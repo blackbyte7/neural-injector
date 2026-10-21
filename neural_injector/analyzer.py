@@ -1,8 +1,11 @@
 from __future__ import annotations
+
 import heapq
 from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
+
 from .types import (
     ActivationSample,
     NeuronPoleProfile,
@@ -27,6 +30,7 @@ class StreamingLayerStats:
         self.count = 0
         self.mean = torch.zeros(num_neurons, dtype=torch.float64, device=device)
         self.m2 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        self.m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
         self.m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
         self.max_val = torch.full((num_neurons,), float("-inf"), dtype=torch.float64, device=device)
         self.min_val = torch.full((num_neurons,), float("inf"), dtype=torch.float64, device=device)
@@ -51,39 +55,85 @@ class StreamingLayerStats:
         tokens_per_sample: Optional[List[List[str]]] = None,
         contexts_per_sample: Optional[List[str]] = None,
         tracked_neurons: Optional[List[int]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        routed_token_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Updates streaming neuron statistics from a batch of activations.
-        activations shape: [B, S, D] or [B, D] or [B, C, H, W]
+        activations shape: [B, S, D] or [B, D] or [B, C, H, W] or [N_routed, D] (MoE)
         """
         orig_shape = activations.shape
+        spatial_hw: Optional[Tuple[int, int]] = None
         if activations.ndim == 4:
             _, c_dim, h_dim, w_dim = orig_shape
             flat_acts = activations.permute(0, 2, 3, 1).reshape(-1, c_dim).to(torch.float64)
             seq_len = h_dim * w_dim
+            spatial_hw = (h_dim, w_dim)
         elif activations.ndim == 3:
             _, seq_len, d_dim = orig_shape
             flat_acts = activations.reshape(-1, d_dim).to(torch.float64)
         else:
-            seq_len = 1
+            # 2D [B, D] or MoE routed [N_routed, D]: infer seq_len from tokens_per_sample if available
+            if tokens_per_sample and len(tokens_per_sample) > 0 and len(tokens_per_sample[0]) > 1:
+                seq_len = len(tokens_per_sample[0])
+            else:
+                seq_len = 1
             flat_acts = activations.to(torch.float64)
 
         flat_acts = flat_acts.to(self.device)
+
+        # Map each row back to its original flattened (batch * seq_len + pos) index
+        valid_flat_indices: Optional[torch.Tensor] = None
+        if routed_token_indices is not None:
+            valid_flat_indices = routed_token_indices.reshape(-1).to(
+                device=self.device, dtype=torch.long
+            )
+        elif attention_mask is not None:
+            mask_flat = attention_mask.reshape(-1).to(device=self.device, dtype=torch.bool)
+            if mask_flat.numel() == flat_acts.shape[0]:
+                valid_flat_indices = torch.nonzero(mask_flat, as_tuple=False).squeeze(-1)
+                if valid_flat_indices.ndim == 0:
+                    valid_flat_indices = valid_flat_indices.unsqueeze(0)
+                flat_acts = flat_acts[valid_flat_indices]
+
         batch_n = flat_acts.shape[0]
         if batch_n == 0:
             return
 
-        # Batch Welford update
-        new_count = self.count + batch_n
+        # Batch Welford / Pébay parallel update for exact M1, M2, M3, M4 moments
+        n_a = self.count
+        n_b = batch_n
+        new_count = n_a + n_b
         batch_mean = flat_acts.mean(dim=0)
-        delta = batch_mean - self.mean
+        centered_b = flat_acts - batch_mean
+        batch_m2 = (centered_b ** 2).sum(dim=0)
+        batch_m3 = (centered_b ** 3).sum(dim=0)
+        batch_m4 = (centered_b ** 4).sum(dim=0)
 
-        self.mean += delta * (batch_n / new_count)
-        batch_m2 = ((flat_acts - batch_mean) ** 2).sum(dim=0)
-        self.m2 += batch_m2 + (delta ** 2) * (self.count * batch_n / new_count)
+        if n_a == 0:
+            self.mean = batch_mean
+            self.m2 = batch_m2
+            self.m3 = batch_m3
+            self.m4 = batch_m4
+        else:
+            delta = batch_mean - self.mean
+            delta_n = delta / new_count
+            delta_n2 = delta_n * delta_n
+            prod_n = n_a * n_b
 
-        batch_m4 = ((flat_acts - self.mean) ** 4).sum(dim=0)
-        self.m4 += batch_m4
+            self.m4 += (
+                batch_m4
+                + prod_n * (n_a * n_a - prod_n + n_b * n_b) * delta * delta_n * delta_n2
+                + 6.0 * (n_a * n_a * batch_m2 + n_b * n_b * self.m2) * delta_n2
+                + 4.0 * (n_a * batch_m3 - n_b * self.m3) * delta_n
+            )
+            self.m3 += (
+                batch_m3
+                + prod_n * (n_a - n_b) * delta * delta_n2
+                + 3.0 * (n_a * batch_m2 - n_b * self.m2) * delta_n
+            )
+            self.m2 += batch_m2 + (delta ** 2) * (n_a * n_b / new_count)
+            self.mean += delta * (n_b / new_count)
 
         self.max_val = torch.maximum(self.max_val, flat_acts.max(dim=0).values)
         self.min_val = torch.minimum(self.min_val, flat_acts.min(dim=0).values)
@@ -91,35 +141,64 @@ class StreamingLayerStats:
         self.neg_count += (flat_acts < 0).sum(dim=0)
         self.count = new_count
 
-        # Update top-k positive & negative pole heaps for tracked neurons
+        # Update top-k positive & negative pole heaps for tracked neurons (all neurons by default)
         target_indices = (
-            tracked_neurons if tracked_neurons is not None else list(range(min(self.num_neurons, 64)))
+            tracked_neurons if tracked_neurons is not None else list(range(self.num_neurons))
         )
-        acts_cpu = flat_acts[:, target_indices].cpu()
+        if not target_indices:
+            return
+
+        sub_acts = flat_acts[:, target_indices]
+        k_curr = min(self.top_k, batch_n)
+
+        # Vectorized GPU top-k across all tracked neurons simultaneously
+        top_pos_vals, top_pos_flat_idx = torch.topk(sub_acts, k=k_curr, dim=0, largest=True)
+        top_neg_vals, top_neg_flat_idx = torch.topk(sub_acts, k=k_curr, dim=0, largest=False)
+
+        top_pos_vals_cpu = top_pos_vals.T.cpu().tolist()
+        top_pos_idx_cpu = top_pos_flat_idx.T.cpu().tolist()
+        top_neg_vals_cpu = top_neg_vals.T.cpu().tolist()
+        top_neg_idx_cpu = top_neg_flat_idx.T.cpu().tolist()
+        valid_idx_cpu = valid_flat_indices.cpu().tolist() if valid_flat_indices is not None else None
 
         for local_i, neuron_idx in enumerate(target_indices):
-            col = acts_cpu[:, local_i]
+            pos_heap = self.pos_heaps[neuron_idx]
+            neg_heap = self.neg_heaps[neuron_idx]
 
             # Top positive activations in this batch
-            k_curr = min(self.top_k, batch_n)
-            top_pos_vals, top_pos_flat_idx = torch.topk(col, k=k_curr, largest=True)
-            top_neg_vals, top_neg_flat_idx = torch.topk(col, k=k_curr, largest=False)
-
-            for val, f_idx in zip(top_pos_vals.tolist(), top_pos_flat_idx.tolist()):
+            for val, r_idx in zip(top_pos_vals_cpu[local_i], top_pos_idx_cpu[local_i]):
                 if val <= 0:
                     continue
+                if len(pos_heap) >= self.top_k and val <= pos_heap[0][0]:
+                    break
+                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
                 sample = self._build_sample(
-                    val, f_idx, seq_len, sample_ids, tokens_per_sample, contexts_per_sample
+                    val,
+                    f_idx,
+                    seq_len,
+                    sample_ids,
+                    tokens_per_sample,
+                    contexts_per_sample,
+                    spatial_hw=spatial_hw,
                 )
-                self._push_heap(self.pos_heaps[neuron_idx], val, sample)
+                self._push_heap(pos_heap, val, sample)
 
-            for val, f_idx in zip(top_neg_vals.tolist(), top_neg_flat_idx.tolist()):
+            for val, r_idx in zip(top_neg_vals_cpu[local_i], top_neg_idx_cpu[local_i]):
                 if val >= 0:
                     continue
+                if len(neg_heap) >= self.top_k and (-val) <= neg_heap[0][0]:
+                    break
+                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
                 sample = self._build_sample(
-                    val, f_idx, seq_len, sample_ids, tokens_per_sample, contexts_per_sample
+                    val,
+                    f_idx,
+                    seq_len,
+                    sample_ids,
+                    tokens_per_sample,
+                    contexts_per_sample,
+                    spatial_hw=spatial_hw,
                 )
-                self._push_heap(self.neg_heaps[neuron_idx], -val, sample)
+                self._push_heap(neg_heap, -val, sample)
 
     @staticmethod
     def _build_sample(
@@ -129,6 +208,7 @@ class StreamingLayerStats:
         sample_ids: Optional[List[int]],
         tokens_per_sample: Optional[List[List[str]]],
         contexts_per_sample: Optional[List[str]],
+        spatial_hw: Optional[Tuple[int, int]] = None,
     ) -> ActivationSample:
         b_idx = flat_idx // seq_len
         pos_idx = flat_idx % seq_len
@@ -138,10 +218,16 @@ class StreamingLayerStats:
             tok_list = tokens_per_sample[b_idx]
             if pos_idx < len(tok_list):
                 tok_str = tok_list[pos_idx]
+        elif spatial_hw is not None:
+            # Automatic Vision / Conv2d patch coordinate label when no text tokens are supplied
+            h_dim, w_dim = spatial_hw
+            row, col = pos_idx // w_dim, pos_idx % w_dim
+            tok_str = f"patch_({row},{col})"
+
         ctx_str = (
             contexts_per_sample[b_idx]
             if contexts_per_sample and b_idx < len(contexts_per_sample)
-            else None
+            else (f"image_sample_{s_id}" if spatial_hw is not None else None)
         )
         return ActivationSample(
             activation_value=float(val),
@@ -183,13 +269,16 @@ class StreamingLayerStats:
             for item in sorted(self.neg_heaps.get(neuron_idx, []), key=lambda x: x[0], reverse=True)
         ]
 
+        max_v = float(self.max_val[neuron_idx].item())
+        min_v = float(self.min_val[neuron_idx].item())
+
         return NeuronPoleProfile(
             layer_name=self.layer_name,
             neuron_idx=neuron_idx,
             mean=mean_val,
             std=std_val,
-            max_val=float(self.max_val[neuron_idx].item()),
-            min_val=float(self.min_val[neuron_idx].item()),
+            max_val=max_v if max_v != float("-inf") else 0.0,
+            min_val=min_v if min_v != float("inf") else 0.0,
             positive_firing_rate=float(self.pos_count[neuron_idx].item() / n),
             negative_firing_rate=float(self.neg_count[neuron_idx].item() / n),
             pole_selectivity_score=selectivity,
@@ -222,7 +311,10 @@ class StreamingLayerStats:
         weight_norms = torch.ones(self.num_neurons, dtype=torch.float64, device=self.device)
         if down_proj_module is not None and hasattr(down_proj_module, "weight"):
             w = down_proj_module.weight.detach().to(self.device, dtype=torch.float64)
-            if down_proj_module.__class__.__name__ == "Conv1D":
+            if w.ndim == 3 and w.shape[-1] == self.num_neurons:
+                # 3D MoE down_proj: [num_experts, d_model, d_mlp] -> mean L2 norm across experts
+                weight_norms = torch.norm(w, p=2, dim=1).mean(dim=0)
+            elif down_proj_module.__class__.__name__ == "Conv1D":
                 # [d_mlp, d_model]
                 if w.shape[0] == self.num_neurons:
                     weight_norms = torch.norm(w, p=2, dim=1)
@@ -317,22 +409,36 @@ class LogitLensAttributor:
         neuron_idx: int,
         idx_to_token: Optional[Dict[int, str]] = None,
         top_k: int = 8,
+        final_norm_module: Optional[nn.Module] = None,
     ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]]]:
         """
         Returns (top_promoted_tokens, top_suppressed_tokens) for `neuron_idx`.
-        - `down_proj_module`: nn.Linear (shape [d_model, d_mlp]) or GPT2 Conv1D (shape [d_mlp, d_model])
+        - `down_proj_module`: nn.Linear (shape [d_model, d_mlp]), GPT2 Conv1D (shape [d_mlp, d_model]),
+          or 3D MoE expert module (shape [num_experts, d_model, d_mlp]).
         - `unembed_weight`: shape [vocab_size, d_model]
+        - `final_norm_module`: optional pre-unembedding LayerNorm / RMSNorm module
         """
         weight = down_proj_module.weight.detach()
-        if down_proj_module.__class__.__name__ == "Conv1D":
+        if weight.ndim == 3:
+            # 3D MoE down_proj: [num_experts, d_model, d_mlp] -> average write direction across experts
+            neuron_out_vec = weight[:, :, neuron_idx].mean(dim=0).to(dtype=torch.float32)
+        elif down_proj_module.__class__.__name__ == "Conv1D":
             # [d_mlp, d_model]
-            neuron_out_vec = weight[neuron_idx, :]
+            neuron_out_vec = weight[neuron_idx, :].to(dtype=torch.float32)
         else:
             # Standard nn.Linear: [d_model, d_mlp]
-            neuron_out_vec = weight[:, neuron_idx]
+            neuron_out_vec = weight[:, neuron_idx].to(dtype=torch.float32)
+
+        # Optionally apply final RMSNorm / LayerNorm scaling vector gamma before unembedding
+        if final_norm_module is not None and hasattr(final_norm_module, "weight"):
+            norm_w = final_norm_module.weight.detach().to(
+                device=neuron_out_vec.device, dtype=torch.float32
+            )
+            if norm_w.shape == neuron_out_vec.shape:
+                neuron_out_vec = neuron_out_vec * norm_w
 
         # Project onto vocabulary space: [vocab_size]
-        unembed = unembed_weight.detach().to(neuron_out_vec.device, dtype=neuron_out_vec.dtype)
+        unembed = unembed_weight.detach().to(neuron_out_vec.device, dtype=torch.float32)
         if unembed.shape[1] != neuron_out_vec.shape[0] and unembed.shape[0] == neuron_out_vec.shape[0]:
             unembed = unembed.T
 

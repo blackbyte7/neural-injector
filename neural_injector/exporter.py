@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -29,19 +30,49 @@ class SteeringExporter:
     """
 
     @staticmethod
+    def is_spec_compilable_to_residual_vector(spec: InterventionSpec) -> bool:
+        """
+        Returns True if and only if `spec` is an unconditional, position-independent
+        ADDITIVE_STEER operation. HARD_CLAMP, ZERO_ABLATE, SCALE, WEAK_PRUNE, and
+        pole-conditional or token-position-specific interventions cannot be reduced to
+        adding a static vector to the residual stream without modifying incoming activations
+        or weight columns.
+        """
+        return (
+            spec.enabled
+            and spec.mode == InterventionMode.ADDITIVE_STEER
+            and spec.pole == PoleType.BOTH
+            and spec.token_positions is None
+            and spec.custom_fn is None
+        )
+
+    @classmethod
     @torch.no_grad()
     def compile_residual_steering_vectors(
+        cls,
         model: nn.Module,
         interventions_by_layer: Dict[str, List[InterventionSpec]],
     ) -> List[CompiledSteeringVector]:
         """
-        For any layer with ADDITIVE_STEER or HARD_CLAMP interventions, compiles the
-        combined linear shift in the residual stream:
+        For any layer where all enabled interventions are unconditional ADDITIVE_STEER
+        operations, compiles the combined linear shift in the residual stream:
             v_steer = sum_{i} delta_i * W_down[:, i]  (shape: [d_model])
+        For HARD_CLAMP neurons, also records their indices in `clamped_neurons` so that
+        incoming dynamic activations are zeroed prior to `down_proj` (preventing a_i(x)
+        from adding onto the constant clamp value c).
         """
         compiled_list: List[CompiledSteeringVector] = []
 
         for layer_name, specs in interventions_by_layer.items():
+            enabled_specs = [s for s in specs if s.enabled]
+            if not enabled_specs:
+                continue
+            # Only compile the layer into a post-down_proj residual vector if ALL enabled
+            # specs in this layer are unconditional ADDITIVE_STEER (prevents order-of-operations
+            # inversion when a layer mixes ADDITIVE_STEER with ZERO_ABLATE or HARD_CLAMP).
+            if not all(cls.is_spec_compilable_to_residual_vector(s) for s in enabled_specs):
+                continue
+
             module, _, _ = LayerDiscovery.resolve_module(model, layer_name)
             if not hasattr(module, "weight"):
                 continue
@@ -55,12 +86,7 @@ class SteeringExporter:
             src_neurons: List[int] = []
             src_deltas: List[float] = []
 
-            for spec in specs:
-                if not spec.enabled:
-                    continue
-                if spec.mode not in (InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP):
-                    continue
-
+            for spec in enabled_specs:
                 for n_idx in spec.neuron_indices:
                     if n_idx < 0 or n_idx >= d_mlp:
                         continue
@@ -198,7 +224,7 @@ class SteeringExporter:
         """
         Folds unconditional (`PoleType.BOTH`, all token positions) surgical interventions
         directly into `down_proj` weights and biases for ZERO runtime hook overhead:
-          - ZERO_ABLATE : sets `down_proj.weight[:, i] = 0.0`
+          - ZERO_ABLATE : sets `down_proj.weight[:, i] = 0.0` (or `weight[i, :] = 0.0` for Conv1D)
           - SCALE       : multiplies `down_proj.weight[:, i] *= value`
           - ADDITIVE_STEER / HARD_CLAMP: folds `v_steer = sum(val * W_down[:, i])` into `down_proj.bias`
             (and zeroes `W_down[:, i]` first if mode is HARD_CLAMP).
@@ -207,7 +233,8 @@ class SteeringExporter:
 
         for layer_name, specs in interventions_by_layer.items():
             module, _, _ = LayerDiscovery.resolve_module(model, layer_name)
-            if not isinstance(module, nn.Linear):
+            is_conv1d = module.__class__.__name__ == "Conv1D" and hasattr(module, "nf")
+            if not isinstance(module, nn.Linear) and not is_conv1d:
                 continue
 
             for spec in specs:
@@ -219,7 +246,10 @@ class SteeringExporter:
                 )
 
                 if spec.mode == InterventionMode.ZERO_ABLATE:
-                    module.weight[:, idx] = 0.0
+                    if is_conv1d:
+                        module.weight[idx, :] = 0.0
+                    else:
+                        module.weight[:, idx] = 0.0
                     folded_summary.append({
                         "layer": layer_name,
                         "neurons": spec.neuron_indices,
@@ -227,7 +257,10 @@ class SteeringExporter:
                     })
 
                 elif spec.mode == InterventionMode.SCALE:
-                    module.weight[:, idx] *= float(spec.value)
+                    if is_conv1d:
+                        module.weight[idx, :] *= float(spec.value)
+                    else:
+                        module.weight[:, idx] *= float(spec.value)
                     folded_summary.append({
                         "layer": layer_name,
                         "neurons": spec.neuron_indices,
@@ -236,11 +269,17 @@ class SteeringExporter:
 
                 elif spec.mode in (InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP):
                     # Compute residual steering vector contribution: sum_{i in idx} value * W_down[:, i]
-                    v_shift = (module.weight[:, idx] * float(spec.value)).sum(dim=1)
+                    if is_conv1d:
+                        v_shift = (module.weight[idx, :] * float(spec.value)).sum(dim=0)
+                        out_features = module.nf
+                    else:
+                        v_shift = (module.weight[:, idx] * float(spec.value)).sum(dim=1)
+                        out_features = module.out_features
+
                     if module.bias is None:
                         module.bias = nn.Parameter(
                             torch.zeros(
-                                module.out_features,
+                                out_features,
                                 dtype=module.weight.dtype,
                                 device=module.weight.device,
                             )
@@ -249,7 +288,10 @@ class SteeringExporter:
 
                     if spec.mode == InterventionMode.HARD_CLAMP:
                         # Remove input-dependent variation on clamped neurons so output is strictly constant
-                        module.weight[:, idx] = 0.0
+                        if is_conv1d:
+                            module.weight[idx, :] = 0.0
+                        else:
+                            module.weight[:, idx] = 0.0
 
                     folded_summary.append({
                         "layer": layer_name,
@@ -269,7 +311,8 @@ class ProductionSteeringRuntime:
     Lightweight, standalone production inference applier.
     Can load a saved JSON preset and apply either:
       - Mode A (`use_compiled_residual_vectors=True`): Fast residual-stream vector addition `output + v_steer`
-      - Mode B (`use_compiled_residual_vectors=False`): Exact pole-conditional neuron hooks
+        for layers with compiled vectors, plus exact neuron hooks for any remaining layers.
+      - Mode B (`use_compiled_residual_vectors=False`): Exact pole-conditional neuron hooks.
     """
 
     def __init__(self, model: nn.Module, preset_json_or_dict: Union[str, Path, Dict[str, Any]]):
@@ -287,27 +330,31 @@ class ProductionSteeringRuntime:
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
 
+        compiled_layers = set()
         if use_compiled_residual_vectors and self.bundle.compiled_vectors:
             for cv in self.bundle.compiled_vectors:
                 module, _, _ = LayerDiscovery.resolve_module(self.model, cv.layer_name)
                 steer_tensor = torch.tensor(cv.vector_values, dtype=dtype, device=device)
+                compiled_layers.add(cv.layer_name)
 
                 def _make_res_hook(vec: torch.Tensor):
                     def _fwd_hook(_mod: nn.Module, _inp: Tuple[Any, ...], out: Any) -> Any:
                         if isinstance(out, torch.Tensor):
-                            return out + vec
+                            return out + vec.to(device=out.device, dtype=out.dtype)
                         elif isinstance(out, tuple) and isinstance(out[0], torch.Tensor):
-                            return (out[0] + vec,) + out[1:]
+                            t0 = out[0]
+                            return (t0 + vec.to(device=t0.device, dtype=t0.dtype),) + out[1:]
                         return out
 
                     return _fwd_hook
 
                 self._handles.append(module.register_forward_hook(_make_res_hook(steer_tensor)))
-            return
 
-        # Standard surgical neuron-basis hooks grouped by layer
+        # Standard surgical neuron-basis hooks grouped by layer (for any layer not already handled by a compiled vector)
         by_layer: Dict[str, List[InterventionSpec]] = {}
         for s in self.specs:
+            if use_compiled_residual_vectors and s.layer_name in compiled_layers:
+                continue
             by_layer.setdefault(s.layer_name, []).append(s)
 
         for layer_name, layer_specs in by_layer.items():
@@ -334,6 +381,10 @@ class ProductionSteeringRuntime:
                     def _fwd(_mod: nn.Module, _inputs: Tuple[Any, ...], out: Any) -> Any:
                         if isinstance(out, torch.Tensor):
                             return InterventionKernel.apply(out, ls, is_conv2d=cf)
+                        elif isinstance(out, tuple) and isinstance(out[0], torch.Tensor):
+                            return (
+                                InterventionKernel.apply(out[0], ls, is_conv2d=cf),
+                            ) + out[1:]
                         return out
 
                     return _fwd

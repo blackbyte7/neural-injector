@@ -1,5 +1,7 @@
 from __future__ import annotations
+
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +40,7 @@ class CircuitTracer:
         src_layer: str,
         dst_layer: str,
         src_neuron: int,
+        apply_pre_norm_scaling: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Computes the direct residual-stream virtual weights from `src_neuron` in `src_layer`
@@ -55,25 +58,42 @@ class CircuitTracer:
         _, _, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
 
         device = next(self.model.parameters()).device
-        zeros = torch.zeros(num_dst, device=device)
+        zeros = torch.zeros(num_dst, dtype=torch.float32, device=device)
 
         if not hasattr(src_write_mod, "weight"):
             return zeros, zeros, zeros
 
         # Extract outgoing vector written into residual stream by src_neuron: shape [d_model]
         w_src = src_write_mod.weight.detach()
-        if src_write_mod.__class__.__name__ == "Conv1D":
-            src_vec = w_src[src_neuron, :]
+        if w_src.ndim == 3:
+            # 3D MoE down_proj: [num_experts, d_model, d_mlp]
+            src_vec = w_src[:, :, src_neuron].mean(dim=0).to(dtype=torch.float32)
+        elif src_write_mod.__class__.__name__ == "Conv1D":
+            src_vec = w_src[src_neuron, :].to(dtype=torch.float32)
         else:
             # Standard Linear down_proj: shape [d_model, d_mlp]
-            src_vec = w_src[:, src_neuron]
+            src_vec = w_src[:, src_neuron].to(dtype=torch.float32)
+
+        target_device = src_vec.device
+        zeros = zeros.to(target_device)
+
+        # Optionally apply the destination block's pre-MLP RMSNorm / LayerNorm weight scaling gamma
+        if apply_pre_norm_scaling:
+            pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, dst_layer)
+            if pre_norm is not None and hasattr(pre_norm, "weight"):
+                norm_w = pre_norm.weight.detach().to(device=target_device, dtype=torch.float32)
+                if norm_w.shape == src_vec.shape:
+                    src_vec = src_vec * norm_w
 
         read_mod = dst_up_mod if dst_up_mod is not None else dst_write_mod
         if read_mod is None or not hasattr(read_mod, "weight"):
             return zeros, zeros, zeros
 
-        w_up = read_mod.weight.detach()
-        if read_mod.__class__.__name__ == "Conv1D":
+        w_up = read_mod.weight.detach().to(device=target_device, dtype=torch.float32)
+        if w_up.ndim == 3:
+            # 3D MoE up_proj: [num_experts, d_mlp, d_model]
+            w_up = w_up.mean(dim=0)
+        elif read_mod.__class__.__name__ == "Conv1D":
             # [d_model, d_mlp] -> transpose to [d_mlp, d_model]
             w_up = w_up.T
 
@@ -87,8 +107,10 @@ class CircuitTracer:
         cos_sim = torch.mv(up_norm, src_norm)
 
         if dst_gate_mod is not None and hasattr(dst_gate_mod, "weight"):
-            w_gate = dst_gate_mod.weight.detach()
-            if dst_gate_mod.__class__.__name__ == "Conv1D":
+            w_gate = dst_gate_mod.weight.detach().to(device=target_device, dtype=torch.float32)
+            if w_gate.ndim == 3:
+                w_gate = w_gate.mean(dim=0)
+            elif dst_gate_mod.__class__.__name__ == "Conv1D":
                 w_gate = w_gate.T
             virtual_gate = (
                 torch.mv(w_gate, src_vec) if w_gate.shape[1] == src_vec.shape[0] else zeros
@@ -173,7 +195,7 @@ class CircuitTracer:
         was_training = self.model.training
         self.model.eval()
         try:
-            with torch.set_grad_enabled(compute_jacobian):
+            with self.injector.without_interventions(), torch.set_grad_enabled(compute_jacobian):
                 run_fwd(self.model, inputs)
 
                 if not captured_src or not captured_dst:
@@ -185,8 +207,15 @@ class CircuitTracer:
                 dst_act = captured_dst[-1]
 
                 # Flatten batch & sequence/spatial dimensions to [N_tokens, D]
-                src_flat = src_act.reshape(-1, src_act.shape[-1])
-                dst_flat = dst_act.reshape(-1, dst_act.shape[-1])
+                if isinstance(src_mod, nn.Conv2d) and src_act.ndim == 4:
+                    src_flat = src_act.permute(0, 2, 3, 1).reshape(-1, src_act.shape[1])
+                else:
+                    src_flat = src_act.reshape(-1, src_act.shape[-1])
+
+                if isinstance(dst_mod, nn.Conv2d) and dst_act.ndim == 4:
+                    dst_flat = dst_act.permute(0, 2, 3, 1).reshape(-1, dst_act.shape[1])
+                else:
+                    dst_flat = dst_act.reshape(-1, dst_act.shape[-1])
 
                 # Determine active mask for the requested pole of src_neuron
                 src_col = src_flat[:, src_neuron].detach()
@@ -201,12 +230,21 @@ class CircuitTracer:
                 if not active_mask.any():
                     active_mask = torch.ones_like(src_col, dtype=torch.bool)
 
+                # If src and dst have different token/spatial counts (e.g. routed MoE or pooled CNN),
+                # align active_mask to dst_flat length
+                if active_mask.shape[0] != dst_flat.shape[0]:
+                    dst_active_mask = torch.ones(
+                        dst_flat.shape[0], dtype=torch.bool, device=dst_flat.device
+                    )
+                else:
+                    dst_active_mask = active_mask.to(dst_flat.device)
+
                 # Compute exact Jacobian sensitivity d(mean_active_dst[j]) / d(src[src_neuron])
-                jacobian_vec = torch.zeros(num_dst, device=dst_flat.device)
+                jacobian_vec = torch.zeros(num_dst, dtype=torch.float32, device=dst_flat.device)
                 if compute_jacobian and dst_act.requires_grad:
                     # Sum dst activations over active token positions so we can compute vector-Jacobian product
-                    active_dst_sum = dst_flat[active_mask].sum(dim=0)
-                    candidate_variance = dst_flat[active_mask].detach().abs().mean(dim=0)
+                    active_dst_sum = dst_flat[dst_active_mask].float().sum(dim=0)
+                    candidate_variance = dst_flat[dst_active_mask].detach().float().abs().mean(dim=0)
                     jac_k = min(num_dst, max(top_k * 2, 64))
                     _, top_jac_indices = torch.topk(candidate_variance, k=jac_k)
 
@@ -218,15 +256,22 @@ class CircuitTracer:
                             allow_unused=True,
                         )[0]
                         if grad_src is not None:
-                            grad_flat = grad_src.reshape(-1, grad_src.shape[-1])
-                            jacobian_vec[j_idx] = grad_flat[active_mask, src_neuron].mean().detach()
+                            if isinstance(src_mod, nn.Conv2d) and grad_src.ndim == 4:
+                                grad_flat = grad_src.permute(0, 2, 3, 1).reshape(
+                                    -1, grad_src.shape[1]
+                                )
+                            else:
+                                grad_flat = grad_src.reshape(-1, grad_src.shape[-1])
+                            jacobian_vec[j_idx] = (
+                                grad_flat[active_mask, src_neuron].float().mean().detach()
+                            )
         finally:
             h_src.remove()
             h_dst.remove()
 
-        clean_dst_flat = dst_flat.detach().clone()
+        clean_dst_flat = dst_flat.detach().float().clone()
 
-        # Step 2: Intervened pass (surgically ablate or clamp src_neuron's pole)
+        # Step 2: Intervened pass (surgically ablate or clamp src_neuron's pole without clearing user specs)
         captured_dst_ablated: List[torch.Tensor] = []
         h_dst_ab = (
             dst_mod.register_forward_pre_hook(
@@ -244,42 +289,45 @@ class CircuitTracer:
             )
         )
 
-        self.injector.clear_interventions()
-        self.injector.add_intervention(
-            InterventionSpec(
-                layer_name=src_layer,
-                neuron_indices=[src_neuron],
-                mode=intervention_mode,
-                pole=src_pole,
-                value=intervention_value,
-                token_positions=token_positions,
-            )
+        trace_spec = InterventionSpec(
+            layer_name=src_layer,
+            neuron_indices=[src_neuron],
+            mode=intervention_mode,
+            pole=src_pole,
+            value=intervention_value,
+            token_positions=token_positions,
         )
 
         try:
-            with torch.no_grad(), self.injector.active_injection():
+            with torch.no_grad(), self.injector.temporary_interventions([trace_spec]):
                 run_fwd(self.model, inputs)
         finally:
             h_dst_ab.remove()
-            self.injector.clear_interventions()
             if was_training:
                 self.model.train()
 
-        ablated_dst_flat = captured_dst_ablated[-1].reshape(-1, num_dst)
+        raw_ab = captured_dst_ablated[-1]
+        if isinstance(dst_mod, nn.Conv2d) and raw_ab.ndim == 4:
+            ablated_dst_flat = raw_ab.permute(0, 2, 3, 1).reshape(-1, num_dst).float()
+        else:
+            ablated_dst_flat = raw_ab.reshape(-1, num_dst).float()
 
         # Step 3: Compute causal shift Delta = A_clean - A_ablated over active positions
-        delta_active = clean_dst_flat[active_mask] - ablated_dst_flat[active_mask]
+        delta_active = clean_dst_flat[dst_active_mask] - ablated_dst_flat[dst_active_mask]
         mean_delta = delta_active.mean(dim=0)
 
         # Signed max delta (retaining sign of the largest absolute shift per downstream neuron)
         max_abs_idx = delta_active.abs().argmax(dim=0)
         max_delta = delta_active[max_abs_idx, torch.arange(num_dst, device=delta_active.device)]
 
-        clean_mean = clean_dst_flat[active_mask].mean(dim=0)
-        ablated_mean = ablated_dst_flat[active_mask].mean(dim=0)
+        clean_mean = clean_dst_flat[dst_active_mask].mean(dim=0)
+        ablated_mean = ablated_dst_flat[dst_active_mask].mean(dim=0)
 
         # Step 4: Combine with static virtual weights
         v_up, v_gate, cos_sim = self.compute_virtual_weights(src_layer, dst_layer, src_neuron)
+        v_up = v_up.to(device=mean_delta.device, dtype=mean_delta.dtype)
+        v_gate = v_gate.to(device=mean_delta.device, dtype=mean_delta.dtype)
+        cos_sim = cos_sim.to(device=mean_delta.device, dtype=mean_delta.dtype)
 
         # Select top_k most affected downstream neurons (by absolute mean causal delta + static alignment)
         ranking_metric = mean_delta.abs() + 1e-4 * v_up.abs()

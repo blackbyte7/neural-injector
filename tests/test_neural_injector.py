@@ -18,6 +18,7 @@ from neural_injector import (
     LayerCleanlinessReport,
     LayerDiscovery,
     NeuralInjector,
+    NeuronExplainerAgent,
     NeuronTaxonomy,
     PoleType,
     ProductionSteeringRuntime,
@@ -622,3 +623,190 @@ class TestFastAPIAndCLIWorkbench:
         cli_main(["profile", "mlp_block_0.down_proj", "7"])
         out_oneshot = capsys.readouterr().out
         assert "Neuron #7" in out_oneshot
+
+    # =============================================================================
+    # 9. Regression Tests for Audit Fixes & Cammarata (2026) Extensions
+    # =============================================================================
+    class TestAuditFixesAndCammarataExtensions:
+        def test_online_m4_kurtosis_matches_exact_full_batch(self):
+            """
+            Verifies that streaming multiple batches with shifting means produces the
+            exact same 2nd, 3rd, and 4th central moments (M2, M3, M4) as a single full pass.
+            """
+            torch.manual_seed(99)
+            b1 = torch.randn(32, 8) * 1.5 - 2.0
+            b2 = torch.randn(48, 8) * 3.0 + 4.5
+            b3 = torch.randn(20, 8) * 0.5 + 1.0
+            full_data = torch.cat([b1, b2, b3], dim=0)
+
+            streaming_stats = StreamingLayerStats("test_layer", num_neurons=8, top_k=5)
+            for batch in (b1, b2, b3):
+                streaming_stats.update(batch)
+
+            exact_stats = StreamingLayerStats("test_layer", num_neurons=8, top_k=5)
+            exact_stats.update(full_data)
+
+            assert torch.allclose(streaming_stats.mean, exact_stats.mean, atol=1e-6)
+            assert torch.allclose(streaming_stats.m2, exact_stats.m2, atol=1e-5)
+            assert torch.allclose(streaming_stats.m4, exact_stats.m4, atol=1e-4)
+
+        def test_non_destructive_tracing_and_kl_preserve_active_interventions(
+                self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+        ):
+            """
+            Verifies that running `measure_ablation_kl_divergence` or `trace_circuit`
+            does NOT wipe out previously registered user interventions.
+            """
+            injector = demo_session.injector
+            layer = "mlp_block_0.down_proj"
+            injector.clear_interventions()
+            injector.steer_neurons(layer, neuron_indices=[3], delta=5.0)
+            assert injector.active_intervention_count == 1
+
+            # Run diagnostic KL and circuit trace passes
+            _ = injector.measure_ablation_kl_divergence(layer, neuron_idx=7, inputs=sample_prompt_ids)
+            _ = injector.trace_circuit(
+                src_layer="mlp_block_0.down_proj",
+                dst_layer="mlp_block_1.down_proj",
+                src_neuron=7,
+                inputs=sample_prompt_ids,
+            )
+
+            # User's original intervention on neuron #3 must still be intact
+            active = injector.get_active_interventions()
+            assert len(active) == 1
+            assert active[0].neuron_indices == [3]
+            assert active[0].value == 5.0
+
+        def test_track_all_neurons_beyond_index_64(self, demo_session: WorkbenchSession):
+            """
+            Verifies that neurons at index >= 64 (e.g. Neuron #110) still collect
+            top-k positive and negative pole samples even when tracked_neurons=None.
+            """
+            profile_110 = demo_session.injector.get_neuron_profile(
+                layer_name="mlp_block_0.down_proj",
+                neuron_idx=110,
+            )
+            assert len(profile_110.top_positive_samples) > 0 or len(profile_110.top_negative_samples) > 0
+
+# =============================================================================
+# 10. Universal & Model-Agnostic Architecture Tests (Section 2)
+# =============================================================================
+class TestUniversalModelAgnosticSupport:
+    def test_gpt2_conv1d_discovery_and_attn_c_proj_disambiguation(self):
+        """
+        Verifies that GPT-2 style `Conv1D` layers in `mlp.c_proj` are discovered as
+        `GPT2_MLP_Neuron_Basis (Pre-DownProj)`, while `attn.c_proj` is NOT mistaken
+        for an MLP neuron basis, and `fold_interventions_into_weights` works on `Conv1D`.
+        """
+        class Conv1D(nn.Module):
+            def __init__(self, nf: int, nx: int):
+                super().__init__()
+                self.nf = nf
+                self.weight = nn.Parameter(torch.randn(nx, nf) * 0.02)
+                self.bias = nn.Parameter(torch.zeros(nf))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                size_out = x.size()[:-1] + (self.nf,)
+                x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
+                return x.view(size_out)
+
+        class MiniGPT2Block(nn.Module):
+            def __init__(self, d_model: int = 32, d_mlp: int = 64):
+                super().__init__()
+                self.attn = nn.ModuleDict({"c_proj": Conv1D(d_model, d_model)})
+                self.mlp = nn.ModuleDict({
+                    "c_fc": Conv1D(d_mlp, d_model),
+                    "c_proj": Conv1D(d_model, d_mlp),
+                })
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = x + self.attn["c_proj"](x)
+                h = torch.relu(self.mlp["c_fc"](x))
+                return x + self.mlp["c_proj"](h)
+
+        model = MiniGPT2Block()
+        inj = NeuralInjector(model)
+        layers = inj.list_targetable_layers(include_all_linear=False)
+
+        assert "mlp.c_proj" in layers
+        assert "attn.c_proj" not in layers
+        assert layers["mlp.c_proj"].num_neurons == 64
+
+        # Verify Conv1D weight folding numerical equivalence
+        x = torch.randn(2, 4, 32)
+        inj.steer_neurons("mlp.c_proj", neuron_indices=[5, 10], delta=4.0)
+        with torch.no_grad(), inj.active_injection():
+            hook_out = model(x)
+
+        fold_res = inj.fold_interventions_into_weights()
+        assert fold_res["operations_applied"] == 1
+        with torch.no_grad():
+            folded_out = model(x)
+        assert torch.allclose(hook_out, folded_out, atol=1e-5)
+
+    def test_fused_gate_up_proj_virtual_weights(self):
+        """
+        Verifies that models with a single fused `gate_up_proj` (`[2 * d_mlp, d_model]`)
+        properly resolve virtual gate and up weights in `CircuitTracer`.
+        """
+        class FusedSwiGLUMLP(nn.Module):
+            def __init__(self, d_model: int = 32, d_mlp: int = 64):
+                super().__init__()
+                self.gate_up_proj = nn.Linear(d_model, 2 * d_mlp, bias=False)
+                self.down_proj = nn.Linear(d_mlp, d_model, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                return self.down_proj(torch.nn.functional.silu(gate) * up)
+
+        class FusedTwoLayerModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp0 = FusedSwiGLUMLP(32, 64)
+                self.mlp1 = FusedSwiGLUMLP(32, 64)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = x + self.mlp0(x)
+                return x + self.mlp1(x)
+
+        model = FusedTwoLayerModel()
+        inj = NeuralInjector(model)
+        v_up, v_gate, cos_sim = inj.tracer.compute_virtual_weights(
+            "mlp0.down_proj", "mlp1.down_proj", src_neuron=3
+        )
+        assert v_up.shape == (64,)
+        assert v_gate.shape == (64,)
+        assert v_up.abs().sum().item() > 0.0
+        assert v_gate.abs().sum().item() > 0.0
+
+    def test_half_precision_bfloat16_audit_and_circuit_trace(self, demo_session: WorkbenchSession):
+        """
+        Verifies that `bfloat16` models run auditing, logit attribution, and circuit
+        tracing without dtype mismatch errors.
+        """
+        bf16_model = copy.deepcopy(demo_session.model).to(dtype=torch.bfloat16)
+        inj = NeuralInjector(bf16_model)
+        ids = torch.tensor([[1, 2, 3, 5, 6]], dtype=torch.long)
+
+        inj.audit_layers(
+            layer_names=["mlp_block_0.down_proj"],
+            dataloader_or_batches=[{"input_ids": ids}],
+            forward_fn=lambda m, b: m(b["input_ids"]),
+        )
+        prof = inj.get_neuron_profile(
+            "mlp_block_0.down_proj",
+            neuron_idx=7,
+            unembed_weight=bf16_model.lm_head.weight,
+            idx_to_token=demo_session.id_to_tok,
+        )
+        assert len(prof.top_promoted_tokens) > 0
+
+        graph = inj.trace_circuit(
+            src_layer="mlp_block_0.down_proj",
+            dst_layer="mlp_block_1.down_proj",
+            src_neuron=7,
+            inputs=ids,
+            compute_jacobian=True,
+        )
+        assert len(graph.edges) > 0

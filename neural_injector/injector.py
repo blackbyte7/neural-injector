@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 from contextlib import contextmanager
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 from torch.utils.hooks import RemovableHandle
@@ -46,9 +48,11 @@ class NeuralInjector:
         model: nn.Module,
         device: Optional[str] = None,
         llm_client: Optional[LLMClientProtocol] = None,
+        tokenizer: Optional[Any] = None,
     ):
         self.model = model
         self.device = device or next(model.parameters()).device.type
+        self.tokenizer = tokenizer
         self.discovered_layers: Dict[str, LayerDescriptor] = LayerDiscovery.discover_neuron_layers(
             model
         )
@@ -260,6 +264,53 @@ class NeuralInjector:
         finally:
             self.detach_hooks()
 
+    @contextmanager
+    def without_interventions(self):
+        """
+        Non-destructive context manager that temporarily detaches any active hooks
+        for a clean forward pass, then restores the previous hook state upon exit
+        without clearing `self._interventions`.
+        """
+        was_attached = len(self._active_handles) > 0
+        if was_attached:
+            self.detach_hooks()
+        try:
+            yield self
+        finally:
+            if was_attached:
+                self.attach_hooks()
+
+    @contextmanager
+    def temporary_interventions(self, temp_specs: List[InterventionSpec]):
+        """
+        Non-destructive context manager that temporarily replaces active interventions
+        with `temp_specs`, attaches their hooks for the duration of the block, and
+        restores the exact prior `self._interventions` and hook state upon exit.
+        """
+        saved_interventions = {k: list(v) for k, v in self._interventions.items()}
+        was_attached = len(self._active_handles) > 0
+        self.detach_hooks()
+        self._interventions = {}
+        for spec in temp_specs:
+            self.add_intervention(spec)
+        self.attach_hooks()
+        try:
+            yield self
+        finally:
+            self.detach_hooks()
+            self._interventions = saved_interventions
+            if was_attached:
+                self.attach_hooks()
+
+    @contextmanager
+    def clean_forward(self):
+        """
+        Non-destructive context manager that guarantees zero active intervention hooks during
+        a baseline forward pass while preserving any user-registered interventions afterward.
+        """
+        with self.temporary_interventions(None):
+            yield self
+
     # -------------------------------------------------------------------------
     # 3. Bipolar Neuron Auditing & Concept Discovery
     # -------------------------------------------------------------------------
@@ -302,6 +353,8 @@ class NeuralInjector:
                                 tokens_per_sample=current_batch_meta.get("tokens_per_sample"),
                                 contexts_per_sample=current_batch_meta.get("contexts_per_sample"),
                                 tracked_neurons=tracked_neurons,
+                                attention_mask=current_batch_meta.get("attention_mask"),
+                                routed_token_indices=current_batch_meta.get("routed_token_indices"),
                             )
 
                     return _hook
@@ -319,6 +372,8 @@ class NeuralInjector:
                                 tokens_per_sample=current_batch_meta.get("tokens_per_sample"),
                                 contexts_per_sample=current_batch_meta.get("contexts_per_sample"),
                                 tracked_neurons=tracked_neurons,
+                                attention_mask=current_batch_meta.get("attention_mask"),
+                                routed_token_indices=current_batch_meta.get("routed_token_indices"),
                             )
 
                     return _hook
@@ -328,13 +383,16 @@ class NeuralInjector:
         was_training = self.model.training
         self.model.eval()
         try:
-            for batch in dataloader_or_batches:
-                current_batch_meta = {
-                    "sample_ids": batch.get("sample_ids"),
-                    "tokens_per_sample": batch.get("tokens_per_sample"),
-                    "contexts_per_sample": batch.get("contexts_per_sample"),
-                }
-                forward_fn(self.model, batch)
+            with self.without_interventions():
+                for batch in dataloader_or_batches:
+                    current_batch_meta = {
+                        "sample_ids": batch.get("sample_ids"),
+                        "tokens_per_sample": batch.get("tokens_per_sample"),
+                        "contexts_per_sample": batch.get("contexts_per_sample"),
+                        "attention_mask": batch.get("attention_mask"),
+                        "routed_token_indices": batch.get("routed_token_indices"),
+                    }
+                    forward_fn(self.model, batch)
         finally:
             for h in handles:
                 h.remove()
@@ -364,11 +422,13 @@ class NeuralInjector:
         if unembed_weight is not None:
             module, _, _ = LayerDiscovery.resolve_module(self.model, layer_name)
             if hasattr(module, "weight"):
+                final_norm = LayerDiscovery.resolve_final_norm(self.model)
                 promoted, suppressed = LogitLensAttributor.attribute_neuron_to_vocab(
                     down_proj_module=module,
                     unembed_weight=unembed_weight,
                     neuron_idx=neuron_idx,
                     idx_to_token=idx_to_token,
+                    final_norm_module=final_norm,
                 )
                 profile.top_promoted_tokens = promoted
                 profile.top_suppressed_tokens = suppressed
@@ -388,20 +448,23 @@ class NeuralInjector:
         by computing the KL-Divergence D_KL(P_clean || P_ablated) on the model's output logits.
         """
         self.model.eval()
-        clean_out = self.model(inputs)
-        clean_logits = clean_out.logits if hasattr(clean_out, "logits") else clean_out
-        clean_log_probs = torch.log_softmax(clean_logits, dim=-1)
-        clean_probs = clean_log_probs.exp()
+        with self.without_interventions():
+            clean_out = self.model(inputs)
+            clean_logits = clean_out.logits if hasattr(clean_out, "logits") else clean_out
+            clean_log_probs = torch.log_softmax(clean_logits.float(), dim=-1)
+            clean_probs = clean_log_probs.exp()
 
-        self.clear_interventions()
-        self.zero_ablate(layer_name=layer_name, neuron_indices=[neuron_idx], pole=pole)
-
-        with self.active_injection():
+        ablate_spec = InterventionSpec(
+            layer_name=layer_name,
+            neuron_indices=[neuron_idx],
+            mode=InterventionMode.ZERO_ABLATE,
+            pole=pole,
+            value=0.0,
+        )
+        with self.temporary_interventions([ablate_spec]):
             ablated_out = self.model(inputs)
             ablated_logits = ablated_out.logits if hasattr(ablated_out, "logits") else ablated_out
-            ablated_log_probs = torch.log_softmax(ablated_logits, dim=-1)
-
-        self.clear_interventions()
+            ablated_log_probs = torch.log_softmax(ablated_logits.float(), dim=-1)
 
         kl = (clean_probs * (clean_log_probs - ablated_log_probs)).sum(dim=-1).mean().item()
         return float(kl)
@@ -442,11 +505,12 @@ class NeuralInjector:
         self,
         layer_name: str,
         neuron_idx: int,
-        tok_to_id: Dict[str, int],
-        idx_to_token: Dict[int, str],
+        tok_to_id: Optional[Dict[str, int]] = None,
+        idx_to_token: Optional[Dict[int, str]] = None,
         unembed_weight: Optional[torch.Tensor] = None,
         dst_layer: Optional[str] = None,
         circuit_inputs: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
     ) -> BipolarVerbHypothesis:
         """
         Synthesizes a bipolar 'verb' explanation for `(layer_name, neuron_idx)` and runs
@@ -455,11 +519,12 @@ class NeuralInjector:
         return self.explainer.explain_and_verify(
             layer_name=layer_name,
             neuron_idx=neuron_idx,
-            tok_to_id=tok_to_id,
-            idx_to_token=idx_to_token,
+            tok_to_id=tok_to_id or {},
+            idx_to_token=idx_to_token or {},
             unembed_weight=unembed_weight,
             dst_layer=dst_layer,
             circuit_inputs=circuit_inputs,
+            tokenizer=tokenizer or self.tokenizer,
         )
 
     # -------------------------------------------------------------------------
@@ -504,7 +569,6 @@ class NeuralInjector:
 
         # Optionally compute exact causal zero-ablation KL divergence on top candidates
         if compute_kl_for_top_n > 0 and kl_eval_inputs is not None:
-            saved_interventions = {k: list(v) for k, v in self._interventions.items()}
             for summary in summaries[:compute_kl_for_top_n]:
                 summary.ablation_kl_divergence = round(
                     self.measure_ablation_kl_divergence(
@@ -514,7 +578,6 @@ class NeuralInjector:
                     ),
                     5,
                 )
-            self._interventions = saved_interventions
 
         clean_pct = pcts.get(NeuronTaxonomy.CLEAN_MONOSEMANTIC.value, 0.0)
         struct_pct = pcts.get(NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value, 0.0)

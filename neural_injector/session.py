@@ -60,7 +60,7 @@ class WorkbenchSession:
         self.unembed_weight = unembed_weight
         self.tokenizer = tokenizer
         self.model_name = model_name
-        self.injector = NeuralInjector(model)
+        self.injector = NeuralInjector(model, tokenizer=tokenizer)
 
     @classmethod
     def create_demo_session(cls) -> WorkbenchSession:
@@ -151,19 +151,41 @@ class WorkbenchSession:
             model_name=model_id,
         )
 
-    def encode_prompt(self, text: str) -> Tuple[torch.Tensor, List[str]]:
-        """Tokenizes a text string into an input_ids tensor [1, seq_len] and list of token strings."""
+    def encode_prompt_with_mask(self, text: str) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
+        """
+        Tokenizes a text string into `(input_ids, token_strings, attention_mask)`,
+        automatically marking `<pad>` tokens as False/0 in `attention_mask`.
+        """
         device = next(self.model.parameters()).device
         if self.tokenizer is not None:
             enc = self.tokenizer(text, return_tensors="pt")
             input_ids = enc["input_ids"].to(device)
+            if "attention_mask" in enc:
+                attn_mask = enc["attention_mask"].to(device=device, dtype=torch.bool)
+            else:
+                pad_id = getattr(self.tokenizer, "pad_token_id", None)
+                attn_mask = (
+                    (input_ids != pad_id)
+                    if pad_id is not None
+                    else torch.ones_like(input_ids, dtype=torch.bool)
+                )
             tokens = [self.tokenizer.decode([tid]) for tid in input_ids[0].tolist()]
-            return input_ids, tokens
+            return input_ids, tokens, attn_mask
 
         words = [w.strip() for w in text.split() if w.strip()]
-        ids = [self.tok_to_id.get(w, 0) for w in words] or [0]
+        pad_id = self.tok_to_id.get("<pad>", 0)
+        ids = [self.tok_to_id.get(w, pad_id) for w in words] or [pad_id]
         tokens = [self.id_to_tok.get(i, "<pad>") for i in ids]
-        return torch.tensor([ids], dtype=torch.long, device=device), tokens
+        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+        attn_mask = input_ids != pad_id
+        if not attn_mask.any():
+            attn_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        return input_ids, tokens, attn_mask
+
+    def encode_prompt(self, text: str) -> Tuple[torch.Tensor, List[str]]:
+        """Tokenizes a text string into an input_ids tensor [1, seq_len] and list of token strings."""
+        input_ids, tokens, _ = self.encode_prompt_with_mask(text)
+        return input_ids, tokens
 
     def run_audit(
         self,
@@ -175,9 +197,10 @@ class WorkbenchSession:
         """Streams a list of text prompts through the model to populate bipolar neuron stats."""
         batches = []
         for idx, text in enumerate(prompts):
-            input_ids, tok_strs = self.encode_prompt(text)
+            input_ids, tok_strs, attn_mask = self.encode_prompt_with_mask(text)
             batches.append({
                 "input_ids": input_ids,
+                "attention_mask": attn_mask,
                 "sample_ids": [idx],
                 "tokens_per_sample": [tok_strs],
                 "contexts_per_sample": [text],
@@ -208,15 +231,17 @@ class WorkbenchSession:
 
         with torch.no_grad():
             # Clean pass (hooks detached)
-            self.injector.detach_hooks()
-            clean_out = self.model(input_ids)
-            clean_logits = clean_out.logits if hasattr(clean_out, "logits") else clean_out
-            clean_probs = F.softmax(clean_logits[0, -1, :], dim=-1)
+            with self.injector.without_interventions():
+                clean_out = self.model(input_ids)
+                clean_logits = (
+                    clean_out.logits if hasattr(clean_out, "logits") else clean_out
+                ).float()
+                clean_probs = F.softmax(clean_logits[0, -1, :], dim=-1)
 
             # Intervened pass (hooks attached)
             with self.injector.active_injection():
                 mod_out = self.model(input_ids)
-                mod_logits = mod_out.logits if hasattr(mod_out, "logits") else mod_out
+                mod_logits = (mod_out.logits if hasattr(mod_out, "logits") else mod_out).float()
                 mod_probs = F.softmax(mod_logits[0, -1, :], dim=-1)
 
             # Compute sequence-wide KL divergence

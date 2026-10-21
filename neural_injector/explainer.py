@@ -1,8 +1,10 @@
 from __future__ import annotations
+
 import json
 import os
 import urllib.request
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple
+
 import torch
 import torch.nn as nn
 
@@ -10,6 +12,8 @@ from .discovery import LayerDiscovery
 from .types import (
     BipolarVerbHypothesis,
     CircuitGraph,
+    InterventionMode,
+    InterventionSpec,
     NeuronPoleProfile,
     NeuronTaxonomy,
     PoleType,
@@ -196,6 +200,61 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         self.llm_client: LLMClientProtocol = llm_client or HeuristicSynthesisClient()
 
     @staticmethod
+    def _resolve_token_ids(
+        tokens: List[str],
+        tok_to_id: Dict[str, int],
+        tokenizer: Optional[Any] = None,
+    ) -> List[int]:
+        """
+        Resolves token strings into vocabulary IDs, handling BPE/SentencePiece prefixes
+        ('Ġ', '▁', leading spaces), class_<id> labels, and HuggingFace tokenizer fallback.
+        """
+        resolved: List[int] = []
+        for t in tokens:
+            if not t:
+                continue
+            if t in tok_to_id:
+                resolved.append(tok_to_id[t])
+                continue
+            stripped = t.strip()
+            for candidate in (stripped, f"Ġ{stripped}", f"▁{stripped}", f" {stripped}"):
+                if candidate in tok_to_id:
+                    resolved.append(tok_to_id[candidate])
+                    break
+            else:
+                if stripped.startswith(("class_", "token_")) and stripped.split("_")[-1].isdigit():
+                    resolved.append(int(stripped.split("_")[-1]))
+                elif tokenizer is not None and hasattr(tokenizer, "encode"):
+                    enc_ids = tokenizer.encode(stripped, add_special_tokens=False)
+                    if enc_ids:
+                        resolved.extend(int(i) for i in enc_ids)
+        return list(dict.fromkeys(resolved))
+
+    @classmethod
+    def _encode_context_or_tokens(
+        cls,
+        test_tokens: List[str],
+        tok_to_id: Dict[str, int],
+        device: torch.device,
+        fallback_context: Optional[str] = None,
+        tokenizer: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Builds a 2D input_ids tensor `[1, seq_len]` from `test_tokens`, falling back to
+        encoding `fallback_context` when subword lookup would otherwise collapse to `[0]`.
+        """
+        ids = cls._resolve_token_ids(test_tokens, tok_to_id, tokenizer=tokenizer)
+        if not ids and fallback_context:
+            if tokenizer is not None and hasattr(tokenizer, "encode"):
+                ids = tokenizer.encode(fallback_context, add_special_tokens=False)
+            else:
+                words = [w.strip() for w in fallback_context.split() if w.strip()]
+                ids = cls._resolve_token_ids(words, tok_to_id, tokenizer=None)
+        if not ids:
+            ids = [0]
+        return torch.tensor([ids], dtype=torch.long, device=device)
+
+    @staticmethod
     def build_evidence_payload(
         profile: NeuronPoleProfile,
         circuit: Optional[CircuitGraph] = None,
@@ -282,6 +341,9 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         hypothesis: BipolarVerbHypothesis,
         tok_to_id: Dict[str, int],
         dst_layer: Optional[str] = None,
+        profile: Optional[NeuronPoleProfile] = None,
+        tokenizer: Optional[Any] = None,
+        circuit_inputs: Optional[Any] = None,
     ) -> VerificationReport:
         """
         Executes the agent's proposed contrastive & surgical ablation experiments directly
@@ -292,6 +354,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
              causally reduces the logits of `expected_promoted_tokens` and shifts downstream `dst_layer` neurons.
           3. Surgical Pole-Flip Check (`neuron = -max_val`): Measures whether clamping the neuron to its
              negative pole boosts `expected_suppressed_tokens`.
+        Uses `clean_forward()` and `temporary_interventions(...)` so pre-existing user interventions are preserved.
         """
         model = self.injector.model
         model.eval()
@@ -300,16 +363,50 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         neuron_idx = hypothesis.neuron_idx
         exp = hypothesis.proposed_experiment
 
-        pos_ids = [tok_to_id[t] for t in exp.positive_pole_test_tokens if t in tok_to_id] or [0]
-        neg_ids = [tok_to_id[t] for t in exp.negative_pole_test_tokens if t in tok_to_id] or [0]
-        prom_ids = [tok_to_id[t] for t in exp.expected_promoted_tokens if t in tok_to_id]
-        supp_ids = [tok_to_id[t] for t in exp.expected_suppressed_tokens if t in tok_to_id]
+        # Non-tokenized Vision / continuous tensor fallback if circuit_inputs is a float tensor (e.g. [B, C, H, W])
+        if (
+            not tok_to_id
+            and isinstance(circuit_inputs, torch.Tensor)
+            and circuit_inputs.is_floating_point()
+        ):
+            pos_input = circuit_inputs.to(device)
+            neg_input = -circuit_inputs.to(device)
+        else:
+            pos_fallback_ctx = (
+                profile.top_positive_samples[0].context_str
+                if profile and profile.top_positive_samples
+                else None
+            )
+            neg_fallback_ctx = (
+                profile.top_negative_samples[0].context_str
+                if profile and profile.top_negative_samples
+                else None
+            )
+            pos_input = self._encode_context_or_tokens(
+                exp.positive_pole_test_tokens,
+                tok_to_id,
+                device=device,
+                fallback_context=pos_fallback_ctx,
+                tokenizer=tokenizer,
+            )
+            neg_input = self._encode_context_or_tokens(
+                exp.negative_pole_test_tokens,
+                tok_to_id,
+                device=device,
+                fallback_context=neg_fallback_ctx,
+                tokenizer=tokenizer,
+            )
 
-        pos_input = torch.tensor([pos_ids], dtype=torch.long, device=device)
-        neg_input = torch.tensor([neg_ids], dtype=torch.long, device=device)
+        prom_ids = self._resolve_token_ids(
+            exp.expected_promoted_tokens, tok_to_id, tokenizer=tokenizer
+        )
+        supp_ids = self._resolve_token_ids(
+            exp.expected_suppressed_tokens, tok_to_id, tokenizer=tokenizer
+        )
 
         # Helper to capture single neuron activation on an input tensor
         mod, hook_target, _ = LayerDiscovery.resolve_module(model, layer_name)
+        is_conv2d = isinstance(mod, nn.Conv2d)
         captured_acts: List[torch.Tensor] = []
 
         def _cap_pre(_m: nn.Module, inp: Tuple[Any, ...]):
@@ -321,57 +418,106 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             if isinstance(t, torch.Tensor):
                 captured_acts.append(t.detach())
 
+        def _extract_neuron_act(act_tensor: torch.Tensor) -> torch.Tensor:
+            if is_conv2d and act_tensor.ndim == 4:
+                return act_tensor[:, neuron_idx, :, :].float()
+            return act_tensor[..., neuron_idx].float()
+
         h = (
             mod.register_forward_pre_hook(_cap_pre)
             if hook_target == "input"
             else mod.register_forward_hook(_cap_fwd)
         )
         try:
-            self.injector.clear_interventions()
-            clean_pos_out = model(pos_input)
-            clean_pos_logits = (
-                clean_pos_out.logits if hasattr(clean_pos_out, "logits") else clean_pos_out
-            )
-            pos_act_mean = float(captured_acts[-1][..., neuron_idx].mean().item())
+            with self.injector.without_interventions():
+                clean_pos_out = model(pos_input)
+                clean_pos_logits = (
+                    clean_pos_out.logits if hasattr(clean_pos_out, "logits") else clean_pos_out
+                ).float()
+                pos_act_mean = float(_extract_neuron_act(captured_acts[-1]).mean().item())
 
-            model(neg_input)
-            neg_act_mean = float(captured_acts[-1][..., neuron_idx].mean().item())
+                model(neg_input)
+                neg_act_mean = float(_extract_neuron_act(captured_acts[-1]).mean().item())
+
+                # Fallback to full context strings if isolated subwords did not separate poles
+                if (
+                    tok_to_id
+                    and (pos_act_mean <= 0.0 or neg_act_mean >= 0.0)
+                    and profile is not None
+                ):
+                    pos_ctx = (
+                        profile.top_positive_samples[0].context_str
+                        if profile.top_positive_samples
+                        else None
+                    )
+                    neg_ctx = (
+                        profile.top_negative_samples[0].context_str
+                        if profile.top_negative_samples
+                        else None
+                    )
+                    if pos_act_mean <= 0.0 and pos_ctx:
+                        ctx_pos_in = self._encode_context_or_tokens(
+                            [], tok_to_id, device=device, fallback_context=pos_ctx, tokenizer=tokenizer
+                        )
+                        clean_pos_out = model(ctx_pos_in)
+                        clean_pos_logits = (
+                            clean_pos_out.logits
+                            if hasattr(clean_pos_out, "logits")
+                            else clean_pos_out
+                        ).float()
+                        pos_act_mean = float(_extract_neuron_act(captured_acts[-1]).max().item())
+                        pos_input = ctx_pos_in
+                    if neg_act_mean >= 0.0 and neg_ctx:
+                        ctx_neg_in = self._encode_context_or_tokens(
+                            [], tok_to_id, device=device, fallback_context=neg_ctx, tokenizer=tokenizer
+                        )
+                        model(ctx_neg_in)
+                        neg_act_mean = float(_extract_neuron_act(captured_acts[-1]).min().item())
         finally:
             h.remove()
 
         pole_separation_passed = (pos_act_mean > 0.0) and (neg_act_mean < 0.0)
 
         # Test 2: Zero-Ablation on Positive Input (Set neuron = 0.0)
-        self.injector.clear_interventions()
-        self.injector.zero_ablate(layer_name, neuron_indices=neuron_idx, pole=PoleType.BOTH)
-        with self.injector.active_injection():
+        ablate_spec = InterventionSpec(
+            layer_name=layer_name,
+            neuron_indices=[neuron_idx],
+            mode=InterventionMode.ZERO_ABLATE,
+            pole=PoleType.BOTH,
+            value=0.0,
+        )
+        with self.injector.temporary_interventions([ablate_spec]):
             zero_pos_out = model(pos_input)
             zero_pos_logits = (
                 zero_pos_out.logits if hasattr(zero_pos_out, "logits") else zero_pos_out
-            )
+            ).float()
 
         # Test 3: Pole-Flip Clamping on Positive Input (Clamp neuron to strong negative value)
         clamp_neg_val = min(neg_act_mean * 1.5, -5.0)
-        self.injector.clear_interventions()
-        self.injector.clamp_neurons(layer_name, neuron_indices=neuron_idx, value=clamp_neg_val)
-        with self.injector.active_injection():
+        clamp_spec = InterventionSpec(
+            layer_name=layer_name,
+            neuron_indices=[neuron_idx],
+            mode=InterventionMode.HARD_CLAMP,
+            pole=PoleType.BOTH,
+            value=clamp_neg_val,
+        )
+        with self.injector.temporary_interventions([clamp_spec]):
             flip_pos_out = model(pos_input)
             flip_pos_logits = (
                 flip_pos_out.logits if hasattr(flip_pos_out, "logits") else flip_pos_out
-            )
-        self.injector.clear_interventions()
+            ).float()
 
         # Compute logit shifts on expected promoted & suppressed tokens
         if prom_ids:
-            clean_prom = clean_pos_logits[:, :, prom_ids].mean().item()
-            zero_prom = zero_pos_logits[:, :, prom_ids].mean().item()
+            clean_prom = clean_pos_logits[..., prom_ids].mean().item()
+            zero_prom = zero_pos_logits[..., prom_ids].mean().item()
             logit_drop = float(clean_prom - zero_prom)
         else:
             logit_drop = 0.0
 
         if supp_ids:
-            clean_supp = clean_pos_logits[:, :, supp_ids].mean().item()
-            flip_supp = flip_pos_logits[:, :, supp_ids].mean().item()
+            clean_supp = clean_pos_logits[..., supp_ids].mean().item()
+            flip_supp = flip_pos_logits[..., supp_ids].mean().item()
             pole_flip_shift = float(flip_supp - clean_supp)
         else:
             pole_flip_shift = 0.0
@@ -444,6 +590,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         unembed_weight: Optional[torch.Tensor] = None,
         dst_layer: Optional[str] = None,
         circuit_inputs: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
     ) -> BipolarVerbHypothesis:
         """
         Full end-to-end closed-loop agentic workflow:
@@ -472,5 +619,12 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             )
 
         hypothesis = self.generate_hypothesis(profile, circuit)
-        self.verify_hypothesis(hypothesis, tok_to_id=tok_to_id, dst_layer=dst_layer)
+        self.verify_hypothesis(
+            hypothesis,
+            tok_to_id=tok_to_id,
+            dst_layer=dst_layer,
+            profile=profile,
+            tokenizer=tokenizer,
+            circuit_inputs=circuit_inputs,
+        )
         return hypothesis

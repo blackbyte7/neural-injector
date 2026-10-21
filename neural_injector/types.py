@@ -278,7 +278,9 @@ class LayerCleanlinessReport:
 class CompiledSteeringVector:
     """
     Represents a pre-compiled residual-stream steering vector v_steer in R^{d_model}
-    synthesized from one or more neuron-basis interventions in `layer_name`.
+    synthesized from one or more unconditional neuron-basis interventions in `layer_name`.
+    `clamped_neurons` tracks indices whose incoming dynamic activation must be zeroed
+    prior to `down_proj` so that adding `v_steer` reproduces exact `HARD_CLAMP` semantics.
     """
     layer_name: str
     d_model: int
@@ -286,6 +288,7 @@ class CompiledSteeringVector:
     source_deltas: List[float]
     vector_norm: float
     vector_values: List[float]  # Serialized 1D vector of length d_model
+    clamped_neurons: List[int] = field(default_factory=list)
 
 
 @dataclass
