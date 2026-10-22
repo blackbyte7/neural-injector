@@ -22,21 +22,40 @@ class InterventionMode(str, Enum):
     ADDITIVE_STEER = "additive_steer"  # Shift activation by +delta (concept injection)
     WEAK_PRUNE = "weak_prune"  # Zero out weak activations where |a| < threshold (tests "Weak Activations Don't Matter")
     POLE_RECTIFY = "pole_rectify"  # Zero out one pole while preserving the other
+    CONDITIONAL_GATE = "conditional_gate"  # Closed-loop dynamic gating triggered by an upstream/detector neuron
+
+
+class NeuronTaxonomy(str, Enum):
+    """
+    Classification of a neuron's (or single pole's) cleanliness following Cammarata (2026):
+      - CLEAN_MONOSEMANTIC (~90% of neuron poles): Performs a single clear core job / differential split.
+      - STRUCTURED_RECURSIVE_MIXTURE (~7%): Core trunk motif with related semantic offshoots.
+      - TRUE_POLYSEMANTIC (~3%): Unrelated concepts superposed on the same pole.
+      - DEAD_OR_NOISY: Near-zero variance or flat unselective firing.
+    """
+    CLEAN_MONOSEMANTIC = "clean_monosemantic"
+    STRUCTURED_RECURSIVE_MIXTURE = "structured_recursive_mixture"
+    TRUE_POLYSEMANTIC = "true_polysemantic"
+    DEAD_OR_NOISY = "dead_or_noisy"
 
 
 @dataclass
 class ActivationSample:
-    """Stores a single top-activating or top-inhibiting context example for a neuron pole."""
+    """Stores a single top-activating or quantile-stratified context example for a neuron pole."""
     activation_value: float
     sample_id: int
     position_idx: Optional[int] = None  # Token index (for sequences) or spatial index (for CNNs)
     token_str: Optional[str] = None  # Decoded focal token or patch label
     context_str: Optional[str] = None  # Surrounding text window or sample metadata
+    quantile_band: Optional[str] = None  # "peak_trunk", "secondary_branch", or "tertiary_offshoot"
 
 
 @dataclass
 class NeuronPoleProfile:
-    """Detailed statistical and semantic profile for a single neuron across both poles."""
+    """
+    Detailed statistical and semantic profile for a single neuron across both poles,
+    including conditional pole-specific selectivity/taxonomy and stratified quantile bands.
+    """
     layer_name: str
     neuron_idx: int
     mean: float
@@ -45,27 +64,67 @@ class NeuronPoleProfile:
     min_val: float
     positive_firing_rate: float
     negative_firing_rate: float
-    pole_selectivity_score: float  # Measures how sharply peaked/clean the neuron's top activations are (kurtosis/tail)
+    pole_selectivity_score: float  # Combined full-distribution 4th-moment tail selectivity
     top_positive_samples: List[ActivationSample] = field(default_factory=list)
     top_negative_samples: List[ActivationSample] = field(default_factory=list)
     top_promoted_tokens: List[Tuple[str, float]] = field(default_factory=list)
     top_suppressed_tokens: List[Tuple[str, float]] = field(default_factory=list)
 
+    # Pole-specific conditional statistics (Cammarata Section 3.1: Evaluating Poles Independently)
+    pos_pole_mean: float = 0.0
+    pos_pole_std: float = 0.0
+    pos_pole_selectivity_score: float = 0.0
+    pos_taxonomy_class: NeuronTaxonomy = NeuronTaxonomy.DEAD_OR_NOISY
+    neg_pole_mean: float = 0.0
+    neg_pole_std: float = 0.0
+    neg_pole_selectivity_score: float = 0.0
+    neg_taxonomy_class: NeuronTaxonomy = NeuronTaxonomy.DEAD_OR_NOISY
+
+    # Stratified quantile activation buckets per pole (Cammarata Section 3.3: Recursive Generalization Offshoots)
+    # Keys: "peak_trunk" ([80%..100%]), "secondary_branch" ([40%..80%)), "tertiary_offshoot" ([15%..40%))
+    positive_quantile_buckets: Dict[str, List[ActivationSample]] = field(default_factory=dict)
+    negative_quantile_buckets: Dict[str, List[ActivationSample]] = field(default_factory=dict)
+
     @property
     def is_clean_candidate(self) -> bool:
-        """Heuristic following Cammarata (2026): high tail selectivity indicates a focused, clean pole."""
-        return self.pole_selectivity_score >= 2.5
+        """Heuristic following Cammarata (2026): high tail selectivity on either pole or overall."""
+        return (
+            self.pole_selectivity_score >= 2.5
+            or self.pos_pole_selectivity_score >= 2.1
+            or self.neg_pole_selectivity_score >= 2.1
+        )
+
+
+@dataclass
+class GateConditionSpec:
+    """
+    Defines a closed-loop conditional trigger for `InterventionMode.CONDITIONAL_GATE` (Section 5.2):
+    Only applies `action_mode` to the target neuron(s) when `detector_neuron` in `detector_layer`
+    fires on `detector_pole` with magnitude exceeding `threshold`.
+    """
+    detector_layer: str
+    detector_neuron: int
+    detector_pole: PoleType = PoleType.POSITIVE
+    threshold: float = 0.5
+    action_mode: InterventionMode = InterventionMode.ADDITIVE_STEER
+    sequence_scope: str = "token_wise"  # "token_wise" (per token position) or "any_token" (whole sequence)
 
 
 @dataclass
 class InterventionSpec:
-    """Specification for a surgical intervention on one or more neurons in a layer."""
+    """
+    Specification for a surgical intervention on one or more neurons in a layer.
+    Supports scalar `value`, native per-neuron adaptive values via `per_neuron_values`,
+    and closed-loop dynamic concept gating via `gate_condition`.
+    """
     layer_name: str
     neuron_indices: List[int]
     mode: InterventionMode = InterventionMode.ZERO_ABLATE
     pole: PoleType = PoleType.BOTH
-    value: float = 0.0  # Used as clamp constant, scale factor, shift delta, or weak threshold
+    value: float = 0.0  # Default scalar clamp constant, scale factor, shift delta, or weak threshold
+    per_neuron_values: Optional[List[float]] = None  # Optional per-neuron values aligned with `neuron_indices`
     token_positions: Optional[List[int]] = None  # If None, applies across all sequence/spatial positions
+    gate_condition: Optional[GateConditionSpec] = None  # Optional upstream/same-layer detector trigger
     custom_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     enabled: bool = True
 
@@ -174,18 +233,24 @@ class CircuitGraph:
         }
 
 
-class NeuronTaxonomy(str, Enum):
+@dataclass
+class DownstreamReadoutReport:
     """
-    Classification of a neuron's cleanliness following Cammarata (2026):
-      - CLEAN_MONOSEMANTIC (~90% of neuron poles): Performs a single clear core job / differential split.
-      - STRUCTURED_RECURSIVE_MIXTURE (~7%): Core trunk motif with related semantic offshoots.
-      - TRUE_POLYSEMANTIC (~3%): Unrelated concepts superposed on the same pole.
-      - DEAD_OR_NOISY: Near-zero variance or flat unselective firing.
+    Empirical audit report for Cammarata's 'Nothing Reads That Combination' hypothesis (Section 3.5).
+    Tests whether weak/secondary cross-activations across a group of neurons in `src_layer`
+    actually cross the gating/activation threshold of any downstream neuron in `dst_layer`.
     """
-    CLEAN_MONOSEMANTIC = "clean_monosemantic"
-    STRUCTURED_RECURSIVE_MIXTURE = "structured_recursive_mixture"
-    TRUE_POLYSEMANTIC = "true_polysemantic"
-    DEAD_OR_NOISY = "dead_or_noisy"
+    src_layer: str
+    dst_layer: str
+    src_neurons: List[int]
+    applied_thresholds: List[float]
+    max_downstream_activation_shift: float
+    mean_downstream_activation_shift: float
+    max_downstream_gate_shift: float
+    mean_downstream_gate_shift: float
+    readout_tolerance: float
+    affected_downstream_neurons: List[int] = field(default_factory=list)
+    is_benign_spillover: bool = True
 
 
 @dataclass
@@ -237,6 +302,117 @@ class BipolarVerbHypothesis:
 
 
 @dataclass
+class EcologyNeighborContext:
+    """
+    Represents an already-explained upstream or downstream neighbor clue injected into
+    the Crossword / CircuitEcologyMap solver loop (Cammarata Section 3.2: 'Understanding Compounds').
+    """
+    layer_name: str
+    neuron_idx: int
+    direction: str  # "upstream" or "downstream"
+    role: str
+    mean_causal_delta: float
+    positive_pole_motif: str
+    negative_pole_motif: str
+    unified_verb_hypothesis: str
+    confidence_score: float
+
+
+@dataclass
+class LayerEcologySolveReport:
+    """
+    Summary of a multi-pass Crossword / Circuit Ecology solve across a layer.
+    Pass 1 solves high-selectivity monosemantic 'anchor' neurons; Pass 2 uses those
+    verified anchor motifs to constrain and explain harder recursive-mixture neurons.
+    """
+    layer_name: str
+    anchor_neurons_explained: List[int]
+    contextual_neurons_explained: List[int]
+    hypotheses: Dict[int, BipolarVerbHypothesis] = field(default_factory=dict)
+    mean_verification_score: float = 0.0
+
+
+@dataclass
+class ContrastiveNeuronMatch:
+    """
+    Represents a single native-basis neuron ranked by its Bipolar Separation t-statistic
+    across two contrastive prompt sets D+ and D- (Section 5.3).
+    """
+    layer_name: str
+    neuron_idx: int
+    t_statistic: float  # Signed Welch's t-statistic: (mu_pos - mu_neg) / sqrt(var_pos/N+ + var_neg/N-)
+    abs_t_statistic: float
+    pos_mean: float
+    neg_mean: float
+    pos_std: float
+    neg_std: float
+    bipolar_sign_flip: bool  # True if mu_pos and mu_neg have opposite signs (true bipolar verb split)
+    recommended_pole: PoleType
+
+
+@dataclass
+class ContrastiveDiscoveryReport:
+    """
+    Report returned by `discover_contrastive_neurons` ranking native neurons across layers
+    that best separate positive vs. negative behavioral datasets without an SAE.
+    """
+    layers_scanned: List[str]
+    pos_tokens_count: int
+    neg_tokens_count: int
+    top_matches: List[ContrastiveNeuronMatch] = field(default_factory=list)
+
+
+@dataclass
+class NeuronCheckpointSnapshot:
+    """
+    Captures a single neuron's statistical, structural, and quantile-bucket state at one
+    training checkpoint or fine-tuning stage (Section 5.4).
+    """
+    checkpoint_label: str
+    mean: float
+    std: float
+    pos_pole_selectivity: float
+    neg_pole_selectivity: float
+    pos_taxonomy: NeuronTaxonomy
+    neg_taxonomy: NeuronTaxonomy
+    outgoing_weight_norm: float
+    weight_cosine_to_final: float
+    peak_trunk_tokens: List[str] = field(default_factory=list)
+    secondary_branch_tokens: List[str] = field(default_factory=list)
+    tertiary_offshoot_tokens: List[str] = field(default_factory=list)
+
+
+@dataclass
+class NeuronEvolutionReport:
+    """
+    Tracks how a neuron's selectivity, weight direction, and recursive offshoots evolve
+    across a sequence of checkpoints or LoRA adapters (Section 5.4).
+    """
+    layer_name: str
+    neuron_idx: int
+    snapshots: List[NeuronCheckpointSnapshot] = field(default_factory=list)
+    emerged_offshoot_tokens: List[str] = field(default_factory=list)
+    selectivity_delta_pos: float = 0.0
+    selectivity_delta_neg: float = 0.0
+
+
+@dataclass
+class SynergisticAblationResult:
+    """
+    Result of `AblationMaskOptimizer` (Section 5.5) identifying a minimal coalition of k neurons
+    whose joint surgical ablation overcomes backup circuits to maximize causal impact or flip behavior.
+    """
+    layer_name: str
+    method: str  # "greedy" or "l1_optim"
+    selected_neurons: List[int]
+    stepwise_scores: List[float]
+    joint_ablation_kl: float
+    sum_of_individual_kls: float
+    synergy_ratio: float  # joint_ablation_kl / max(sum_of_individual_kls, 1e-9)
+    target_logit_shift: float = 0.0
+
+
+@dataclass
 class NeuronScanSummary:
     """Compact layer-wide audit metrics for a single neuron used in rankings and heatmaps."""
     neuron_idx: int
@@ -254,13 +430,17 @@ class NeuronScanSummary:
     ablation_kl_divergence: Optional[float] = None
     top_pos_token: Optional[str] = None
     top_neg_token: Optional[str] = None
+    pos_pole_selectivity_score: float = 0.0
+    neg_pole_selectivity_score: float = 0.0
+    pos_taxonomy_class: NeuronTaxonomy = NeuronTaxonomy.DEAD_OR_NOISY
+    neg_taxonomy_class: NeuronTaxonomy = NeuronTaxonomy.DEAD_OR_NOISY
 
 
 @dataclass
 class LayerCleanlinessReport:
     """
     Aggregated layer-wide cleanliness audit report mirroring Cammarata (2026).
-    Provides exact taxonomy percentages and ranked neuron summaries.
+    Provides both whole-neuron and independent pole-level taxonomy percentages.
     """
     layer_name: str
     num_neurons: int
@@ -272,6 +452,11 @@ class LayerCleanlinessReport:
     combined_clean_and_structured_pct: float
     mean_selectivity_score: float
     neurons: List[NeuronScanSummary] = field(default_factory=list)
+    pole_taxonomy_counts: Dict[str, int] = field(default_factory=dict)
+    pole_taxonomy_percentages: Dict[str, float] = field(default_factory=dict)
+    clean_poles_pct: float = 0.0
+    structured_poles_pct: float = 0.0
+    combined_clean_and_structured_poles_pct: float = 0.0
 
 
 @dataclass

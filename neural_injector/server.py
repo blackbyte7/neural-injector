@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -27,6 +29,7 @@ class InterventionRequest(BaseModel):
     mode: InterventionMode = Field(default=InterventionMode.ZERO_ABLATE)
     pole: PoleType = Field(default=PoleType.BOTH)
     value: float = Field(default=0.0)
+    per_neuron_values: Optional[List[float]] = Field(default=None)
     token_positions: Optional[List[int]] = Field(default=None)
 
 
@@ -65,17 +68,28 @@ class ImportPresetRequest(BaseModel):
 
 
 # =============================================================================
-# 2. FastAPI Factory & Endpoints
+# 2. FastAPI Factory & Thread-Safe, Path-Hardened Endpoints (Sections 4.1 & 4.2)
 # =============================================================================
-def create_workbench_app(session: Optional[WorkbenchSession] = None) -> FastAPI:
+def create_workbench_app(
+    session: Optional[WorkbenchSession] = None,
+    allowed_workspace_dir: Optional[Union[str, Path]] = None,
+) -> FastAPI:
     wb_session = session or WorkbenchSession.create_demo_session()
+    if allowed_workspace_dir is not None:
+        wb_session.injector.allowed_workspace_dir = Path(allowed_workspace_dir).resolve()
+    elif wb_session.injector.allowed_workspace_dir is None:
+        wb_session.injector.allowed_workspace_dir = Path.cwd().resolve()
 
     app = FastAPI(
         title="Neural Injector Workbench API",
         description="Bipolar Neuron Auditor, Surgical Activation Injector, Circuit Tracer & Agentic Explainer",
-        version="0.5.0",
+        version="0.6.0",
     )
-    app.state.session = wb_session
+    session_lock = asyncio.Lock()
+    app_state = getattr(app, "state", None)
+    if app_state is not None:
+        setattr(app_state, "session", wb_session)
+        setattr(app_state, "lock", session_lock)
 
     @app.get("/api/layers")
     async def list_layers(include_all_linear: bool = False) -> Dict[str, Any]:
@@ -97,15 +111,16 @@ def create_workbench_app(session: Optional[WorkbenchSession] = None) -> FastAPI:
 
     @app.post("/api/audit")
     async def audit_layers(req: AuditRequest) -> Dict[str, Any]:
-        try:
-            return wb_session.run_audit(
-                layer_names=req.layer_names,
-                prompts=req.prompts,
-                top_k=req.top_k,
-                tracked_neurons=req.tracked_neurons,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with session_lock:
+            try:
+                return wb_session.run_audit(
+                    layer_names=req.layer_names,
+                    prompts=req.prompts,
+                    top_k=req.top_k,
+                    tracked_neurons=req.tracked_neurons,
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/layers/{layer_name}/scan")
     async def scan_layer_cleanliness(
@@ -114,18 +129,19 @@ def create_workbench_app(session: Optional[WorkbenchSession] = None) -> FastAPI:
         compute_kl_top_n: int = 3,
         limit: int = 64,
     ) -> Dict[str, Any]:
-        try:
-            kl_inputs, _ = wb_session.encode_prompt("the system negotiated AES256 TLS cipher")
-            report = wb_session.injector.scan_layer_cleanliness(
-                layer_name=layer_name,
-                sort_by=sort_by,
-                compute_kl_for_top_n=compute_kl_top_n,
-                kl_eval_inputs=kl_inputs if compute_kl_top_n > 0 else None,
-                limit=limit,
-            )
-            return asdict(report)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        async with session_lock:
+            try:
+                kl_inputs, _ = wb_session.encode_prompt("the system negotiated AES256 TLS cipher")
+                report = wb_session.injector.scan_layer_cleanliness(
+                    layer_name=layer_name,
+                    sort_by=sort_by,
+                    compute_kl_for_top_n=compute_kl_top_n,
+                    kl_eval_inputs=kl_inputs if compute_kl_top_n > 0 else None,
+                    limit=limit,
+                )
+                return asdict(report)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/layers/{layer_name}/neurons/{neuron_idx}")
     async def get_neuron_profile(layer_name: str, neuron_idx: int) -> Dict[str, Any]:
@@ -148,95 +164,107 @@ def create_workbench_app(session: Optional[WorkbenchSession] = None) -> FastAPI:
 
     @app.post("/api/interventions")
     async def add_intervention(req: InterventionRequest) -> Dict[str, Any]:
-        spec = InterventionSpec(
-            layer_name=req.layer_name,
-            neuron_indices=req.neuron_indices,
-            mode=req.mode,
-            pole=req.pole,
-            value=req.value,
-            token_positions=req.token_positions,
-        )
-        wb_session.injector.add_intervention(spec)
-        return {
-            "status": "registered",
-            "active_count": wb_session.injector.active_intervention_count,
-            "intervention": asdict(spec),
-        }
+        async with session_lock:
+            spec = InterventionSpec(
+                layer_name=req.layer_name,
+                neuron_indices=req.neuron_indices,
+                mode=req.mode,
+                pole=req.pole,
+                value=req.value,
+                per_neuron_values=req.per_neuron_values,
+                token_positions=req.token_positions,
+            )
+            wb_session.injector.add_intervention(spec)
+            return {
+                "status": "registered",
+                "active_count": wb_session.injector.active_intervention_count,
+                "intervention": asdict(spec),
+            }
 
     @app.delete("/api/interventions")
     async def clear_interventions() -> Dict[str, Any]:
-        wb_session.injector.clear_interventions()
-        return {"status": "cleared", "active_count": 0}
+        async with session_lock:
+            wb_session.injector.clear_interventions()
+            return {"status": "cleared", "active_count": 0}
 
     @app.post("/api/evaluate")
     async def evaluate_prompt(req: EvaluateRequest) -> Dict[str, Any]:
-        return wb_session.evaluate_prompt_comparison(
-            prompt=req.prompt, top_k_logits=req.top_k_logits
-        )
+        async with session_lock:
+            return wb_session.evaluate_prompt_comparison(
+                prompt=req.prompt, top_k_logits=req.top_k_logits
+            )
 
     @app.post("/api/circuits/trace")
     async def trace_circuit(req: CircuitTraceRequest) -> Dict[str, Any]:
-        try:
-            input_ids, _ = wb_session.encode_prompt(req.prompt)
-            graph = wb_session.injector.trace_circuit(
-                src_layer=req.src_layer,
-                dst_layer=req.dst_layer,
-                src_neuron=req.src_neuron,
-                inputs=input_ids,
-                src_pole=req.src_pole,
-                compute_jacobian=req.compute_jacobian,
-                top_k=req.top_k,
-            )
-            return graph.to_agent_payload()
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with session_lock:
+            try:
+                input_ids, _ = wb_session.encode_prompt(req.prompt)
+                graph = wb_session.injector.trace_circuit(
+                    src_layer=req.src_layer,
+                    dst_layer=req.dst_layer,
+                    src_neuron=req.src_neuron,
+                    inputs=input_ids,
+                    src_pole=req.src_pole,
+                    compute_jacobian=req.compute_jacobian,
+                    top_k=req.top_k,
+                )
+                return graph.to_agent_payload()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/explain")
     async def explain_neuron(req: ExplainRequest) -> Dict[str, Any]:
-        try:
-            circuit_inputs = None
-            if req.dst_layer and req.circuit_prompt:
-                circuit_inputs, _ = wb_session.encode_prompt(req.circuit_prompt)
+        async with session_lock:
+            try:
+                circuit_inputs = None
+                if req.dst_layer and req.circuit_prompt:
+                    circuit_inputs, _ = wb_session.encode_prompt(req.circuit_prompt)
 
-            hypothesis = wb_session.injector.explain_neuron(
-                layer_name=req.layer_name,
-                neuron_idx=req.neuron_idx,
-                tok_to_id=wb_session.tok_to_id,
-                idx_to_token=wb_session.id_to_tok,
-                unembed_weight=wb_session.unembed_weight,
-                dst_layer=req.dst_layer,
-                circuit_inputs=circuit_inputs,
-            )
-            return asdict(hypothesis)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+                hypothesis = wb_session.injector.explain_neuron(
+                    layer_name=req.layer_name,
+                    neuron_idx=req.neuron_idx,
+                    tok_to_id=wb_session.tok_to_id,
+                    idx_to_token=wb_session.id_to_tok,
+                    unembed_weight=wb_session.unembed_weight,
+                    dst_layer=req.dst_layer,
+                    circuit_inputs=circuit_inputs,
+                )
+                return asdict(hypothesis)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/export/preset")
     async def export_preset(req: ExportPresetRequest) -> Dict[str, Any]:
-        bundle = wb_session.injector.export_production_preset(
-            preset_name=req.preset_name,
-            model_name=wb_session.model_name,
-            description=req.description,
-            save_json_path=req.save_json_path,
-            save_pt_vectors_path=req.save_pt_vectors_path,
-        )
-        return asdict(bundle)
+        async with session_lock:
+            try:
+                bundle = wb_session.injector.export_production_preset(
+                    preset_name=req.preset_name,
+                    model_name=wb_session.model_name,
+                    description=req.description,
+                    save_json_path=req.save_json_path,
+                    save_pt_vectors_path=req.save_pt_vectors_path,
+                )
+                return asdict(bundle)
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     @app.post("/api/import/preset")
     async def import_preset(req: ImportPresetRequest) -> Dict[str, Any]:
-        bundle = wb_session.injector.load_production_preset(
-            preset_data_or_path=req.preset_payload,
-            replace_existing=req.replace_existing,
-        )
-        return {
-            "status": "imported",
-            "preset_name": bundle.preset_name,
-            "active_interventions": len(bundle.interventions),
-        }
+        async with session_lock:
+            bundle = wb_session.injector.load_production_preset(
+                preset_data_or_path=req.preset_payload,
+                replace_existing=req.replace_existing,
+            )
+            return {
+                "status": "imported",
+                "preset_name": bundle.preset_name,
+                "active_interventions": len(bundle.interventions),
+            }
 
     @app.post("/api/export/fold-weights")
     async def fold_weights() -> Dict[str, Any]:
-        return wb_session.injector.fold_interventions_into_weights()
+        async with session_lock:
+            return wb_session.injector.fold_interventions_into_weights()
 
     @app.get("/", response_class=HTMLResponse)
     async def workbench_ui() -> HTMLResponse:
@@ -259,7 +287,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   <div class="max-w-7xl mx-auto space-y-6">
     <header class="flex items-center justify-between border-b border-slate-800 pb-4">
       <div>
-        <h1 class="text-2xl font-bold text-emerald-400">Neural Injector Workbench v0.5</h1>
+        <h1 class="text-2xl font-bold text-emerald-400">Neural Injector Workbench v0.6</h1>
         <p class="text-sm text-slate-400">Bipolar Auditor • Layer-Wide Cleanliness Scanner • Surgical Injector • Circuit Tracer • Production Steering Exporter</p>
       </div>
       <span id="model-badge" class="px-3 py-1 rounded bg-slate-800 text-xs font-mono text-emerald-300">Loading...</span>
@@ -270,7 +298,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 class="text-lg font-semibold text-indigo-400">1. Batch Layer-Wide Cleanliness Scanner</h2>
-          <p class="text-xs text-slate-400">Scans all neurons in parallel using GPU Welford 4th-moment kurtosis &amp; outgoing residual norms. Click any neuron tile to inspect it.</p>
+          <p class="text-xs text-slate-400">Scans all neurons &amp; poles in parallel using GPU Welford 4th-moment kurtosis &amp; outgoing residual norms. Click any neuron tile to inspect it.</p>
         </div>
         <div class="flex items-center gap-2">
           <select id="scan-sort" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
@@ -288,7 +316,6 @@ WORKBENCH_HTML = """<!DOCTYPE html>
 
     <!-- Row 2: Inspector, Surgical Injector, Circuit Tracer -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      <!-- Panel 2: Bipolar Neuron Inspector -->
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
         <h2 class="text-lg font-semibold text-sky-400">2. Bipolar Neuron Inspector</h2>
         <div class="grid grid-cols-2 gap-3">
@@ -347,7 +374,6 @@ WORKBENCH_HTML = """<!DOCTYPE html>
         <pre id="eval-output" class="bg-slate-950 p-3 rounded text-xs font-mono overflow-auto max-h-64 text-slate-300"></pre>
       </div>
 
-      <!-- Panel 4: Circuit Tracer & Production Steering Export -->
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
         <h2 class="text-lg font-semibold text-emerald-400">4. Circuit Tracer &amp; Steering Exporter</h2>
         <div class="grid grid-cols-2 gap-2">
@@ -398,7 +424,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
 
       document.getElementById('scan-metrics').innerHTML = `
         <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Clean Monosemantic</span><span class="text-lg font-bold text-emerald-400">${data.clean_monosemantic_pct}%</span></div>
-        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Structured Recursive</span><span class="text-lg font-bold text-sky-400">${data.structured_recursive_pct}%</span></div>
+        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Clean Poles (+ / -)</span><span class="text-lg font-bold text-sky-400">${data.clean_poles_pct}%</span></div>
         <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Combined Clean + Structured</span><span class="text-lg font-bold text-indigo-400">${data.combined_clean_and_structured_pct}%</span></div>
         <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Mean Selectivity Score</span><span class="text-lg font-bold text-amber-400">${data.mean_selectivity_score}</span></div>
       `;

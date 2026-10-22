@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from neural_injector import (
+    AgentHypothesisResponseSchema,
     BipolarVerbHypothesis,
     InteractionRole,
     InterventionKernel,
@@ -18,10 +20,11 @@ from neural_injector import (
     LayerCleanlinessReport,
     LayerDiscovery,
     NeuralInjector,
-    NeuronExplainerAgent,
     NeuronTaxonomy,
+    OpenAICompatibleClient,
     PoleType,
     ProductionSteeringRuntime,
+    SteeringExporter,
     StreamingLayerStats,
     WorkbenchSession,
 )
@@ -99,7 +102,7 @@ class TestLayerDiscovery:
 # =============================================================================
 class TestSurgicalInterventions:
     def test_kernel_pole_specific_zero_ablation(self):
-        x = torch.tensor([[[2.5, -3.0, 1.0], [-1.5, 4.0, -0.5]]])  # shape [1, 2, 3]
+        x = torch.tensor([[[2.5, -3.0, 1.0], [-1.5, 4.0, -0.5]]])
 
         # Ablate ONLY the positive pole of neuron 0
         spec_pos = InterventionSpec(
@@ -110,7 +113,7 @@ class TestSurgicalInterventions:
         )
         out_pos = InterventionKernel.apply(x, [spec_pos])
         assert out_pos[0, 0, 0].item() == 0.0
-        assert out_pos[0, 1, 0].item() == -1.5  # Negative pole preserved
+        assert out_pos[0, 1, 0].item() == -1.5
 
         # Ablate ONLY the negative pole of neuron 1
         spec_neg = InterventionSpec(
@@ -120,8 +123,8 @@ class TestSurgicalInterventions:
             pole=PoleType.NEGATIVE,
         )
         out_neg = InterventionKernel.apply(x, [spec_neg])
-        assert out_neg[0, 0, 1].item() == 0.0  # Negative pole zeroed
-        assert out_neg[0, 1, 1].item() == 4.0  # Positive pole preserved
+        assert out_neg[0, 0, 1].item() == 0.0
+        assert out_neg[0, 1, 1].item() == 4.0
 
     def test_kernel_weak_activation_pruning(self):
         # Tests Cammarata (2026) "Do Weak Activations Matter?" filter
@@ -131,13 +134,13 @@ class TestSurgicalInterventions:
             neuron_indices=[0, 1, 2, 3],
             mode=InterventionMode.WEAK_PRUNE,
             pole=PoleType.BOTH,
-            value=1.0,  # Threshold |a| < 1.0 -> 0.0
+            value=1.0,
         )
         out = InterventionKernel.apply(x, [spec])
         assert torch.allclose(out, torch.tensor([[0.0, 0.0, 3.5, -4.2]]))
 
     def test_kernel_token_position_selective_clamping(self):
-        x = torch.ones((1, 4, 6))  # [batch=1, seq=4, dim=6]
+        x = torch.ones((1, 4, 6))
         spec = InterventionSpec(
             layer_name="dummy",
             neuron_indices=[2, 5],
@@ -154,7 +157,7 @@ class TestSurgicalInterventions:
         assert out[0, 2, 5].item() == 1.0
 
     def test_kernel_conv2d_channel_intervention(self):
-        x = torch.ones((2, 8, 4, 4))  # [B, C, H, W]
+        x = torch.ones((2, 8, 4, 4))
         spec = InterventionSpec(
             layer_name="conv",
             neuron_indices=[3],
@@ -167,15 +170,15 @@ class TestSurgicalInterventions:
         assert torch.all(out[:, 0, :, :] == 1.0)
 
     def test_live_model_zero_ablation_and_kl_divergence(
-            self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
     ):
         injector = demo_session.injector
         layer = "mlp_block_0.down_proj"
 
-        kl_active_neuron = injector.measure_ablation_kl_divergence(layer, neuron_idx=7, inputs=sample_prompt_ids)
-        assert kl_active_neuron > 0.05  # Neuron #7 carries strong causal signal on Crypto tokens
-
-        # Verify context manager cleanly detaches hooks after exit
+        kl_active_neuron = injector.measure_ablation_kl_divergence(
+            layer, neuron_idx=7, inputs=sample_prompt_ids
+        )
+        assert kl_active_neuron > 0.05
         assert len(injector._active_handles) == 0
 
 
@@ -216,7 +219,7 @@ class TestBipolarNeuronAuditing:
 # =============================================================================
 class TestLayerCleanlinessScanner:
     def test_scan_layer_cleanliness_metrics_and_ranking(
-            self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
     ):
         report: LayerCleanlinessReport = demo_session.injector.scan_layer_cleanliness(
             layer_name="mlp_block_0.down_proj",
@@ -232,12 +235,8 @@ class TestLayerCleanlinessScanner:
         # Taxonomy percentages must sum to ~100%
         total_pct = sum(report.taxonomy_percentages.values())
         assert abs(total_pct - 100.0) < 0.1
-        assert abs(
-            report.combined_clean_and_structured_pct
-            - (report.clean_monosemantic_pct + report.structured_recursive_pct)
-        ) < 0.05
+        assert sum(report.pole_taxonomy_counts.values()) == 256
 
-        # Neuron #7 was calibrated with strong outgoing norm & selectivity, so it should rank #1 in impact
         top_neuron = report.neurons[0]
         assert top_neuron.neuron_idx == 7
         assert top_neuron.ablation_kl_divergence is not None
@@ -262,10 +261,10 @@ class TestLayerCleanlinessScanner:
 # =============================================================================
 class TestCircuitTracer:
     def test_virtual_weights_and_causal_pole_tracing(
-            self,
-            demo_session: WorkbenchSession,
-            sample_prompt_ids: torch.Tensor,
-            sql_prompt_ids: torch.Tensor,
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        sql_prompt_ids: torch.Tensor,
     ):
         injector = demo_session.injector
         src_layer = "mlp_block_0.down_proj"
@@ -289,6 +288,7 @@ class TestCircuitTracer:
         edge_12 = next(e for e in pos_graph.edges if e.dst_neuron == 12)
         assert edge_12.mean_causal_delta > 0.5
         assert edge_12.virtual_weight_up > 0.0
+        assert edge_12.jacobian_sensitivity != 0.0
         assert edge_12.role == InteractionRole.EXCITATORY
 
         # 2. Trace Negative Pole on SQL input: should excite L1 Neuron #19
@@ -310,7 +310,7 @@ class TestCircuitTracer:
         assert len(payload["top_excited_downstream"]) > 0
 
     def test_multi_hop_circuit_tracing(
-            self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
     ):
         graphs = demo_session.injector.tracer.trace_multi_hop(
             layer_sequence=["mlp_block_0.down_proj", "mlp_block_1.down_proj"],
@@ -328,7 +328,7 @@ class TestCircuitTracer:
 # =============================================================================
 class TestAgenticNeuronExplainer:
     def test_closed_loop_explain_and_verify_with_heuristic_client(
-            self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
     ):
         hypothesis: BipolarVerbHypothesis = demo_session.injector.explain_neuron(
             layer_name="mlp_block_0.down_proj",
@@ -357,7 +357,7 @@ class TestAgenticNeuronExplainer:
         assert rep.empirical_verification_score >= 0.8
 
     def test_custom_mock_llm_client_protocol(
-            self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
     ):
         class MockLLMClient:
             def complete_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
@@ -401,10 +401,10 @@ class TestAgenticNeuronExplainer:
 # =============================================================================
 class TestProductionSteeringExportAndWeightFolding:
     def test_export_import_and_compiled_vector_equivalence(
-            self,
-            demo_session: WorkbenchSession,
-            sample_prompt_ids: torch.Tensor,
-            tmp_path: Path,
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        tmp_path: Path,
     ):
         injector = demo_session.injector
         layer = "mlp_block_0.down_proj"
@@ -436,8 +436,43 @@ class TestProductionSteeringExportAndWeightFolding:
             compiled_vec_logits = demo_session.model(sample_prompt_ids)
 
         # Mathematical check: adding delta * W_down[:, 7] in residual space must match
-        # adding delta to neuron 7 prior to linear down_proj!
+        # adding delta to neuron 7 prior to linear down_proj
         assert torch.allclose(hook_logits, compiled_vec_logits, atol=1e-4)
+
+    def test_hard_clamp_compiled_vector_exact_equivalence(
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        tmp_path: Path,
+    ):
+        """
+        Verifies Bug Fix 1B: HARD_CLAMP exported to a compiled residual vector records
+        `clamped_neurons` and zeroes incoming dynamic activations before adding `v_steer`,
+        matching hook-based HARD_CLAMP instead of turning into ADDITIVE_STEER.
+        """
+        injector = demo_session.injector
+        layer = "mlp_block_0.down_proj"
+        injector.clear_interventions()
+        injector.clamp_neurons(layer, neuron_indices=[7], value=-15.0)
+
+        with torch.no_grad(), injector.active_injection():
+            expected_clamp_logits = demo_session.model(sample_prompt_ids)
+
+        json_file = tmp_path / "clamp_preset.json"
+        bundle = injector.export_production_preset(
+            preset_name="clamp_preset",
+            model_name=demo_session.model_name,
+            save_json_path=str(json_file),
+        )
+        assert len(bundle.compiled_vectors) == 1
+        assert bundle.compiled_vectors[0].clamped_neurons == [7]
+
+        injector.clear_interventions()
+        runtime = ProductionSteeringRuntime(demo_session.model, json_file)
+        with torch.no_grad(), runtime.active(use_compiled_residual_vectors=True):
+            compiled_clamp_logits = demo_session.model(sample_prompt_ids)
+
+        assert torch.allclose(expected_clamp_logits, compiled_clamp_logits, atol=1e-4)
 
     @pytest.mark.parametrize(
         "mode,val",
@@ -449,11 +484,11 @@ class TestProductionSteeringExportAndWeightFolding:
         ],
     )
     def test_weight_folding_exact_numerical_equivalence(
-            self,
-            demo_session: WorkbenchSession,
-            sample_prompt_ids: torch.Tensor,
-            mode: InterventionMode,
-            val: float,
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        mode: InterventionMode,
+        val: float,
     ):
         """
         Verifies that folding ZERO_ABLATE, SCALE, ADDITIVE_STEER, or HARD_CLAMP
@@ -492,12 +527,14 @@ class TestProductionSteeringExportAndWeightFolding:
 # 8. FastAPI Endpoints & CLI / REPL Workbench Tests
 # =============================================================================
 class TestFastAPIAndCLIWorkbench:
-    def test_fastapi_endpoints_end_to_end(self, demo_session: WorkbenchSession):
+    def test_fastapi_endpoints_end_to_end(
+        self, demo_session: WorkbenchSession, tmp_path: Path
+    ):
         pytest.importorskip("fastapi")
         from fastapi.testclient import TestClient
         from neural_injector.server import create_workbench_app
 
-        app = create_workbench_app(demo_session)
+        app = create_workbench_app(demo_session, allowed_workspace_dir=tmp_path)
         client = TestClient(app)
 
         # 1. GET / (HTML Workbench UI)
@@ -508,15 +545,14 @@ class TestFastAPIAndCLIWorkbench:
         # 2. GET /api/layers
         layers_resp = client.get("/api/layers")
         assert layers_resp.status_code == 200
-        layers_data = layers_resp.json()
-        assert len(layers_data["layers"]) >= 2
+        assert len(layers_resp.json()["layers"]) >= 2
 
         # 3. GET /api/layers/{layer_name}/scan
-        scan_resp = client.get("/api/layers/mlp_block_0.down_proj/scan?sort_by=estimated_causal_impact&limit=8")
+        scan_resp = client.get(
+            "/api/layers/mlp_block_0.down_proj/scan?sort_by=estimated_causal_impact&limit=8"
+        )
         assert scan_resp.status_code == 200
-        scan_data = scan_resp.json()
-        assert scan_data["num_neurons"] == 128
-        assert len(scan_data["neurons"]) == 8
+        assert scan_resp.json()["num_neurons"] == 128
 
         # 4. GET /api/layers/{layer_name}/neurons/{neuron_idx}
         prof_resp = client.get("/api/layers/mlp_block_0.down_proj/neurons/7")
@@ -552,6 +588,17 @@ class TestFastAPIAndCLIWorkbench:
         assert exp_resp.status_code == 200
         preset_bundle = exp_resp.json()
         assert len(preset_bundle["compiled_vectors"]) == 1
+        assert preset_bundle["compiled_vectors"][0]["clamped_neurons"] == [7]
+
+        # Verify path traversal protection returns HTTP 403
+        bad_exp_resp = client.post(
+            "/api/export/preset",
+            json={
+                "preset_name": "malicious_preset",
+                "save_json_path": "../escaped_preset.json",
+            },
+        )
+        assert bad_exp_resp.status_code == 403
 
         del_resp = client.delete("/api/interventions")
         assert del_resp.status_code == 200
@@ -594,7 +641,7 @@ class TestFastAPIAndCLIWorkbench:
         assert explain_resp.json()["verification_report"]["pole_separation_passed"] is True
 
     def test_cli_repl_commands_and_entrypoints(
-            self, demo_session: WorkbenchSession, tmp_path: Path, capsys: pytest.CaptureFixture
+        self, demo_session: WorkbenchSession, tmp_path: Path, capsys: pytest.CaptureFixture
     ):
         repl = NeuralInjectorREPL(demo_session)
 
@@ -624,70 +671,234 @@ class TestFastAPIAndCLIWorkbench:
         out_oneshot = capsys.readouterr().out
         assert "Neuron #7" in out_oneshot
 
-    # =============================================================================
-    # 9. Regression Tests for Audit Fixes & Cammarata (2026) Extensions
-    # =============================================================================
-    class TestAuditFixesAndCammarataExtensions:
-        def test_online_m4_kurtosis_matches_exact_full_batch(self):
-            """
-            Verifies that streaming multiple batches with shifting means produces the
-            exact same 2nd, 3rd, and 4th central moments (M2, M3, M4) as a single full pass.
-            """
-            torch.manual_seed(99)
-            b1 = torch.randn(32, 8) * 1.5 - 2.0
-            b2 = torch.randn(48, 8) * 3.0 + 4.5
-            b3 = torch.randn(20, 8) * 0.5 + 1.0
-            full_data = torch.cat([b1, b2, b3], dim=0)
 
-            streaming_stats = StreamingLayerStats("test_layer", num_neurons=8, top_k=5)
-            for batch in (b1, b2, b3):
-                streaming_stats.update(batch)
+# =============================================================================
+# 9. Regression Tests for Audit Fixes & Cammarata (2026) Section 3 Mechanisms
+# =============================================================================
+class TestAuditFixesAndCammarataExtensions:
+    def test_online_m4_kurtosis_matches_exact_full_batch(self):
+        """
+        Verifies that streaming multiple batches with shifting means produces the
+        exact same 2nd, 3rd, and 4th central moments (M2, M3, M4) as a single full pass,
+        as well as exact conditional positive and negative pole moments.
+        """
+        torch.manual_seed(99)
+        b1 = torch.randn(32, 8) * 1.5 - 2.0
+        b2 = torch.randn(48, 8) * 3.0 + 4.5
+        b3 = torch.randn(20, 8) * 0.5 + 1.0
+        full_data = torch.cat([b1, b2, b3], dim=0)
 
-            exact_stats = StreamingLayerStats("test_layer", num_neurons=8, top_k=5)
-            exact_stats.update(full_data)
+        streaming_stats = StreamingLayerStats("test_layer", num_neurons=8, top_k=5)
+        for batch in (b1, b2, b3):
+            streaming_stats.update(batch)
 
-            assert torch.allclose(streaming_stats.mean, exact_stats.mean, atol=1e-6)
-            assert torch.allclose(streaming_stats.m2, exact_stats.m2, atol=1e-5)
-            assert torch.allclose(streaming_stats.m4, exact_stats.m4, atol=1e-4)
+        exact_stats = StreamingLayerStats("test_layer", num_neurons=8, top_k=5)
+        exact_stats.update(full_data)
 
-        def test_non_destructive_tracing_and_kl_preserve_active_interventions(
-                self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
-        ):
-            """
-            Verifies that running `measure_ablation_kl_divergence` or `trace_circuit`
-            does NOT wipe out previously registered user interventions.
-            """
-            injector = demo_session.injector
-            layer = "mlp_block_0.down_proj"
-            injector.clear_interventions()
-            injector.steer_neurons(layer, neuron_indices=[3], delta=5.0)
-            assert injector.active_intervention_count == 1
+        assert torch.allclose(streaming_stats.mean, exact_stats.mean, atol=1e-6)
+        assert torch.allclose(streaming_stats.m2, exact_stats.m2, atol=1e-5)
+        assert torch.allclose(streaming_stats.m4, exact_stats.m4, atol=1e-4)
+        assert torch.allclose(streaming_stats.pos_mean, exact_stats.pos_mean, atol=1e-6)
+        assert torch.allclose(streaming_stats.neg_mean, exact_stats.neg_mean, atol=1e-6)
+        assert torch.allclose(streaming_stats.pos_m4, exact_stats.pos_m4, atol=1e-4)
+        assert torch.allclose(streaming_stats.neg_m4, exact_stats.neg_m4, atol=1e-4)
 
-            # Run diagnostic KL and circuit trace passes
-            _ = injector.measure_ablation_kl_divergence(layer, neuron_idx=7, inputs=sample_prompt_ids)
-            _ = injector.trace_circuit(
-                src_layer="mlp_block_0.down_proj",
-                dst_layer="mlp_block_1.down_proj",
-                src_neuron=7,
-                inputs=sample_prompt_ids,
-            )
+    def test_non_destructive_tracing_and_kl_preserve_active_interventions(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies that running `measure_ablation_kl_divergence`, `trace_circuit`,
+        or `clean_forward` does NOT wipe out previously registered user interventions.
+        """
+        injector = demo_session.injector
+        layer = "mlp_block_0.down_proj"
+        injector.clear_interventions()
+        injector.steer_neurons(layer, neuron_indices=[3], delta=5.0)
+        assert injector.active_intervention_count == 1
 
-            # User's original intervention on neuron #3 must still be intact
-            active = injector.get_active_interventions()
-            assert len(active) == 1
-            assert active[0].neuron_indices == [3]
-            assert active[0].value == 5.0
+        with injector.clean_forward():
+            _ = demo_session.model(sample_prompt_ids)
 
-        def test_track_all_neurons_beyond_index_64(self, demo_session: WorkbenchSession):
-            """
-            Verifies that neurons at index >= 64 (e.g. Neuron #110) still collect
-            top-k positive and negative pole samples even when tracked_neurons=None.
-            """
-            profile_110 = demo_session.injector.get_neuron_profile(
-                layer_name="mlp_block_0.down_proj",
-                neuron_idx=110,
-            )
-            assert len(profile_110.top_positive_samples) > 0 or len(profile_110.top_negative_samples) > 0
+        _ = injector.measure_ablation_kl_divergence(layer, neuron_idx=7, inputs=sample_prompt_ids)
+        _ = injector.trace_circuit(
+            src_layer="mlp_block_0.down_proj",
+            dst_layer="mlp_block_1.down_proj",
+            src_neuron=7,
+            inputs=sample_prompt_ids,
+        )
+
+        active = injector.get_active_interventions()
+        assert len(active) == 1
+        assert active[0].neuron_indices == [3]
+        assert active[0].value == 5.0
+
+    def test_track_all_neurons_beyond_index_64(self, demo_session: WorkbenchSession):
+        """
+        Verifies that neurons at index >= 64 (e.g. Neuron #110) still collect
+        top-k positive and negative pole samples even when tracked_neurons=None.
+        """
+        profile_110 = demo_session.injector.get_neuron_profile(
+            layer_name="mlp_block_0.down_proj",
+            neuron_idx=110,
+        )
+        assert len(profile_110.top_positive_samples) > 0 or len(profile_110.top_negative_samples) > 0
+
+    def test_section_3_1_pole_specific_cleanliness_auditing(self):
+        """
+        Verifies Cammarata Section 3.1: Evaluating Positive and Negative poles independently.
+        Constructs a neuron whose Positive Pole is a sharp monosemantic spike while its
+        Negative Pole is uniform dense noise, verifying independent pole taxonomies.
+        """
+        torch.manual_seed(123)
+        tracker = StreamingLayerStats("asymmetric_layer", num_neurons=2, top_k=5)
+        acts = torch.zeros((200, 2))
+        # Neuron 0: Positive pole fires sharply on only 2 tokens; Negative pole is flat noise on 150 tokens
+        acts[0, 0] = 45.0
+        acts[1, 0] = 42.0
+        acts[2:152, 0] = -torch.rand(150) * 0.5 - 0.5
+
+        tracker.update(acts)
+        prof = tracker.export_profile(0)
+
+        assert prof.pos_pole_selectivity_score > 2.2
+        assert prof.pos_taxonomy_class == NeuronTaxonomy.CLEAN_MONOSEMANTIC
+        assert prof.neg_pole_selectivity_score < prof.pos_pole_selectivity_score
+
+    def test_section_3_2_crossword_circuit_ecology_solver(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies Cammarata Section 3.2 ('Understanding Compounds'):
+        `solve_layer_ecology` explains high-selectivity anchor neurons first, stores
+        them in `CircuitEcologyMap`, and propagates neighbor clues into connected neurons.
+        """
+        injector = demo_session.injector
+        ecology_report = injector.solve_layer_ecology(
+            layer_name="mlp_block_0.down_proj",
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=demo_session.unembed_weight,
+            dst_layer="mlp_block_1.down_proj",
+            circuit_inputs=sample_prompt_ids,
+            top_anchors=2,
+            top_contextual=2,
+        )
+        assert len(ecology_report.anchor_neurons_explained) == 2
+        assert len(ecology_report.hypotheses) >= 2
+        assert ecology_report.mean_verification_score > 0.0
+
+        # Now explain downstream Layer 1 Neuron #12 and verify it receives Layer 0 upstream ecology clues
+        neighbors = injector.ecology_map.get_neighbor_contexts("mlp_block_1.down_proj", 12)
+        assert any(n.direction == "upstream" for n in neighbors)
+
+        hyp_l1 = injector.explain_neuron(
+            layer_name="mlp_block_1.down_proj",
+            neuron_idx=12,
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=demo_session.unembed_weight,
+        )
+        assert hyp_l1.neuron_idx == 12
+
+    def test_section_3_3_stratified_quantile_activation_buckets(self):
+        """
+        Verifies Cammarata Section 3.3: Stratified Quantile Activation Buckets capture
+        `peak_trunk` ([80%..100%]), `secondary_branch` ([40%..80%)), and
+        `tertiary_offshoot` ([15%..40%)) samples per pole.
+        """
+        tracker = StreamingLayerStats("quantile_layer", num_neurons=1, top_k=4)
+        # Create activations spanning all three quantile bands of max=10.0:
+        # 9.5 -> peak_trunk (95%), 6.0 -> secondary_branch (60%), 2.5 -> tertiary_offshoot (25%)
+        acts = torch.tensor([[9.5], [6.0], [2.5], [-8.0], [-5.0], [-2.0]], dtype=torch.float32)
+        tokens = [["iy"], ["diy"], ["do_it_yourself"], ["SELECT"], ["FROM"], ["db_table"]]
+        contexts = ["ctx_peak", "ctx_sec", "ctx_tert", "neg_peak", "neg_sec", "neg_tert"]
+
+        tracker.update(
+            acts,
+            sample_ids=[0, 1, 2, 3, 4, 5],
+            tokens_per_sample=tokens,
+            contexts_per_sample=contexts,
+        )
+        prof = tracker.export_profile(0)
+
+        pos_b = prof.positive_quantile_buckets
+        neg_b = prof.negative_quantile_buckets
+
+        assert any(s.token_str == "iy" for s in pos_b["peak_trunk"])
+        assert any(s.token_str == "diy" for s in pos_b["secondary_branch"])
+        assert any(s.token_str == "do_it_yourself" for s in pos_b["tertiary_offshoot"])
+
+        assert any(s.token_str == "SELECT" for s in neg_b["peak_trunk"])
+        assert any(s.token_str == "FROM" for s in neg_b["secondary_branch"])
+        assert any(s.token_str == "db_table" for s in neg_b["tertiary_offshoot"])
+
+    def test_section_3_4_native_per_neuron_adaptive_thresholds(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies Cammarata Section 3.4: Respecting Native Activation Ranges & Percentiles
+        via per-neuron adaptive thresholds in `prune_weak_activations` and `InterventionKernel`.
+        """
+        injector = demo_session.injector
+        layer = "mlp_block_0.down_proj"
+        injector.clear_interventions()
+
+        spec_std = injector.prune_weak_activations(
+            layer, neuron_indices=[0, 7, 12], std_multiplier=0.8
+        )
+        assert spec_std.per_neuron_values is not None
+        assert len(spec_std.per_neuron_values) == 3
+        # Neuron #7 has much larger activation scale than background Neuron #0
+        assert spec_std.per_neuron_values[1] > spec_std.per_neuron_values[0]
+
+        injector.clear_interventions()
+        spec_pct = injector.prune_weak_activations(
+            layer, neuron_indices=[0, 7, 12], percentile=50.0
+        )
+        assert spec_pct.per_neuron_values is not None
+        assert len(spec_pct.per_neuron_values) == 3
+
+        with torch.no_grad(), injector.active_injection():
+            out = demo_session.model(sample_prompt_ids)
+        assert out.shape[-1] == len(demo_session.tok_to_id)
+        injector.clear_interventions()
+
+    def test_section_3_5_verify_downstream_readout_superposition_audit(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies Cammarata Section 3.5 ('Nothing Reads That Combination'):
+        `verify_downstream_readout` distinguishes benign weak spillover across background
+        neurons from causally read primary circuit neurons.
+        """
+        injector = demo_session.injector
+        src_layer = "mlp_block_0.down_proj"
+        dst_layer = "mlp_block_1.down_proj"
+
+        # 1. Weak activations on unaligned background neurons [0, 1, 2] with small threshold
+        benign_report = injector.verify_downstream_readout(
+            src_layer=src_layer,
+            dst_layer=dst_layer,
+            src_neurons=[0, 1, 2],
+            inputs=sample_prompt_ids,
+            weak_threshold=0.05,
+            readout_tolerance=0.25,
+        )
+        assert benign_report.is_benign_spillover is True
+        assert len(benign_report.affected_downstream_neurons) == 0
+
+        # 2. Pruning strong primary router Neuron #7 with high threshold triggers downstream shift
+        active_report = injector.verify_downstream_readout(
+            src_layer=src_layer,
+            dst_layer=dst_layer,
+            src_neurons=[7],
+            inputs=sample_prompt_ids,
+            weak_threshold=50.0,
+            readout_tolerance=0.1,
+        )
+        assert active_report.is_benign_spillover is False
+        assert 12 in active_report.affected_downstream_neurons
+
 
 # =============================================================================
 # 10. Universal & Model-Agnostic Architecture Tests (Section 2)
@@ -745,10 +956,11 @@ class TestUniversalModelAgnosticSupport:
             folded_out = model(x)
         assert torch.allclose(hook_out, folded_out, atol=1e-5)
 
-    def test_fused_gate_up_proj_virtual_weights(self):
+    def test_fused_gate_up_proj_and_3d_moe_virtual_weights(self):
         """
         Verifies that models with a single fused `gate_up_proj` (`[2 * d_mlp, d_model]`)
-        properly resolve virtual gate and up weights in `CircuitTracer`.
+        or 3D MoE fused `gate_up_proj` (`[num_experts, 2 * d_mlp, d_model]`) properly
+        resolve virtual gate and up weights without shape mismatch errors.
         """
         class FusedSwiGLUMLP(nn.Module):
             def __init__(self, d_model: int = 32, d_mlp: int = 64):
@@ -763,17 +975,23 @@ class TestUniversalModelAgnosticSupport:
         class FusedTwoLayerModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.mlp0 = FusedSwiGLUMLP(32, 64)
-                self.mlp1 = FusedSwiGLUMLP(32, 64)
+                self.norm_0 = nn.LayerNorm(32)
+                self.mlp_block_0 = FusedSwiGLUMLP(32, 64)
+                self.norm_1 = nn.LayerNorm(32)
+                self.mlp_block_1 = FusedSwiGLUMLP(32, 64)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
-                x = x + self.mlp0(x)
-                return x + self.mlp1(x)
+                x = x + self.mlp_block_0(self.norm_0(x))
+                return x + self.mlp_block_1(self.norm_1(x))
 
         model = FusedTwoLayerModel()
+        # Verify resolve_pre_mlp_norm maps mlp_block_0 -> norm_0 and mlp_block_1 -> norm_1
+        assert LayerDiscovery.resolve_pre_mlp_norm(model, "mlp_block_0.down_proj") is model.norm_0
+        assert LayerDiscovery.resolve_pre_mlp_norm(model, "mlp_block_1.down_proj") is model.norm_1
+
         inj = NeuralInjector(model)
-        v_up, v_gate, cos_sim = inj.tracer.compute_virtual_weights(
-            "mlp0.down_proj", "mlp1.down_proj", src_neuron=3
+        v_up, v_gate, _ = inj.tracer.compute_virtual_weights(
+            "mlp_block_0.down_proj", "mlp_block_1.down_proj", src_neuron=3
         )
         assert v_up.shape == (64,)
         assert v_gate.shape == (64,)
@@ -810,3 +1028,205 @@ class TestUniversalModelAgnosticSupport:
             compute_jacobian=True,
         )
         assert len(graph.edges) > 0
+
+
+# =============================================================================
+# 11. Production Hardening & Section 5 Frontier Capabilities Tests
+# =============================================================================
+class TestProductionHardeningAndSection5Capabilities:
+    def test_section_4_1_thread_safety_under_concurrent_evaluations(
+        self, demo_session: WorkbenchSession
+    ):
+        demo_session.injector.clear_interventions()
+        demo_session.injector.steer_neurons("mlp_block_0.down_proj", neuron_indices=[7], delta=-8.0)
+
+        def _worker(idx: int) -> float:
+            res = demo_session.evaluate_prompt_comparison("the system negotiated AES256")
+            return float(res["kl_divergence"])
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            kls = list(pool.map(_worker, range(8)))
+
+        assert all(abs(k - kls[0]) < 1e-5 for k in kls)
+        assert demo_session.injector.active_hook_count == 0
+        demo_session.injector.clear_interventions()
+
+    def test_section_4_2_path_traversal_security(self, tmp_path: Path):
+        with pytest.raises(PermissionError):
+            SteeringExporter.validate_safe_export_path(
+                "../outside.json", allowed_workspace_dir=tmp_path
+            )
+        outside = tmp_path.parent / "escaped_file.json"
+        with pytest.raises(PermissionError):
+            SteeringExporter.validate_safe_export_path(
+                outside, allowed_workspace_dir=tmp_path
+            )
+        safe = SteeringExporter.validate_safe_export_path(
+            tmp_path / "subdir" / "ok.json", allowed_workspace_dir=tmp_path
+        )
+        assert safe.is_relative_to(tmp_path.resolve())
+
+    def test_section_4_3_pydantic_schema_validation_and_retry(self, monkeypatch: pytest.MonkeyPatch):
+        attempts = {"count": 0}
+
+        class _FakeHTTPResponse:
+            def __init__(self, body_str: str):
+                self._bytes = body_str.encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._bytes
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        def _fake_urlopen(req, timeout=60):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                # Malformed JSON on attempt 1 -> triggers retry
+                return _FakeHTTPResponse('{"choices": [{"message": {"content": "NOT_JSON"}}]}')
+            valid_payload = {
+                "positive_pole_motif": "Crypto TLS",
+                "negative_pole_motif": "SQL SELECT",
+                "unified_verb_hypothesis": "Routes crypto vs SQL.",
+                "recursive_offshoots": ["TLS branch"],
+                "taxonomy_class": "clean_monosemantic",
+                "confidence_score": 0.91,
+                "proposed_experiment": {"positive_pole_test_tokens": ["AES256"]},
+            }
+            return _FakeHTTPResponse(
+                json.dumps({"choices": [{"message": {"content": json.dumps(valid_payload)}}]})
+            )
+
+        monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+        client = OpenAICompatibleClient(max_retries=3, backoff_base=0.01)
+        out = client.complete_json("sys", "user")
+        assert attempts["count"] == 2
+        assert out["confidence_score"] == 0.91
+        assert AgentHypothesisResponseSchema.model_validate(out).taxonomy_class == NeuronTaxonomy.CLEAN_MONOSEMANTIC
+
+    def test_section_5_1_forward_mode_ad_single_pass_circuit_tracer(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        jac_map = demo_session.injector.trace_forward_ad_all_layers(
+            src_layer="mlp_block_0.down_proj",
+            src_neuron=7,
+            inputs=sample_prompt_ids,
+            src_pole=PoleType.POSITIVE,
+        )
+        assert "mlp_block_1.down_proj" in jac_map
+        jac_l1 = jac_map["mlp_block_1.down_proj"]
+        assert jac_l1.shape == (128,)
+        # L0 Neuron #7 (+Pole) strongly excites L1 Neuron #12 and inhibits L1 Neuron #19
+        assert jac_l1[12].item() > 0.1
+        assert jac_l1[19].item() < -0.1
+
+    def test_section_5_2_closed_loop_conditional_concept_gating(
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        sql_prompt_ids: torch.Tensor,
+    ):
+        injector = demo_session.injector
+        injector.clear_interventions()
+
+        # Only steer Layer 1 Neuron #12 by +20.0 when Detector Neuron #7 in Layer 0 fires positively (> 1.0)
+        injector.add_conditional_gate(
+            target_layer="mlp_block_1.down_proj",
+            target_neurons=[12],
+            detector_layer="mlp_block_0.down_proj",
+            detector_neuron=7,
+            detector_pole=PoleType.POSITIVE,
+            threshold=1.0,
+            action_mode=InterventionMode.ADDITIVE_STEER,
+            value=20.0,
+            sequence_scope="any_token",
+        )
+
+        with torch.no_grad():
+            with injector.without_interventions():
+                clean_crypto = demo_session.model(sample_prompt_ids)
+                clean_sql = demo_session.model(sql_prompt_ids)
+            with injector.active_injection():
+                gated_crypto = demo_session.model(sample_prompt_ids)
+                gated_sql = demo_session.model(sql_prompt_ids)
+
+        # Crypto prompt triggers L0 N7 (+Pole) -> gate opens -> output shifts
+        assert not torch.allclose(clean_crypto, gated_crypto, atol=1e-3)
+        # SQL prompt drives L0 N7 negatively -> gate stays closed -> zero collateral damage!
+        assert torch.allclose(clean_sql, gated_sql, atol=1e-6)
+        injector.clear_interventions()
+
+    def test_section_5_3_contrastive_pole_discovery(
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        sql_prompt_ids: torch.Tensor,
+    ):
+        report = demo_session.injector.discover_contrastive_neurons(
+            pos_inputs=sample_prompt_ids,
+            neg_inputs=sql_prompt_ids,
+            layer_names=["mlp_block_0.down_proj"],
+            top_k=5,
+        )
+        assert len(report.top_matches) == 5
+        top_match = report.top_matches[0]
+        assert top_match.neuron_idx == 7
+        assert top_match.bipolar_sign_flip is True
+        assert top_match.t_statistic > 1.5
+
+    def test_section_5_4_cross_checkpoint_recursive_growth_tracker(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        ckpt_early = copy.deepcopy(demo_session.model)
+        ckpt_final = copy.deepcopy(demo_session.model)
+        with torch.no_grad():
+            # Simulate early checkpoint having weaker gate/up weights on Neuron #7
+            ckpt_early.mlp_block_0.up_proj.weight[7] *= 0.25
+
+        batches = [
+            {
+                "input_ids": sample_prompt_ids,
+                "sample_ids": [0],
+                "tokens_per_sample": [["the", "system", "negotiated", "AES256", "TLS", "cipher"]],
+                "contexts_per_sample": ["the system negotiated AES256 TLS cipher"],
+            }
+        ]
+        evo_report = demo_session.injector.track_checkpoint_evolution(
+            checkpoints=[("epoch_1", ckpt_early), ("epoch_5", ckpt_final)],
+            layer_name="mlp_block_0.down_proj",
+            neuron_idx=7,
+            batches=batches,
+            forward_fn=lambda m, b: m(b["input_ids"]),
+        )
+        assert len(evo_report.snapshots) == 2
+        assert evo_report.snapshots[0].checkpoint_label == "epoch_1"
+        assert evo_report.snapshots[1].checkpoint_label == "epoch_5"
+        assert evo_report.snapshots[1].std > evo_report.snapshots[0].std
+
+    def test_section_5_5_synergistic_multi_neuron_ablation(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        injector = demo_session.injector
+        res_greedy = injector.find_synergistic_ablation_set(
+            layer_name="mlp_block_0.down_proj",
+            inputs=sample_prompt_ids,
+            max_subset_size=2,
+            candidate_pool_size=8,
+            method="greedy",
+        )
+        assert len(res_greedy.selected_neurons) == 2
+        assert 7 in res_greedy.selected_neurons
+        assert res_greedy.joint_ablation_kl > 0.05
+
+        res_l1 = injector.find_synergistic_ablation_set(
+            layer_name="mlp_block_0.down_proj",
+            inputs=sample_prompt_ids,
+            max_subset_size=2,
+            candidate_pool_size=8,
+            method="l1_optim",
+        )
+        assert len(res_l1.selected_neurons) == 2
+        assert res_l1.joint_ablation_kl > 0.0

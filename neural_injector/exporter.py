@@ -15,6 +15,7 @@ from .discovery import LayerDiscovery
 from .interventions import InterventionKernel
 from .types import (
     CompiledSteeringVector,
+    GateConditionSpec,
     InterventionMode,
     InterventionSpec,
     PoleType,
@@ -25,24 +26,45 @@ from .types import (
 class SteeringExporter:
     """
     Compiles surgical neuron manipulations into residual-stream steering vectors,
-    exports/imports portable JSON production presets, and folds unconditional
-    interventions directly into model weights for zero-overhead inference.
+    exports/imports portable JSON production presets (with path-traversal security),
+    and folds unconditional interventions directly into model weights for zero-overhead inference.
     """
+
+    @staticmethod
+    def validate_safe_export_path(
+        filepath: Union[str, Path],
+        allowed_workspace_dir: Optional[Union[str, Path]] = None,
+    ) -> Path:
+        """
+        Validates a file path against path-traversal attacks (`..` segments or escaping
+        `allowed_workspace_dir` when configured). Raises `PermissionError` if unsafe.
+        """
+        raw_path = Path(filepath)
+        if ".." in raw_path.parts:
+            raise PermissionError(
+                f"Path traversal ('..') is not permitted in export path: '{filepath}'."
+            )
+        resolved = raw_path.expanduser().resolve()
+        if allowed_workspace_dir is not None:
+            workspace_root = Path(allowed_workspace_dir).expanduser().resolve()
+            if not resolved.is_relative_to(workspace_root):
+                raise PermissionError(
+                    f"Export path '{resolved}' escapes allowed workspace '{workspace_root}'."
+                )
+        return resolved
 
     @staticmethod
     def is_spec_compilable_to_residual_vector(spec: InterventionSpec) -> bool:
         """
         Returns True if and only if `spec` is an unconditional, position-independent
-        ADDITIVE_STEER operation. HARD_CLAMP, ZERO_ABLATE, SCALE, WEAK_PRUNE, and
-        pole-conditional or token-position-specific interventions cannot be reduced to
-        adding a static vector to the residual stream without modifying incoming activations
-        or weight columns.
+        ADDITIVE_STEER or HARD_CLAMP operation without dynamic gating.
         """
         return (
             spec.enabled
-            and spec.mode == InterventionMode.ADDITIVE_STEER
+            and spec.mode in (InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP)
             and spec.pole == PoleType.BOTH
             and spec.token_positions is None
+            and spec.gate_condition is None
             and spec.custom_fn is None
         )
 
@@ -55,7 +77,7 @@ class SteeringExporter:
     ) -> List[CompiledSteeringVector]:
         """
         For any layer where all enabled interventions are unconditional ADDITIVE_STEER
-        operations, compiles the combined linear shift in the residual stream:
+        or HARD_CLAMP operations, compiles the combined linear shift in the residual stream:
             v_steer = sum_{i} delta_i * W_down[:, i]  (shape: [d_model])
         For HARD_CLAMP neurons, also records their indices in `clamped_neurons` so that
         incoming dynamic activations are zeroed prior to `down_proj` (preventing a_i(x)
@@ -67,9 +89,6 @@ class SteeringExporter:
             enabled_specs = [s for s in specs if s.enabled]
             if not enabled_specs:
                 continue
-            # Only compile the layer into a post-down_proj residual vector if ALL enabled
-            # specs in this layer are unconditional ADDITIVE_STEER (prevents order-of-operations
-            # inversion when a layer mixes ADDITIVE_STEER with ZERO_ABLATE or HARD_CLAMP).
             if not all(cls.is_spec_compilable_to_residual_vector(s) for s in enabled_specs):
                 continue
 
@@ -79,21 +98,43 @@ class SteeringExporter:
 
             w = module.weight.detach()
             is_conv1d = module.__class__.__name__ == "Conv1D"
-            d_model = w.shape[1] if is_conv1d else w.shape[0]
-            d_mlp = w.shape[0] if is_conv1d else w.shape[1]
+            if w.ndim == 3:
+                # 3D MoE down_proj: [num_experts, d_model, d_mlp]
+                d_model, d_mlp = w.shape[1], w.shape[2]
+            else:
+                d_model = w.shape[1] if is_conv1d else w.shape[0]
+                d_mlp = w.shape[0] if is_conv1d else w.shape[1]
 
             v_steer = torch.zeros(d_model, dtype=torch.float32, device=w.device)
             src_neurons: List[int] = []
             src_deltas: List[float] = []
+            clamped_neurons: List[int] = []
 
             for spec in enabled_specs:
-                for n_idx in spec.neuron_indices:
+                per_vals = (
+                    spec.per_neuron_values
+                    if spec.per_neuron_values is not None
+                    and len(spec.per_neuron_values) == len(spec.neuron_indices)
+                    else [float(spec.value)] * len(spec.neuron_indices)
+                )
+                for n_idx, val_i in zip(spec.neuron_indices, per_vals):
                     if n_idx < 0 or n_idx >= d_mlp:
                         continue
-                    col_vec = w[n_idx, :].float() if is_conv1d else w[:, n_idx].float()
-                    v_steer = v_steer + float(spec.value) * col_vec
+                    if w.ndim == 3:
+                        col_vec = w[:, :, n_idx].float().mean(dim=0)
+                    elif is_conv1d:
+                        col_vec = w[n_idx, :].float()
+                    else:
+                        col_vec = w[:, n_idx].float()
+
+                    # If a neuron is HARD_CLAMPed after an earlier spec in the same layer,
+                    # its previous contribution is overwritten by the clamp constant.
+                    if spec.mode == InterventionMode.HARD_CLAMP and int(n_idx) not in clamped_neurons:
+                        clamped_neurons.append(int(n_idx))
+
+                    v_steer = v_steer + float(val_i) * col_vec
                     src_neurons.append(int(n_idx))
-                    src_deltas.append(float(spec.value))
+                    src_deltas.append(float(val_i))
 
             if src_neurons:
                 vec_norm = float(torch.norm(v_steer, p=2).item())
@@ -105,6 +146,7 @@ class SteeringExporter:
                         source_deltas=src_deltas,
                         vector_norm=round(vec_norm, 5),
                         vector_values=[round(float(x), 6) for x in v_steer.cpu().tolist()],
+                        clamped_neurons=clamped_neurons,
                     )
                 )
 
@@ -125,14 +167,26 @@ class SteeringExporter:
             for s in specs:
                 if not s.enabled:
                     continue
-                serialized_specs.append({
+                item_dict: Dict[str, Any] = {
                     "layer_name": s.layer_name,
                     "neuron_indices": list(s.neuron_indices),
                     "mode": s.mode.value,
                     "pole": s.pole.value,
                     "value": float(s.value),
                     "token_positions": s.token_positions,
-                })
+                }
+                if s.per_neuron_values is not None:
+                    item_dict["per_neuron_values"] = [float(v) for v in s.per_neuron_values]
+                if s.gate_condition is not None:
+                    item_dict["gate_condition"] = {
+                        "detector_layer": s.gate_condition.detector_layer,
+                        "detector_neuron": s.gate_condition.detector_neuron,
+                        "detector_pole": s.gate_condition.detector_pole.value,
+                        "threshold": float(s.gate_condition.threshold),
+                        "action_mode": s.gate_condition.action_mode.value,
+                        "sequence_scope": s.gate_condition.sequence_scope,
+                    }
+                serialized_specs.append(item_dict)
 
         compiled_vectors = cls.compile_residual_steering_vectors(model, interventions_by_layer)
 
@@ -151,27 +205,28 @@ class SteeringExporter:
         bundle: ProductionPresetBundle,
         filepath: Union[str, Path],
         export_pt_vectors_path: Optional[Union[str, Path]] = None,
+        allowed_workspace_dir: Optional[Union[str, Path]] = None,
     ) -> Dict[str, str]:
         """
         Writes the ProductionPresetBundle to disk as a portable JSON file.
         Optionally also saves a `.pt` dictionary mapping `{layer_name: tensor(d_model)}`
         for direct loading into vLLM / PyTorch serving pipelines.
         """
-        path = Path(filepath)
+        path = cls.validate_safe_export_path(filepath, allowed_workspace_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(bundle), indent=2), encoding="utf-8")
 
-        result = {"json_preset_path": str(path.resolve())}
+        result = {"json_preset_path": str(path)}
 
         if export_pt_vectors_path is not None and bundle.compiled_vectors:
-            pt_path = Path(export_pt_vectors_path)
+            pt_path = cls.validate_safe_export_path(export_pt_vectors_path, allowed_workspace_dir)
             pt_path.parent.mkdir(parents=True, exist_ok=True)
             tensor_dict = {
                 cv.layer_name: torch.tensor(cv.vector_values, dtype=torch.float32)
                 for cv in bundle.compiled_vectors
             }
             torch.save(tensor_dict, pt_path)
-            result["pt_vectors_path"] = str(pt_path.resolve())
+            result["pt_vectors_path"] = str(pt_path)
 
         return result
 
@@ -182,6 +237,19 @@ class SteeringExporter:
         """Parses a raw dictionary (from JSON or API payload) back into a bundle and InterventionSpecs."""
         specs: List[InterventionSpec] = []
         for item in data.get("interventions", []):
+            gc_raw = item.get("gate_condition")
+            gate_cond = (
+                GateConditionSpec(
+                    detector_layer=gc_raw["detector_layer"],
+                    detector_neuron=int(gc_raw["detector_neuron"]),
+                    detector_pole=PoleType(gc_raw.get("detector_pole", "positive")),
+                    threshold=float(gc_raw.get("threshold", 0.5)),
+                    action_mode=InterventionMode(gc_raw.get("action_mode", "additive_steer")),
+                    sequence_scope=gc_raw.get("sequence_scope", "token_wise"),
+                )
+                if isinstance(gc_raw, dict)
+                else None
+            )
             specs.append(
                 InterventionSpec(
                     layer_name=item["layer_name"],
@@ -189,7 +257,9 @@ class SteeringExporter:
                     mode=InterventionMode(item.get("mode", "zero_ablate")),
                     pole=PoleType(item.get("pole", "both")),
                     value=float(item.get("value", 0.0)),
+                    per_neuron_values=item.get("per_neuron_values"),
                     token_positions=item.get("token_positions"),
+                    gate_condition=gate_cond,
                 )
             )
 
@@ -201,6 +271,7 @@ class SteeringExporter:
                 source_deltas=cv["source_deltas"],
                 vector_norm=float(cv["vector_norm"]),
                 vector_values=cv["vector_values"],
+                clamped_neurons=[int(i) for i in cv.get("clamped_neurons", [])],
             )
             for cv in data.get("compiled_vectors", [])
         ]
@@ -238,12 +309,30 @@ class SteeringExporter:
                 continue
 
             for spec in specs:
-                if not spec.enabled or spec.pole != PoleType.BOTH or spec.token_positions is not None:
+                if (
+                    not spec.enabled
+                    or spec.pole != PoleType.BOTH
+                    or spec.token_positions is not None
+                    or spec.gate_condition is not None
+                ):
                     continue
 
                 idx = torch.as_tensor(
                     spec.neuron_indices, dtype=torch.long, device=module.weight.device
                 )
+                if spec.per_neuron_values is not None and len(spec.per_neuron_values) == len(spec.neuron_indices):
+                    val_vec = torch.as_tensor(
+                        spec.per_neuron_values,
+                        dtype=module.weight.dtype,
+                        device=module.weight.device,
+                    )
+                else:
+                    val_vec = torch.full(
+                        (len(spec.neuron_indices),),
+                        float(spec.value),
+                        dtype=module.weight.dtype,
+                        device=module.weight.device,
+                    )
 
                 if spec.mode == InterventionMode.ZERO_ABLATE:
                     if is_conv1d:
@@ -258,9 +347,9 @@ class SteeringExporter:
 
                 elif spec.mode == InterventionMode.SCALE:
                     if is_conv1d:
-                        module.weight[idx, :] *= float(spec.value)
+                        module.weight[idx, :] *= val_vec.unsqueeze(1)
                     else:
-                        module.weight[:, idx] *= float(spec.value)
+                        module.weight[:, idx] *= val_vec.unsqueeze(0)
                     folded_summary.append({
                         "layer": layer_name,
                         "neurons": spec.neuron_indices,
@@ -268,12 +357,12 @@ class SteeringExporter:
                     })
 
                 elif spec.mode in (InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP):
-                    # Compute residual steering vector contribution: sum_{i in idx} value * W_down[:, i]
+                    # Compute residual steering vector contribution: sum_{i in idx} value_i * W_down[:, i]
                     if is_conv1d:
-                        v_shift = (module.weight[idx, :] * float(spec.value)).sum(dim=0)
+                        v_shift = (module.weight[idx, :] * val_vec.unsqueeze(1)).sum(dim=0)
                         out_features = module.nf
                     else:
-                        v_shift = (module.weight[:, idx] * float(spec.value)).sum(dim=1)
+                        v_shift = (module.weight[:, idx] * val_vec.unsqueeze(0)).sum(dim=1)
                         out_features = module.out_features
 
                     if module.bias is None:
@@ -311,7 +400,8 @@ class ProductionSteeringRuntime:
     Lightweight, standalone production inference applier.
     Can load a saved JSON preset and apply either:
       - Mode A (`use_compiled_residual_vectors=True`): Fast residual-stream vector addition `output + v_steer`
-        for layers with compiled vectors, plus exact neuron hooks for any remaining layers.
+        for layers with compiled vectors (plus dynamic pre-zeroing for any `clamped_neurons`),
+        and exact neuron hooks for any remaining layers.
       - Mode B (`use_compiled_residual_vectors=False`): Exact pole-conditional neuron hooks.
     """
 
@@ -333,9 +423,31 @@ class ProductionSteeringRuntime:
         compiled_layers = set()
         if use_compiled_residual_vectors and self.bundle.compiled_vectors:
             for cv in self.bundle.compiled_vectors:
-                module, _, _ = LayerDiscovery.resolve_module(self.model, cv.layer_name)
+                module, hook_target, _ = LayerDiscovery.resolve_module(self.model, cv.layer_name)
                 steer_tensor = torch.tensor(cv.vector_values, dtype=dtype, device=device)
                 compiled_layers.add(cv.layer_name)
+
+                # If any neurons in this compiled vector were HARD_CLAMPed, zero their dynamic
+                # activations before `down_proj` so adding `v_steer` gives exact clamp output.
+                if cv.clamped_neurons and hook_target == "input":
+                    clamp_idx = list(cv.clamped_neurons)
+
+                    def _make_clamp_zero_pre(c_indices: List[int]):
+                        def _pre_zero(_mod: nn.Module, inputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
+                            if inputs and isinstance(inputs[0], torch.Tensor):
+                                cloned = inputs[0].clone()
+                                idx_t = torch.as_tensor(
+                                    c_indices, dtype=torch.long, device=cloned.device
+                                )
+                                cloned[..., idx_t] = 0.0
+                                return (cloned,) + inputs[1:]
+                            return inputs
+
+                        return _pre_zero
+
+                    self._handles.append(
+                        module.register_forward_pre_hook(_make_clamp_zero_pre(clamp_idx))
+                    )
 
                 def _make_res_hook(vec: torch.Tensor):
                     def _fwd_hook(_mod: nn.Module, _inp: Tuple[Any, ...], out: Any) -> Any:

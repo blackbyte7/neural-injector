@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple
 
+from pydantic import BaseModel, Field, ValidationError
 import torch
 import torch.nn as nn
 
 from .discovery import LayerDiscovery
 from .types import (
     BipolarVerbHypothesis,
+    CircuitEdge,
     CircuitGraph,
+    EcologyNeighborContext,
     InterventionMode,
     InterventionSpec,
     NeuronPoleProfile,
@@ -25,6 +30,30 @@ if TYPE_CHECKING:
     from .injector import NeuralInjector
 
 
+# =============================================================================
+# 1. Pydantic Structured Output Schemas for LLM Response Validation (Sec 4.3)
+# =============================================================================
+class ProposedExperimentSchema(BaseModel):
+    positive_pole_test_tokens: List[str] = Field(default_factory=list)
+    negative_pole_test_tokens: List[str] = Field(default_factory=list)
+    expected_promoted_tokens: List[str] = Field(default_factory=list)
+    expected_suppressed_tokens: List[str] = Field(default_factory=list)
+    expected_excited_dst_neurons: List[int] = Field(default_factory=list)
+    expected_inhibited_dst_neurons: List[int] = Field(default_factory=list)
+
+
+class AgentHypothesisResponseSchema(BaseModel):
+    positive_pole_motif: str = Field(..., min_length=1)
+    negative_pole_motif: str = Field(..., min_length=1)
+    unified_verb_hypothesis: str = Field(..., min_length=1)
+    recursive_offshoots: List[str] = Field(default_factory=list)
+    taxonomy_class: NeuronTaxonomy = Field(default=NeuronTaxonomy.CLEAN_MONOSEMANTIC)
+    confidence_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    proposed_experiment: ProposedExperimentSchema = Field(
+        default_factory=ProposedExperimentSchema
+    )
+
+
 class LLMClientProtocol(Protocol):
     """Protocol for any LLM backend used by NeuronExplainerAgent."""
 
@@ -34,8 +63,9 @@ class LLMClientProtocol(Protocol):
 
 class OpenAICompatibleClient:
     """
-    Zero-dependency OpenAI-compatible JSON completion client using stdlib `urllib.request`.
-    Works with OpenAI, Ollama (http://localhost:11434/v1), vLLM, OpenRouter, and Gemini/Anthropic proxies.
+    OpenAI-compatible JSON completion client using stdlib `urllib.request` with
+    exponential backoff retry logic and strict Pydantic schema validation (Section 4.3).
+    Works with OpenAI, Ollama (http://localhost:11434/v1), vLLM, OpenRouter, and proxies.
     """
 
     def __init__(
@@ -44,11 +74,19 @@ class OpenAICompatibleClient:
         api_key: Optional[str] = None,
         base_url: str = "https://api.openai.com/v1",
         temperature: float = 0.1,
+        max_retries: int = 3,
+        backoff_base: float = 0.5,
+        timeout: float = 60.0,
+        validate_schema: bool = True,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
+        self.max_retries = max(1, max_retries)
+        self.backoff_base = backoff_base
+        self.timeout = timeout
+        self.validate_schema = validate_schema
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         url = f"{self.base_url}/chat/completions"
@@ -62,32 +100,151 @@ class OpenAICompatibleClient:
             ],
         }
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        content = body["choices"][0]["message"]["content"]
-        return json.loads(content)
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(self.max_retries):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.api_key}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                content = body["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                if self.validate_schema:
+                    validated = AgentHypothesisResponseSchema.model_validate(parsed)
+                    return validated.model_dump(mode="json")
+                return parsed
+            except (
+                urllib.error.HTTPError,
+                urllib.error.URLError,
+                TimeoutError,
+                KeyError,
+                json.JSONDecodeError,
+                ValidationError,
+            ) as exc:
+                last_exc = exc
+                if attempt + 1 < self.max_retries:
+                    time.sleep(self.backoff_base * (2 ** attempt))
+
+        raise RuntimeError(
+            f"OpenAICompatibleClient failed after {self.max_retries} attempts: {last_exc}"
+        ) from last_exc
+
+
+# =============================================================================
+# 2. Persistent Crossword / Circuit Ecology Store (Cammarata Section 3.2)
+# =============================================================================
+class CircuitEcologyMap:
+    """
+    Persistent Crossword Graph Store implementing Cammarata's 'Understanding Compounds'
+    loop (Section 3.2):
+      - Stores verified `BipolarVerbHypothesis` objects indexed by `(layer_name, neuron_idx)`.
+      - Stores directed `CircuitEdge` connections traced across layers.
+      - Retrieves upstream and downstream neighbor hypotheses so that when explaining
+        neuron `(L, i)`, already-verified motifs of connected neurons in `L-1` and `L+1`
+        are injected into the Explainer Agent's context.
+    """
+
+    def __init__(self) -> None:
+        self.hypotheses: Dict[Tuple[str, int], BipolarVerbHypothesis] = {}
+        self.edges_from: Dict[Tuple[str, int], List[CircuitEdge]] = {}
+        self.edges_to: Dict[Tuple[str, int], List[CircuitEdge]] = {}
+
+    def register_hypothesis(self, hypothesis: BipolarVerbHypothesis) -> None:
+        """Stores or updates a neuron's BipolarVerbHypothesis in the ecology map."""
+        self.hypotheses[(hypothesis.layer_name, hypothesis.neuron_idx)] = hypothesis
+
+    def get_hypothesis(
+        self, layer_name: str, neuron_idx: int
+    ) -> Optional[BipolarVerbHypothesis]:
+        """Returns the stored BipolarVerbHypothesis for `(layer_name, neuron_idx)` if present."""
+        return self.hypotheses.get((layer_name, neuron_idx))
+
+    def register_circuit_graph(self, graph: CircuitGraph) -> None:
+        """Indexes all directed edges from a traced CircuitGraph for bidirectional lookup."""
+        src_key = (graph.src_layer, graph.src_neuron)
+        existing_out = {
+            (e.dst_layer, e.dst_neuron): e for e in self.edges_from.get(src_key, [])
+        }
+        for edge in graph.edges:
+            existing_out[(edge.dst_layer, edge.dst_neuron)] = edge
+            dst_key = (edge.dst_layer, edge.dst_neuron)
+            existing_in = {
+                (e.src_layer, e.src_neuron): e for e in self.edges_to.get(dst_key, [])
+            }
+            existing_in[src_key] = edge
+            self.edges_to[dst_key] = list(existing_in.values())
+        self.edges_from[src_key] = list(existing_out.values())
+
+    def get_neighbor_contexts(
+        self, layer_name: str, neuron_idx: int, max_neighbors: int = 6
+    ) -> List[EcologyNeighborContext]:
+        """
+        Returns already-explained upstream and downstream neighbor clues connected
+        to `(layer_name, neuron_idx)`, sorted by causal delta magnitude.
+        """
+        key = (layer_name, neuron_idx)
+        neighbors: List[EcologyNeighborContext] = []
+
+        # 1. Upstream neighbors (L-1 -> L)
+        for edge in self.edges_to.get(key, []):
+            up_hyp = self.hypotheses.get((edge.src_layer, edge.src_neuron))
+            if up_hyp is not None:
+                neighbors.append(
+                    EcologyNeighborContext(
+                        layer_name=edge.src_layer,
+                        neuron_idx=edge.src_neuron,
+                        direction="upstream",
+                        role=edge.role.value,
+                        mean_causal_delta=round(edge.mean_causal_delta, 4),
+                        positive_pole_motif=up_hyp.positive_pole_motif,
+                        negative_pole_motif=up_hyp.negative_pole_motif,
+                        unified_verb_hypothesis=up_hyp.unified_verb_hypothesis,
+                        confidence_score=up_hyp.confidence_score,
+                    )
+                )
+
+        # 2. Downstream neighbors (L -> L+1)
+        for edge in self.edges_from.get(key, []):
+            dn_hyp = self.hypotheses.get((edge.dst_layer, edge.dst_neuron))
+            if dn_hyp is not None:
+                neighbors.append(
+                    EcologyNeighborContext(
+                        layer_name=edge.dst_layer,
+                        neuron_idx=edge.dst_neuron,
+                        direction="downstream",
+                        role=edge.role.value,
+                        mean_causal_delta=round(edge.mean_causal_delta, 4),
+                        positive_pole_motif=dn_hyp.positive_pole_motif,
+                        negative_pole_motif=dn_hyp.negative_pole_motif,
+                        unified_verb_hypothesis=dn_hyp.unified_verb_hypothesis,
+                        confidence_score=dn_hyp.confidence_score,
+                    )
+                )
+
+        neighbors.sort(key=lambda n: abs(n.mean_causal_delta), reverse=True)
+        return neighbors[:max_neighbors]
 
 
 class HeuristicSynthesisClient:
     """
     Built-in offline analytical synthesizer that inspects the structured NeuronPoleProfile
-    and CircuitGraph JSON payload and formulates a BipolarVerbHypothesis + verification plan
-    without requiring an external API key.
+    (including Stratified Quantile Activation Buckets and Pole-Specific Selectivity),
+    CircuitGraph, and Crossword Ecology Neighbor clues to formulate a BipolarVerbHypothesis.
     """
 
     def complete_json(self, _system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         evidence = json.loads(user_prompt)
         prof = evidence.get("neuron_profile", {})
         circuit = evidence.get("downstream_circuit", {})
+        neighbors = evidence.get("ecology_neighbors", [])
 
         pos_samples = prof.get("top_positive_samples", [])
         neg_samples = prof.get("top_negative_samples", [])
@@ -101,12 +258,16 @@ class HeuristicSynthesisClient:
         inhibited_dst = [e["dst_neuron"] for e in circuit.get("top_inhibited_downstream", [])[:3]]
 
         selectivity = float(prof.get("pole_selectivity_score", 0.0))
-        if selectivity >= 2.2 and (pos_tokens or neg_tokens):
+        pos_sel = float(prof.get("pos_pole_selectivity_score", selectivity))
+        neg_sel = float(prof.get("neg_pole_selectivity_score", selectivity))
+        best_pole_sel = max(selectivity, pos_sel, neg_sel)
+
+        if best_pole_sel >= 2.1 and (pos_tokens or neg_tokens):
             taxonomy = NeuronTaxonomy.CLEAN_MONOSEMANTIC.value
-            confidence = min(0.95, 0.70 + 0.05 * selectivity)
-        elif selectivity >= 1.2:
+            confidence = min(0.96, 0.72 + 0.05 * best_pole_sel)
+        elif best_pole_sel >= 1.2:
             taxonomy = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value
-            confidence = 0.72
+            confidence = 0.75
         else:
             taxonomy = NeuronTaxonomy.DEAD_OR_NOISY.value
             confidence = 0.40
@@ -128,8 +289,32 @@ class HeuristicSynthesisClient:
             f"and inhibits competing circuit branches {inhibited_dst}."
         )
 
-        offshoots = []
-        if len(pos_tokens) > 2:
+        offshoots: List[str] = []
+        # Extract stratified quantile offshoots (Cammarata Section 3.3)
+        pos_buckets = prof.get("positive_quantile_buckets", {})
+        sec_tokens = list(
+            dict.fromkeys(
+                s["token"]
+                for s in pos_buckets.get("secondary_branch", [])
+                if s.get("token") and s.get("token") not in pos_tokens[:1]
+            )
+        )
+        tert_tokens = list(
+            dict.fromkeys(
+                s["token"]
+                for s in pos_buckets.get("tertiary_offshoot", [])
+                if s.get("token") and s.get("token") not in pos_tokens[:1]
+            )
+        )
+        if sec_tokens:
+            offshoots.append(
+                f"Secondary quantile branch (40-80% max): recursive generalization onto {sec_tokens[:3]}"
+            )
+        if tert_tokens:
+            offshoots.append(
+                f"Tertiary quantile offshoot (15-40% max): weak semantic extension onto {tert_tokens[:3]}"
+            )
+        if len(pos_tokens) > 2 and not offshoots:
             offshoots.append(
                 f"Recursive generalization across co-occurring context tokens {pos_tokens[1:]} sharing downstream readers {excited_dst}"
             )
@@ -139,8 +324,14 @@ class HeuristicSynthesisClient:
                 for e in circuit["top_excited_downstream"][:2]
             ]
             offshoots.append(f"Downstream specialization into Layer+1 circuit nodes: {', '.join(roles)}")
+        if neighbors:
+            neighbor_summary = ", ".join(
+                f"{n['direction']} {n['layer_name']}[N{n['neuron_idx']}] ({n['role']})"
+                for n in neighbors[:2]
+            )
+            offshoots.append(f"Crossword ecology alignment with verified neighbors: {neighbor_summary}")
 
-        return {
+        raw_result = {
             "positive_pole_motif": pos_motif,
             "negative_pole_motif": neg_motif,
             "unified_verb_hypothesis": verb_hypothesis,
@@ -156,6 +347,8 @@ class HeuristicSynthesisClient:
                 "expected_inhibited_dst_neurons": inhibited_dst,
             },
         }
+        validated = AgentHypothesisResponseSchema.model_validate(raw_result)
+        return validated.model_dump(mode="json")
 
 
 class NeuronExplainerAgent:
@@ -163,8 +356,9 @@ class NeuronExplainerAgent:
     Automated Mechanistic Interpretability Agent implementing the methodology from
     'Neural Networks Are Already Clean' (Cammarata / Goodfire, 2026).
 
-    1. Packages Bipolar Neuron Profiles (+Pole / -Pole contexts + Direct Logit Attribution)
-       alongside Downstream Circuit Ecology (Excited, Inhibited, and Gating edges).
+    1. Packages Bipolar Neuron Profiles (+Pole / -Pole contexts, Pole-Specific Selectivities,
+       Stratified Quantile Activation Buckets, and Direct Logit Attribution) alongside
+       Downstream Circuit Ecology and verified Crossword Neighbor Clues (`CircuitEcologyMap`).
     2. Prompts an LLM Agent to synthesize a unified 'Verb' hypothesis and recursive offshoots.
     3. Automatically runs closed-loop surgical interventions (Zero-Ablation & Pole Clamping)
        on the live PyTorch model to empirically verify or falsify the agent's hypothesis.
@@ -172,13 +366,14 @@ class NeuronExplainerAgent:
 
     SYSTEM_PROMPT = """You are a senior mechanistic interpretability researcher auditing single neurons under the 'Neural Networks Are Already Clean' framework.
 Your task is to analyze the provided JSON evidence for a single neuron (including its Positive Pole activating contexts,
- Negative Pole activating contexts, Direct Vocabulary Logit Attribution, and Downstream Layer Circuit Connections) and 
+ Negative Pole activating contexts, Stratified Quantile Activation Buckets, Direct Vocabulary Logit Attribution,
+ Downstream Layer Circuit Connections, and any already-verified Crossword Ecology Neighbor Clues) and
  return a strict JSON object with the following schema:
 {
   "positive_pole_motif": "Concise description of what excites the positive pole (>0)",
   "negative_pole_motif": "Concise description of what drives the negative pole (<0)",
   "unified_verb_hypothesis": "Single sentence explaining how this neuron acts as a differential 'verb' or router separating the Positive Pole from the Negative Pole and routing signals to downstream neurons.",
-  "recursive_offshoots": ["List of related secondary semantic offshoots or downstream specializations"],
+  "recursive_offshoots": ["List of related secondary semantic offshoots across quantile bands or downstream specializations"],
   "taxonomy_class": "clean_monosemantic | structured_recursive_mixture | true_polysemantic | dead_or_noisy",
   "confidence_score": 0.0 to 1.0,
   "proposed_experiment": {
@@ -258,8 +453,26 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
     def build_evidence_payload(
         profile: NeuronPoleProfile,
         circuit: Optional[CircuitGraph] = None,
+        ecology_neighbors: Optional[List[EcologyNeighborContext]] = None,
     ) -> Dict[str, Any]:
-        """Serializes a NeuronPoleProfile and optional CircuitGraph into a compact agent JSON payload."""
+        """
+        Serializes a NeuronPoleProfile (including pole-specific selectivities and
+        stratified quantile buckets), optional CircuitGraph, and optional Crossword
+        Ecology Neighbor contexts into a compact agent JSON payload.
+        """
+        def _fmt_buckets(buckets: Dict[str, List[Any]]) -> Dict[str, List[Dict[str, Any]]]:
+            return {
+                band: [
+                    {
+                        "activation": round(s.activation_value, 4),
+                        "token": s.token_str,
+                        "context": s.context_str,
+                    }
+                    for s in samples[:4]
+                ]
+                for band, samples in buckets.items()
+            }
+
         payload: Dict[str, Any] = {
             "neuron_profile": {
                 "layer_name": profile.layer_name,
@@ -271,6 +484,10 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 "positive_firing_rate": round(profile.positive_firing_rate, 4),
                 "negative_firing_rate": round(profile.negative_firing_rate, 4),
                 "pole_selectivity_score": round(profile.pole_selectivity_score, 3),
+                "pos_pole_selectivity_score": round(profile.pos_pole_selectivity_score, 3),
+                "pos_taxonomy_class": profile.pos_taxonomy_class.value,
+                "neg_pole_selectivity_score": round(profile.neg_pole_selectivity_score, 3),
+                "neg_taxonomy_class": profile.neg_taxonomy_class.value,
                 "top_positive_samples": [
                     {
                         "activation": round(s.activation_value, 4),
@@ -287,21 +504,39 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     }
                     for s in profile.top_negative_samples
                 ],
+                "positive_quantile_buckets": _fmt_buckets(profile.positive_quantile_buckets),
+                "negative_quantile_buckets": _fmt_buckets(profile.negative_quantile_buckets),
                 "top_promoted_tokens": profile.top_promoted_tokens,
                 "top_suppressed_tokens": profile.top_suppressed_tokens,
             }
         }
         if circuit is not None:
             payload["downstream_circuit"] = circuit.to_agent_payload()
+        if ecology_neighbors:
+            payload["ecology_neighbors"] = [
+                {
+                    "layer_name": n.layer_name,
+                    "neuron_idx": n.neuron_idx,
+                    "direction": n.direction,
+                    "role": n.role,
+                    "mean_causal_delta": n.mean_causal_delta,
+                    "positive_pole_motif": n.positive_pole_motif,
+                    "negative_pole_motif": n.negative_pole_motif,
+                    "unified_verb_hypothesis": n.unified_verb_hypothesis,
+                    "confidence_score": n.confidence_score,
+                }
+                for n in ecology_neighbors
+            ]
         return payload
 
     def generate_hypothesis(
         self,
         profile: NeuronPoleProfile,
         circuit: Optional[CircuitGraph] = None,
+        ecology_neighbors: Optional[List[EcologyNeighborContext]] = None,
     ) -> BipolarVerbHypothesis:
         """Calls the LLM agent to synthesize a BipolarVerbHypothesis and verification plan."""
-        evidence = self.build_evidence_payload(profile, circuit)
+        evidence = self.build_evidence_payload(profile, circuit, ecology_neighbors)
         raw_resp = self.llm_client.complete_json(
             system_prompt=self.SYSTEM_PROMPT,
             user_prompt=json.dumps(evidence, indent=2),
@@ -354,7 +589,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
              causally reduces the logits of `expected_promoted_tokens` and shifts downstream `dst_layer` neurons.
           3. Surgical Pole-Flip Check (`neuron = -max_val`): Measures whether clamping the neuron to its
              negative pole boosts `expected_suppressed_tokens`.
-        Uses `clean_forward()` and `temporary_interventions(...)` so pre-existing user interventions are preserved.
+        Uses `without_interventions()` and `temporary_interventions(...)` so pre-existing user interventions are preserved.
         """
         model = self.injector.model
         model.eval()
@@ -594,10 +829,11 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
     ) -> BipolarVerbHypothesis:
         """
         Full end-to-end closed-loop agentic workflow:
-          1. Extracts the audited NeuronPoleProfile (+ Direct Logit Attribution).
+          1. Extracts the audited NeuronPoleProfile (+ Direct Logit Attribution + Quantile Buckets).
           2. Optionally traces the downstream circuit to `dst_layer`.
-          3. Synthesizes a BipolarVerbHypothesis via the LLM Agent.
-          4. Runs surgical Zero-Ablation and Pole-Clamping verification experiments to validate the hypothesis.
+          3. Queries `self.injector.ecology_map` for already-verified upstream/downstream neighbor clues.
+          4. Synthesizes a BipolarVerbHypothesis via the LLM Agent and empirically verifies it.
+          5. Registers the verified hypothesis back into `self.injector.ecology_map`.
         """
         profile = self.injector.get_neuron_profile(
             layer_name=layer_name,
@@ -618,7 +854,11 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 top_k=8,
             )
 
-        hypothesis = self.generate_hypothesis(profile, circuit)
+        neighbors: List[EcologyNeighborContext] = []
+        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
+            neighbors = self.injector.ecology_map.get_neighbor_contexts(layer_name, neuron_idx)
+
+        hypothesis = self.generate_hypothesis(profile, circuit, ecology_neighbors=neighbors)
         self.verify_hypothesis(
             hypothesis,
             tok_to_id=tok_to_id,
@@ -627,4 +867,6 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             tokenizer=tokenizer,
             circuit_inputs=circuit_inputs,
         )
+        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
+            self.injector.ecology_map.register_hypothesis(hypothesis)
         return hypothesis

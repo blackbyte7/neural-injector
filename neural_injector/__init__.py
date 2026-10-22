@@ -1,33 +1,49 @@
-from .analyzer import StreamingLayerStats, LogitLensAttributor
-from .circuit_tracer import CircuitTracer
-from .discovery import LayerDiscovery, LayerDescriptor
-from .explainer import (
-    LLMClientProtocol,
-    OpenAICompatibleClient,
-    HeuristicSynthesisClient,
-    NeuronExplainerAgent,
+from .analyzer import (
+    CheckpointEvolutionTracker,
+    ContrastivePoleFinder,
+    LogitLensAttributor,
+    StreamingLayerStats,
 )
-from .exporter import SteeringExporter, ProductionSteeringRuntime
+from .circuit_tracer import CircuitTracer
+from .discovery import LayerDescriptor, LayerDiscovery
+from .explainer import (
+    AgentHypothesisResponseSchema,
+    CircuitEcologyMap,
+    HeuristicSynthesisClient,
+    LLMClientProtocol,
+    NeuronExplainerAgent,
+    OpenAICompatibleClient,
+)
+from .exporter import ProductionSteeringRuntime, SteeringExporter
 from .injector import NeuralInjector
-from .interventions import InterventionKernel
+from .interventions import AblationMaskOptimizer, InterventionKernel
 from .session import WorkbenchSession
 from .types import (
-    PoleType,
-    InterventionMode,
-    InteractionRole,
-    NeuronTaxonomy,
     ActivationSample,
-    NeuronPoleProfile,
-    InterventionSpec,
+    BipolarVerbHypothesis,
     CircuitEdge,
     CircuitGraph,
+    CompiledSteeringVector,
+    ContrastiveDiscoveryReport,
+    ContrastiveNeuronMatch,
+    DownstreamReadoutReport,
+    EcologyNeighborContext,
+    GateConditionSpec,
+    InteractionRole,
+    InterventionMode,
+    InterventionSpec,
+    LayerCleanlinessReport,
+    LayerEcologySolveReport,
+    NeuronCheckpointSnapshot,
+    NeuronEvolutionReport,
+    NeuronPoleProfile,
+    NeuronScanSummary,
+    NeuronTaxonomy,
+    PoleType,
+    ProductionPresetBundle,
+    SynergisticAblationResult,
     VerificationExperimentSpec,
     VerificationReport,
-    BipolarVerbHypothesis,
-    NeuronScanSummary,
-    LayerCleanlinessReport,
-    CompiledSteeringVector,
-    ProductionPresetBundle,
 )
 
 __all__ = [
@@ -37,12 +53,21 @@ __all__ = [
     "NeuronTaxonomy",
     "ActivationSample",
     "NeuronPoleProfile",
+    "GateConditionSpec",
     "InterventionSpec",
     "CircuitEdge",
     "CircuitGraph",
+    "DownstreamReadoutReport",
     "VerificationExperimentSpec",
     "VerificationReport",
     "BipolarVerbHypothesis",
+    "EcologyNeighborContext",
+    "LayerEcologySolveReport",
+    "ContrastiveNeuronMatch",
+    "ContrastiveDiscoveryReport",
+    "NeuronCheckpointSnapshot",
+    "NeuronEvolutionReport",
+    "SynergisticAblationResult",
     "NeuronScanSummary",
     "LayerCleanlinessReport",
     "CompiledSteeringVector",
@@ -51,11 +76,16 @@ __all__ = [
     "LayerDescriptor",
     "StreamingLayerStats",
     "LogitLensAttributor",
+    "ContrastivePoleFinder",
+    "CheckpointEvolutionTracker",
     "InterventionKernel",
+    "AblationMaskOptimizer",
     "CircuitTracer",
     "LLMClientProtocol",
+    "AgentHypothesisResponseSchema",
     "OpenAICompatibleClient",
     "HeuristicSynthesisClient",
+    "CircuitEcologyMap",
     "NeuronExplainerAgent",
     "SteeringExporter",
     "ProductionSteeringRuntime",

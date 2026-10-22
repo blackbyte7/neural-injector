@@ -57,7 +57,7 @@ class LayerDiscovery:
           2. up_module: The sibling module that reads linear value projections from the residual stream (`up_proj` / `fc1`)
           3. gate_module: The sibling gating module in SwiGLU blocks (`gate_proj`), if present
         Also supports fused `gate_up_proj` layers by splitting `[2 * d_mlp, d_model]` into `(gate, up)` views,
-        and 3D MoE expert tensors `[num_experts, d_model, d_mlp]` or `[num_experts, d_mlp, d_model]`.
+        and 3D MoE expert tensors `[num_experts, d_model, d_mlp]` or `[num_experts, 2 * d_mlp, d_model]`.
         """
         write_mod, _, num_neurons = cls.resolve_module(model, layer_name)
         parent_path = ".".join(layer_name.split(".")[:-1])
@@ -74,10 +74,10 @@ class LayerDiscovery:
             ):
                 w = child_mod.weight.detach()
                 if w.ndim == 3 and w.shape[-2] == 2 * num_neurons:
-                    # 3D MoE fused gate_up_proj: [num_experts, 2 * d_mlp, d_model] -> flatten experts into neuron dim
+                    # 3D MoE fused gate_up_proj: [num_experts, 2 * d_mlp, d_model] -> preserve 3D [num_experts, d_mlp, d_model]
                     gate_w, up_w = w.chunk(2, dim=-2)
-                    gate_mod = _SlicedLinearView(gate_w.reshape(-1, w.shape[-1]))
-                    up_mod = _SlicedLinearView(up_w.reshape(-1, w.shape[-1]))
+                    gate_mod = _SlicedLinearView(gate_w)
+                    up_mod = _SlicedLinearView(up_w)
                 elif child_mod.__class__.__name__ == "Conv1D" and w.shape[1] == 2 * num_neurons:
                     gate_w, up_w = w.T.chunk(2, dim=0)
                     gate_mod = _SlicedLinearView(gate_w)
@@ -97,7 +97,7 @@ class LayerDiscovery:
     def resolve_pre_mlp_norm(cls, model: nn.Module, layer_name: str) -> Optional[nn.Module]:
         """
         Resolves the LayerNorm / RMSNorm module immediately preceding the MLP block containing `layer_name`
-        (e.g., `post_attention_layernorm`, `norm_1`, `ln_2`, `ffn_norm`).
+        (e.g., `post_attention_layernorm`, `norm_0`, `norm_1`, `ln_2`, `ffn_norm`).
         """
         parts = layer_name.split(".")
         # Walk up 1 or 2 levels (e.g. from `layers.0.mlp.down_proj` to `layers.0`)
@@ -110,17 +110,17 @@ class LayerDiscovery:
                 if any(p in cname.lower() for p in cls.NORM_PATTERNS) and hasattr(cmod, "weight")
             ]
             if norms:
-                # Prefer post-attention / MLP norm if multiple norms exist in the block
-                for cname, cmod in norms:
-                    if any(k in cname.lower() for k in ("post", "mlp", "ffn", "ln_2", "norm_1", "norm2")):
-                        return cmod
-                # If layer_name has a numeric index (e.g., mlp_block_0 -> norm_0), match the index
+                # 1. If layer_name has a numeric block suffix (e.g., mlp_block_0 -> norm_0), match it first
                 for seg in parts:
                     if seg.startswith("mlp_block_"):
                         idx_suffix = seg.replace("mlp_block_", "")
                         for cname, cmod in norms:
                             if cname.endswith(f"_{idx_suffix}") or cname.endswith(idx_suffix):
                                 return cmod
+                # 2. Prefer post-attention / MLP norm if multiple norms exist in a single transformer block
+                for cname, cmod in norms:
+                    if any(k in cname.lower() for k in ("post", "mlp", "ffn", "ln_2", "norm_1", "norm2")):
+                        return cmod
                 return norms[-1][1]
         return None
 
