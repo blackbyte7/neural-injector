@@ -103,6 +103,10 @@ class NeuralInjector:
         """Returns True if streaming statistics have been collected for `layer_name`."""
         return layer_name in self._stats_trackers
 
+    def get_stats_tracker(self, layer_name: str) -> Optional[StreamingLayerStats]:
+        """Public accessor returning the audited StreamingLayerStats for `layer_name`, if available."""
+        return self._stats_trackers.get(layer_name)
+
     @property
     def active_intervention_count(self) -> int:
         """Returns the total number of registered InterventionSpecs across all layers."""

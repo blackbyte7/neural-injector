@@ -6,13 +6,14 @@ import shlex
 from typing import List, Optional
 
 from .session import WorkbenchSession
-from .types import PoleType
+from .types import InterventionMode, PoleType
 
 
 class NeuralInjectorREPL(cmd.Cmd):
     """
     Stateful interactive terminal workbench for auditing neurons, manipulating poles,
-    tracing layer-to-layer circuits, and running closed-loop agent explanations.
+    tracing layer-to-layer circuits, solving crossword circuit ecology, discovering
+    contrastive neurons, and running closed-loop agent explanations.
     """
 
     intro = (
@@ -40,7 +41,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         print()
 
     def do_scan(self, arg: str) -> None:
-        """scan <layer_name> [sort_by] [top_n] : Run a batch layer-wide cleanliness audit across all neurons."""
+        """scan <layer_name> [sort_by] [top_n] : Run a batch layer-wide & pole-specific cleanliness audit."""
         parts = shlex.split(arg)
         if not parts:
             print(
@@ -61,33 +62,38 @@ class NeuralInjectorREPL(cmd.Cmd):
         )
 
         print(
-            f"\n=== LAYER-WIDE CLEANLINESS SCAN: {report.layer_name} ({report.num_neurons} neurons) ==="
+            f"\n=== LAYER-WIDE CLEANLINESS SCAN: {report.layer_name} ({report.num_neurons} neurons / {2 * report.num_neurons} poles) ==="
         )
         print(
-            f"Clean Monosemantic: {report.clean_monosemantic_pct:.1f}% | "
+            f"Whole-Neuron Clean : {report.clean_monosemantic_pct:.1f}% | "
             f"Structured Recursive: {report.structured_recursive_pct:.1f}% | "
-            f"Combined Clean+Structured: {report.combined_clean_and_structured_pct:.1f}%"
+            f"Combined: {report.combined_clean_and_structured_pct:.1f}%"
         )
-        print(f"Taxonomy Counts: {report.taxonomy_counts}")
         print(
-            f"\n{'IDX':<5} | {'TAXONOMY':<28} | {'SELECTIVITY':<11} | {'BIPOLAR':<7} | {'IMPACT':<8} | {'KL_ABL':<8} | {'+TOK / -TOK'}"
+            f"Independent Poles  : {report.clean_poles_pct:.1f}% Clean | "
+            f"Structured Poles: {report.structured_poles_pct:.1f}% | "
+            f"Combined Poles: {report.combined_clean_and_structured_poles_pct:.1f}%"
         )
-        print("-" * 96)
+        print(
+            f"\n{'IDX':<5} | {'TAXONOMY':<28} | {'SEL (+ / -)':<19} | {'BIPOLAR':<7} | {'IMPACT':<8} | {'KL_ABL':<8} | {'+TOK / -TOK'}"
+        )
+        print("-" * 106)
         for n in report.neurons:
             kl_str = (
                 f"{n.ablation_kl_divergence:.4f}"
                 if n.ablation_kl_divergence is not None
                 else "  -   "
             )
+            sel_pair = f"{n.pole_selectivity_score:4.1f} ({n.pos_pole_selectivity_score:4.1f}/{n.neg_pole_selectivity_score:4.1f})"
             tok_pair = f"{n.top_pos_token or '-'} / {n.top_neg_token or '-'}"
             print(
-                f"N{n.neuron_idx:<4} | {n.taxonomy_class.value:<28} | {n.pole_selectivity_score:<11.3f} | "
+                f"N{n.neuron_idx:<4} | {n.taxonomy_class.value:<28} | {sel_pair:<19} | "
                 f"{n.bipolar_balance:<7.3f} | {n.estimated_causal_impact:<8.3f} | {kl_str:<8} | {tok_pair}"
             )
         print()
 
     def do_profile(self, arg: str) -> None:
-        """profile <layer_name> <neuron_idx> : Inspect Positive & Negative poles and Logit Attribution."""
+        """profile <layer_name> <neuron_idx> : Inspect Positive & Negative poles, Quantile Bands, and Logit Attribution."""
         parts = shlex.split(arg)
         if len(parts) < 2:
             print("Usage: profile <layer_name> <neuron_idx>  (e.g., profile mlp_block_0.down_proj 7)")
@@ -102,7 +108,11 @@ class NeuralInjectorREPL(cmd.Cmd):
             )
             print(f"\n--- NEURON PROFILE: {p.layer_name} [Neuron #{p.neuron_idx}] ---")
             print(
-                f"Mean: {p.mean:+.4f} | Std: {p.std:.4f} | Selectivity: {p.pole_selectivity_score:.2f} | Clean Candidate: {p.is_clean_candidate}"
+                f"Mean: {p.mean:+.4f} | Std: {p.std:.4f} | Overall Selectivity: {p.pole_selectivity_score:.2f} | Clean Candidate: {p.is_clean_candidate}"
+            )
+            print(
+                f"+Pole Selectivity: {p.pos_pole_selectivity_score:.2f} ({p.pos_taxonomy_class.value}) | "
+                f"-Pole Selectivity: {p.neg_pole_selectivity_score:.2f} ({p.neg_taxonomy_class.value})"
             )
             print(
                 f"\n[+] POSITIVE POLE (Firing Rate: {p.positive_firing_rate * 100:.1f}%, Max: {p.max_val:+.3f}):"
@@ -111,6 +121,11 @@ class NeuralInjectorREPL(cmd.Cmd):
                 print(
                     f"    Act: {s.activation_value:+.3f} | Token: '{s.token_str}' | Context: \"{s.context_str}\""
                 )
+            for band, b_samples in p.positive_quantile_buckets.items():
+                toks = [s.token_str for s in b_samples[:4] if s.token_str]
+                if toks:
+                    print(f"    [Band: {band:<17}] Tokens: {toks}")
+
             print(
                 f"\n[-] NEGATIVE POLE (Firing Rate: {p.negative_firing_rate * 100:.1f}%, Min: {p.min_val:+.3f}):"
             )
@@ -148,18 +163,56 @@ class NeuralInjectorREPL(cmd.Cmd):
         print(f"Registered HARD_CLAMP={val:+.2f} on {layer_name}[{idx}] (pole={pole.value}).")
 
     def do_prune(self, arg: str) -> None:
-        """prune <layer_name> <threshold> : Zero out weak activations |a| below threshold across the layer."""
+        """prune <layer_name> <threshold_or_std_mult> [adaptive] : Zero out weak activations across the layer."""
         parts = shlex.split(arg)
         if len(parts) < 2:
-            print("Usage: prune <layer_name> <threshold>")
+            print("Usage: prune <layer_name> <threshold> [adaptive]")
             return
-        layer_name, threshold = parts[0], float(parts[1])
+        layer_name, val = parts[0], float(parts[1])
+        use_adaptive = len(parts) >= 3 and parts[2].lower() == "adaptive"
         layers = self.session.injector.list_targetable_layers()
         num_n = layers[layer_name].num_neurons if layer_name in layers else 128
-        self.session.injector.prune_weak_activations(
-            layer_name, list(range(num_n)), threshold=threshold
+        if use_adaptive:
+            self.session.injector.prune_weak_activations(
+                layer_name, list(range(num_n)), std_multiplier=val
+            )
+            print(
+                f"Registered adaptive WEAK_PRUNE (std_multiplier={val}) across {num_n} neurons in {layer_name}."
+            )
+        else:
+            self.session.injector.prune_weak_activations(
+                layer_name, list(range(num_n)), threshold=val
+            )
+            print(
+                f"Registered WEAK_PRUNE (|a| below {val}) across {num_n} neurons in {layer_name}."
+            )
+
+    def do_gate(self, arg: str) -> None:
+        """gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> [threshold] : Register a closed-loop conditional gate."""
+        parts = shlex.split(arg)
+        if len(parts) < 5:
+            print(
+                "Usage: gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> [threshold]"
+            )
+            return
+        t_layer, t_idx = parts[0], int(parts[1])
+        d_layer, d_idx = parts[2], int(parts[3])
+        delta = float(parts[4])
+        thresh = float(parts[5]) if len(parts) >= 6 else 1.0
+        self.session.injector.add_conditional_gate(
+            target_layer=t_layer,
+            target_neurons=[t_idx],
+            detector_layer=d_layer,
+            detector_neuron=d_idx,
+            detector_pole=PoleType.POSITIVE,
+            threshold=thresh,
+            action_mode=InterventionMode.ADDITIVE_STEER,
+            value=delta,
+            sequence_scope="any_token",
         )
-        print(f"Registered WEAK_PRUNE (|a| below {threshold}) across {num_n} neurons in {layer_name}.")
+        print(
+            f"Registered CONDITIONAL_GATE: steer {t_layer}[N{t_idx}] by {delta:+.2f} when {d_layer}[N{d_idx}] > {thresh}."
+        )
 
     def do_clear(self, _arg: str) -> None:
         """clear : Remove all active surgical neuron interventions."""
@@ -214,6 +267,33 @@ class NeuralInjectorREPL(cmd.Cmd):
             )
         print()
 
+    def do_readout(self, arg: str) -> None:
+        """readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold] : Audit whether weak cross-activations are read downstream."""
+        parts = shlex.split(arg)
+        if len(parts) < 3:
+            print("Usage: readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold]")
+            return
+        src_l, dst_l = parts[0], parts[1]
+        neurons = [int(x.strip()) for x in parts[2].split(",") if x.strip()]
+        thresh = float(parts[3]) if len(parts) >= 4 else None
+        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        rep = self.session.injector.verify_downstream_readout(
+            src_layer=src_l,
+            dst_layer=dst_l,
+            src_neurons=neurons,
+            inputs=input_ids,
+            weak_threshold=thresh,
+        )
+        print(f"\n--- DOWNSTREAM READOUT AUDIT ({src_l} {neurons} -> {dst_l}) ---")
+        print(
+            f"Max Downstream Act Shift : {rep.max_downstream_activation_shift:.5f} | "
+            f"Max Gate Shift: {rep.max_downstream_gate_shift:.5f}"
+        )
+        print(
+            f"Benign Spillover ('Nothing Reads That Combination'): {rep.is_benign_spillover} | "
+            f"Affected Downstream Neurons: {rep.affected_downstream_neurons}\n"
+        )
+
     def do_explain(self, arg: str) -> None:
         """explain <layer_name> <neuron_idx> [dst_layer] : Run the Automated LLM Explainer & Surgical Verifier."""
         parts = shlex.split(arg)
@@ -237,10 +317,89 @@ class NeuralInjectorREPL(cmd.Cmd):
         print(f"+Pole Motif    : {hyp.positive_pole_motif}")
         print(f"-Pole Motif    : {hyp.negative_pole_motif}")
         print(f"Unified 'Verb' : {hyp.unified_verb_hypothesis}")
+        if hyp.recursive_offshoots:
+            print("Offshoots      :")
+            for branch in hyp.recursive_offshoots:
+                print(f"  - {branch}")
         if hyp.verification_report:
             print(
                 f"Verification   : Score={hyp.verification_report.empirical_verification_score:.3f} | {hyp.verification_report.summary_notes}\n"
             )
+
+    def do_ecology(self, arg: str) -> None:
+        """ecology <layer_name> [dst_layer] [top_anchors] [top_contextual] : Solve layer ecology via Crossword propagation."""
+        parts = shlex.split(arg)
+        if not parts:
+            print("Usage: ecology <layer_name> [dst_layer] [top_anchors] [top_contextual]")
+            return
+        layer_name = parts[0]
+        dst_layer = parts[1] if len(parts) >= 2 else None
+        top_a = int(parts[2]) if len(parts) >= 3 else 2
+        top_c = int(parts[3]) if len(parts) >= 4 else 2
+        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        rep = self.session.injector.solve_layer_ecology(
+            layer_name=layer_name,
+            tok_to_id=self.session.tok_to_id,
+            idx_to_token=self.session.id_to_tok,
+            unembed_weight=self.session.unembed_weight,
+            dst_layer=dst_layer,
+            circuit_inputs=input_ids if dst_layer else None,
+            top_anchors=top_a,
+            top_contextual=top_c,
+        )
+        print(f"\n=== CROSSWORD CIRCUIT ECOLOGY SOLVE: {rep.layer_name} ===")
+        print(
+            f"Anchor Neurons Solved: {rep.anchor_neurons_explained} | "
+            f"Contextual Neurons Solved: {rep.contextual_neurons_explained} | "
+            f"Mean Verification Score: {rep.mean_verification_score:.3f}"
+        )
+        for n_idx, hyp in rep.hypotheses.items():
+            print(f"  * N{n_idx:<3} [{hyp.taxonomy_class.value}]: {hyp.unified_verb_hypothesis}")
+        print()
+
+    def do_contrastive(self, arg: str) -> None:
+        """contrastive <pos_prompt> | <neg_prompt> : Discover native neurons separating two contrastive prompts."""
+        if "|" not in arg:
+            print(
+                "Usage: contrastive <pos_prompt> | <neg_prompt>  (e.g., contrastive the system negotiated AES256 TLS | the system executed SELECT postgres)"
+            )
+            return
+        pos_str, neg_str = [s.strip() for s in arg.split("|", 1)]
+        pos_ids, _ = self.session.encode_prompt(pos_str)
+        neg_ids, _ = self.session.encode_prompt(neg_str)
+        rep = self.session.injector.discover_contrastive_neurons(
+            pos_inputs=pos_ids, neg_inputs=neg_ids, top_k=6
+        )
+        print("\n=== CONTRASTIVE BIPOLAR NEURON DISCOVERY (Welch's t-statistic) ===")
+        for m in rep.top_matches:
+            print(
+                f"  {m.layer_name}[N{m.neuron_idx:<3}] | t={m.t_statistic:+.3f} | "
+                f"mu+={m.pos_mean:+.3f}, mu-={m.neg_mean:+.3f} | "
+                f"SignFlip={m.bipolar_sign_flip} | Pole={m.recommended_pole.value}"
+            )
+        print()
+
+    def do_synergy(self, arg: str) -> None:
+        """synergy <layer_name> [k] [greedy|l1_optim] : Find a minimal synergistic coalition of k neurons to ablate."""
+        parts = shlex.split(arg)
+        if not parts:
+            print("Usage: synergy <layer_name> [k] [greedy|l1_optim]")
+            return
+        layer_name = parts[0]
+        k = int(parts[1]) if len(parts) >= 2 else 3
+        method = parts[2] if len(parts) >= 3 else "greedy"
+        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        res = self.session.injector.find_synergistic_ablation_set(
+            layer_name=layer_name, inputs=input_ids, max_subset_size=k, method=method
+        )
+        print(f"\n=== SYNERGISTIC MULTI-NEURON ABLATION ({res.layer_name}, method={res.method}) ===")
+        print(f"Selected Coalition : {res.selected_neurons}")
+        print(f"Stepwise Scores    : {res.stepwise_scores}")
+        print(
+            f"Joint Ablation KL  : {res.joint_ablation_kl:.5f} | "
+            f"Sum Individual KLs: {res.sum_of_individual_kls:.5f} | "
+            f"Synergy Ratio: {res.synergy_ratio:.3f}\n"
+        )
 
     def do_export(self, arg: str) -> None:
         """export <json_filepath> [pt_vectors_filepath] : Export active interventions & compiled steering vectors."""
@@ -322,7 +481,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     prof_p.add_argument("neuron_idx", type=int)
 
     # 4. Direct one-shot explain command
-    exp_p = sub.add_parser("explain", help="Run the agentic explainer + surgical verification on a neuron")
+    exp_p = sub.add_parser(
+        "explain", help="Run the agentic explainer + surgical verification on a neuron"
+    )
     exp_p.add_argument("layer_name", type=str)
     exp_p.add_argument("neuron_idx", type=int)
     exp_p.add_argument("--dst-layer", type=str, default=None)

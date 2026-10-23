@@ -166,8 +166,8 @@ class TestSurgicalInterventions:
             value=0.0,
         )
         out = InterventionKernel.apply(x, [spec], is_conv2d=True)
-        assert torch.all(out[:, 3, :, :] == 0.0)
-        assert torch.all(out[:, 0, :, :] == 1.0)
+        assert torch.allclose(out[:, 3, :, :], torch.zeros_like(out[:, 3, :, :]))
+        assert torch.allclose(out[:, 0, :, :], torch.ones_like(out[:, 0, :, :]))
 
     def test_live_model_zero_ablation_and_kl_divergence(
         self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
@@ -905,11 +905,6 @@ class TestAuditFixesAndCammarataExtensions:
 # =============================================================================
 class TestUniversalModelAgnosticSupport:
     def test_gpt2_conv1d_discovery_and_attn_c_proj_disambiguation(self):
-        """
-        Verifies that GPT-2 style `Conv1D` layers in `mlp.c_proj` are discovered as
-        `GPT2_MLP_Neuron_Basis (Pre-DownProj)`, while `attn.c_proj` is NOT mistaken
-        for an MLP neuron basis, and `fold_interventions_into_weights` works on `Conv1D`.
-        """
         class Conv1D(nn.Module):
             def __init__(self, nf: int, nx: int):
                 super().__init__()
@@ -917,10 +912,10 @@ class TestUniversalModelAgnosticSupport:
                 self.weight = nn.Parameter(torch.randn(nx, nf) * 0.02)
                 self.bias = nn.Parameter(torch.zeros(nf))
 
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                size_out = x.size()[:-1] + (self.nf,)
-                x = torch.addmm(self.bias, x.view(-1, x.size(-1)), self.weight)
-                return x.view(size_out)
+            def forward(self, inp: torch.Tensor) -> torch.Tensor:
+                size_out = inp.size()[:-1] + (self.nf,)
+                out_t = torch.addmm(self.bias, inp.view(-1, inp.size(-1)), self.weight)
+                return out_t.view(size_out)
 
         class MiniGPT2Block(nn.Module):
             def __init__(self, d_model: int = 32, d_mlp: int = 64):
@@ -931,10 +926,10 @@ class TestUniversalModelAgnosticSupport:
                     "c_proj": Conv1D(d_model, d_mlp),
                 })
 
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                x = x + self.attn["c_proj"](x)
-                h = torch.relu(self.mlp["c_fc"](x))
-                return x + self.mlp["c_proj"](h)
+            def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                hidden_states = hidden_states + self.attn["c_proj"](hidden_states)
+                h = torch.relu(self.mlp["c_fc"](hidden_states))
+                return hidden_states + self.mlp["c_proj"](h)
 
         model = MiniGPT2Block()
         inj = NeuralInjector(model)
@@ -944,16 +939,15 @@ class TestUniversalModelAgnosticSupport:
         assert "attn.c_proj" not in layers
         assert layers["mlp.c_proj"].num_neurons == 64
 
-        # Verify Conv1D weight folding numerical equivalence
-        x = torch.randn(2, 4, 32)
+        sample_x = torch.randn(2, 4, 32)
         inj.steer_neurons("mlp.c_proj", neuron_indices=[5, 10], delta=4.0)
         with torch.no_grad(), inj.active_injection():
-            hook_out = model(x)
+            hook_out = model(sample_x)
 
         fold_res = inj.fold_interventions_into_weights()
         assert fold_res["operations_applied"] == 1
         with torch.no_grad():
-            folded_out = model(x)
+            folded_out = model(sample_x)
         assert torch.allclose(hook_out, folded_out, atol=1e-5)
 
     def test_fused_gate_up_proj_and_3d_moe_virtual_weights(self):
@@ -1040,7 +1034,7 @@ class TestProductionHardeningAndSection5Capabilities:
         demo_session.injector.clear_interventions()
         demo_session.injector.steer_neurons("mlp_block_0.down_proj", neuron_indices=[7], delta=-8.0)
 
-        def _worker(idx: int) -> float:
+        def _worker(_idx: int) -> float:
             res = demo_session.evaluate_prompt_comparison("the system negotiated AES256")
             return float(res["kl_divergence"])
 
@@ -1082,7 +1076,7 @@ class TestProductionHardeningAndSection5Capabilities:
             def __exit__(self, *args):
                 pass
 
-        def _fake_urlopen(req, timeout=60):
+        def _fake_urlopen(_req: Any, **_kwargs: Any):
             attempts["count"] += 1
             if attempts["count"] == 1:
                 # Malformed JSON on attempt 1 -> triggers retry
@@ -1105,7 +1099,10 @@ class TestProductionHardeningAndSection5Capabilities:
         out = client.complete_json("sys", "user")
         assert attempts["count"] == 2
         assert out["confidence_score"] == 0.91
-        assert AgentHypothesisResponseSchema.model_validate(out).taxonomy_class == NeuronTaxonomy.CLEAN_MONOSEMANTIC
+        assert (
+                AgentHypothesisResponseSchema.model_validate(out).taxonomy_class
+                == NeuronTaxonomy.CLEAN_MONOSEMANTIC
+        )
 
     def test_section_5_1_forward_mode_ad_single_pass_circuit_tracer(
         self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor

@@ -191,8 +191,12 @@ class CircuitTracer:
             tangent_flat = torch.zeros_like(src_flat)
             tangent_flat[amask, src_neuron] = 1.0
             if is_src_conv and t.ndim == 4:
-                b, c, h, w = t.shape
-                tangent = tangent_flat.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+                b_dim, c_dim, h_dim, w_dim = t.shape
+                tangent = (
+                    tangent_flat.reshape(b_dim, h_dim, w_dim, c_dim)
+                    .permute(0, 3, 1, 2)
+                    .contiguous()
+                )
             else:
                 tangent = tangent_flat.reshape_as(t)
             return fwAD.make_dual(t, tangent)
@@ -231,14 +235,19 @@ class CircuitTracer:
                         )
                         return
                     if conv_flag and tang.ndim == 4:
-                        tang_flat = tang.permute(0, 2, 3, 1).reshape(-1, n_dst)
+                        dst_tang_flat = tang.permute(0, 2, 3, 1).reshape(-1, n_dst)
                     else:
-                        tang_flat = tang.reshape(-1, n_dst)
-                    if active_mask_holder and active_mask_holder[-1].shape[0] == tang_flat.shape[0]:
-                        d_mask = active_mask_holder[-1].to(tang_flat.device)
-                        jac_vec = tang_flat[d_mask].float().sum(dim=0) / active_count_holder[0]
+                        dst_tang_flat = tang.reshape(-1, n_dst)
+                    if (
+                            active_mask_holder
+                            and active_mask_holder[-1].shape[0] == dst_tang_flat.shape[0]
+                    ):
+                        d_mask = active_mask_holder[-1].to(dst_tang_flat.device)
+                        jac_vec = (
+                                dst_tang_flat[d_mask].float().sum(dim=0) / active_count_holder[0]
+                        )
                     else:
-                        jac_vec = tang_flat.float().mean(dim=0)
+                        jac_vec = dst_tang_flat.float().mean(dim=0)
                     captured_tangents[lname] = jac_vec.detach()
 
                 return _unpack_tensor
@@ -267,8 +276,8 @@ class CircuitTracer:
             with self.injector.without_interventions(), fwAD.dual_level():
                 run_fwd(self.model, inputs)
         finally:
-            for h in handles:
-                h.remove()
+            for handle in handles:
+                handle.remove()
             if was_training:
                 self.model.train()
 
@@ -278,19 +287,19 @@ class CircuitTracer:
     # 3. Causal Pole-to-Pole Circuit Tracing (Activation Patching + Forward AD)
     # -------------------------------------------------------------------------
     def trace_circuit(
-            self,
-            src_layer: str,
-            dst_layer: str,
-            src_neuron: int,
-            inputs: Any,
-            forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-            src_pole: PoleType = PoleType.POSITIVE,
-            intervention_mode: InterventionMode = InterventionMode.ZERO_ABLATE,
-            intervention_value: float = 0.0,
-            token_positions: Optional[List[int]] = None,
-            compute_jacobian: bool = True,
-            active_threshold: float = 1e-5,
-            top_k: int = 16,
+        self,
+        src_layer: str,
+        dst_layer: str,
+        src_neuron: int,
+        inputs: Any,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        src_pole: PoleType = PoleType.POSITIVE,
+        intervention_mode: InterventionMode = InterventionMode.ZERO_ABLATE,
+        intervention_value: float = 0.0,
+        token_positions: Optional[List[int]] = None,
+        compute_jacobian: bool = True,
+        active_threshold: float = 1e-5,
+        top_k: int = 16,
     ) -> CircuitGraph:
         """
         Traces the causal circuit from `(src_layer, src_neuron, src_pole)` to all neurons in `dst_layer`.
@@ -329,13 +338,17 @@ class CircuitTracer:
                 amask = torch.ones_like(s_col, dtype=torch.bool)
             active_mask_holder.append(amask)
 
-            tang_flat = torch.zeros_like(s_flat)
-            tang_flat[amask, src_neuron] = 1.0
+            src_tangent_flat = torch.zeros_like(s_flat)
+            src_tangent_flat[amask, src_neuron] = 1.0
             if is_src_conv and primal.ndim == 4:
-                b, c, h, w = primal.shape
-                tangent = tang_flat.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+                b_dim, c_dim, h_dim, w_dim = primal.shape
+                tangent = (
+                    src_tangent_flat.reshape(b_dim, h_dim, w_dim, c_dim)
+                    .permute(0, 3, 1, 2)
+                    .contiguous()
+                )
             else:
-                tangent = tang_flat.reshape_as(primal)
+                tangent = src_tangent_flat.reshape_as(primal)
             return fwAD.make_dual(primal, tangent)
 
         def _capture_dst_dual(t: torch.Tensor) -> None:
@@ -435,11 +448,11 @@ class CircuitTracer:
             jacobian_vec = torch.zeros(num_dst, dtype=torch.float32, device=dst_flat.device)
             if compute_jacobian and dst_tang is not None:
                 if is_dst_conv and dst_tang.ndim == 4:
-                    tang_flat = dst_tang.permute(0, 2, 3, 1).reshape(-1, num_dst)
+                    dst_tang_flat = dst_tang.permute(0, 2, 3, 1).reshape(-1, num_dst)
                 else:
-                    tang_flat = dst_tang.reshape(-1, num_dst)
+                    dst_tang_flat = dst_tang.reshape(-1, num_dst)
                 n_active = max(int(active_mask.sum().item()), 1)
-                jacobian_vec = tang_flat[dst_active_mask].float().sum(dim=0) / n_active
+                jacobian_vec = dst_tang_flat[dst_active_mask].float().sum(dim=0) / n_active
         else:
             # Reverse-mode autograd fallback
             rev_src: List[torch.Tensor] = []
@@ -725,6 +738,7 @@ class CircuitTracer:
         dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
         _, _, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(self.model, dst_layer)
 
+        tracker = self.injector.get_stats_tracker(src_layer)
         if isinstance(weak_threshold, list):
             applied_thresholds = [float(x) for x in weak_threshold]
             scalar_val = applied_thresholds[0] if applied_thresholds else 0.0
@@ -733,8 +747,7 @@ class CircuitTracer:
             scalar_val = float(weak_threshold)
             applied_thresholds = [scalar_val] * len(src_neurons)
             per_neuron_vals = None
-        elif self.injector.is_layer_audited(src_layer):
-            tracker = self.injector._stats_trackers[src_layer]
+        elif tracker is not None:
             applied_thresholds = tracker.compute_adaptive_thresholds(
                 src_neurons, std_multiplier=std_multiplier, percentile=percentile
             )

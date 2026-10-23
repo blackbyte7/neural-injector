@@ -852,13 +852,13 @@ class ContrastivePoleFinder:
     @staticmethod
     @torch.no_grad()
     def discover(
-        model: nn.Module,
-        pos_inputs: Union[torch.Tensor, Iterable[Any]],
-        neg_inputs: Union[torch.Tensor, Iterable[Any]],
-        layer_names: List[str],
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        top_k: int = 16,
-        device: str = "cpu",
+            model: nn.Module,
+            pos_inputs: Union[torch.Tensor, Iterable[Any]],
+            neg_inputs: Union[torch.Tensor, Iterable[Any]],
+            layer_names: List[str],
+            forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+            top_k: int = 16,
+            device: str = "cpu",
     ) -> ContrastiveDiscoveryReport:
         run_fwd = forward_fn or (lambda m, inp: m(inp))
 
@@ -873,10 +873,10 @@ class ContrastivePoleFinder:
         def _collect_stats(batches: List[Any]) -> Dict[str, StreamingLayerStats]:
             trackers: Dict[str, StreamingLayerStats] = {}
             handles: List[RemovableHandle] = []
-            for lname in layer_names:
-                mod, hook_target, num_n = LayerDiscovery.resolve_module(model, lname)
-                st = StreamingLayerStats(lname, num_n, top_k=1, device=device)
-                trackers[lname] = st
+            for target_layer in layer_names:
+                mod, hook_target, num_n = LayerDiscovery.resolve_module(model, target_layer)
+                st = StreamingLayerStats(target_layer, num_n, top_k=1, device=device)
+                trackers[target_layer] = st
                 if hook_target == "input":
                     handles.append(
                         mod.register_forward_pre_hook(
@@ -899,8 +899,8 @@ class ContrastivePoleFinder:
                 for b in batches:
                     run_fwd(model, b)
             finally:
-                for h in handles:
-                    h.remove()
+                for handle in handles:
+                    handle.remove()
             return trackers
 
         was_training = model.training
@@ -916,9 +916,9 @@ class ContrastivePoleFinder:
         pos_tokens_count = 0
         neg_tokens_count = 0
 
-        for lname in layer_names:
-            ps = pos_stats[lname]
-            ns = neg_stats[lname]
+        for layer_name in layer_names:
+            ps = pos_stats[layer_name]
+            ns = neg_stats[layer_name]
             n_pos = max(ps.count, 1)
             n_neg = max(ns.count, 1)
             pos_tokens_count = max(pos_tokens_count, ps.count)
@@ -946,7 +946,7 @@ class ContrastivePoleFinder:
                 rec_pole = PoleType.POSITIVE if t_val >= 0.0 else PoleType.NEGATIVE
                 matches.append(
                     ContrastiveNeuronMatch(
-                        layer_name=lname,
+                        layer_name=layer_name,
                         neuron_idx=idx,
                         t_statistic=round(t_val, 4),
                         abs_t_statistic=round(abs(t_val), 4),
