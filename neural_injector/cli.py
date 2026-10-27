@@ -9,6 +9,14 @@ from .session import WorkbenchSession
 from .types import InterventionMode, PoleType
 
 
+def _split_cli_args(arg: str) -> List[str]:
+    """
+    Splits CLI arguments while preserving Windows backslash path separators (`\\`).
+    Using `posix=False` prevents `shlex.split` from stripping `\\` out of Windows paths.
+    """
+    return [tok.strip("\"'") for tok in shlex.split(arg, posix=False) if tok.strip("\"'")]
+
+
 class NeuralInjectorREPL(cmd.Cmd):
     """
     Stateful interactive terminal workbench for auditing neurons, manipulating poles,
@@ -42,7 +50,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_scan(self, arg: str) -> None:
         """scan <layer_name> [sort_by] [top_n] : Run a batch layer-wide & pole-specific cleanliness audit."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if not parts:
             print(
                 "Usage: scan <layer_name> [pole_selectivity_score|estimated_causal_impact|bipolar_balance] [top_n]"
@@ -95,7 +103,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_profile(self, arg: str) -> None:
         """profile <layer_name> <neuron_idx> : Inspect Positive & Negative poles, Next-Token clues, SwiGLU Double-Negative rate, Quantile Bands, and Logit Attribution."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 2:
             print("Usage: profile <layer_name> <neuron_idx>  (e.g., profile mlp_block_0.down_proj 7)")
             return
@@ -145,7 +153,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_ablate(self, arg: str) -> None:
         """ablate <layer_name> <neuron_idx> [both|positive|negative] : Surgically set a neuron or pole to 0.0."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 2:
             print("Usage: ablate <layer_name> <neuron_idx> [both|positive|negative]")
             return
@@ -158,7 +166,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_clamp(self, arg: str) -> None:
         """clamp <layer_name> <neuron_idx> <value> [both|positive|negative] : Force a neuron to a constant value."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 3:
             print("Usage: clamp <layer_name> <neuron_idx> <value> [both|positive|negative]")
             return
@@ -169,7 +177,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_prune(self, arg: str) -> None:
         """prune <layer_name> <threshold_or_std_mult> [adaptive] : Zero out weak activations across the layer."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 2:
             print("Usage: prune <layer_name> <threshold> [adaptive]")
             return
@@ -194,7 +202,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_gate(self, arg: str) -> None:
         """gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> [threshold] : Register a closed-loop conditional gate."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 5:
             print(
                 "Usage: gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> [threshold]"
@@ -240,7 +248,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_trace(self, arg: str) -> None:
         """trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt] : Trace downstream layer-to-layer circuit."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 3:
             print("Usage: trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt]")
             return
@@ -274,7 +282,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_trace_incoming(self, arg: str) -> None:
         """trace_incoming <src_layer> <dst_layer> <dst_neuron> [positive|negative] [prompt] : Trace upstream neurons driving dst_neuron."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 3:
             print("Usage: trace_incoming <src_layer> <dst_layer> <dst_neuron> [positive|negative] [prompt]")
             return
@@ -307,7 +315,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_readout(self, arg: str) -> None:
         """readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold] : Audit whether weak cross-activations are read downstream."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 3:
             print("Usage: readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold]")
             return
@@ -334,7 +342,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_explain(self, arg: str) -> None:
         """explain <layer_name> <neuron_idx> [dst_layer] [src_layer] : Run the Automated LLM Explainer & Surgical Verifier."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if len(parts) < 2:
             print("Usage: explain <layer_name> <neuron_idx> [dst_layer] [src_layer]")
             return
@@ -368,7 +376,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_ecology(self, arg: str) -> None:
         """ecology <layer_name> [dst_layer] [top_anchors] [top_contextual] : Solve layer ecology via Crossword propagation."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if not parts:
             print("Usage: ecology <layer_name> [dst_layer] [top_anchors] [top_contextual]")
             return
@@ -421,7 +429,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_synergy(self, arg: str) -> None:
         """synergy <layer_name> [k] [greedy|l1_optim] : Find a minimal synergistic coalition of k neurons to ablate."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if not parts:
             print("Usage: synergy <layer_name> [k] [greedy|l1_optim]")
             return
@@ -443,7 +451,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_export(self, arg: str) -> None:
         """export <json_filepath> [pt_vectors_filepath] : Export active interventions & compiled steering vectors."""
-        parts = shlex.split(arg)
+        parts = _split_cli_args(arg)
         if not parts:
             print(
                 "Usage: export <json_filepath> [pt_vectors_filepath]  (e.g., export steering_preset.json vectors.pt)"
@@ -469,11 +477,11 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_import(self, arg: str) -> None:
         """import <json_filepath> : Load a saved production steering preset into the active session."""
-        path = arg.strip()
-        if not path:
+        parts = _split_cli_args(arg)
+        if not parts:
             print("Usage: import <json_filepath>")
             return
-        bundle = self.session.injector.load_production_preset(path)
+        bundle = self.session.injector.load_production_preset(parts[0])
         print(f"Loaded preset '{bundle.preset_name}' with {len(bundle.interventions)} interventions.")
 
     def do_fold(self, _arg: str) -> None:

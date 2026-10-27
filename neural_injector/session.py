@@ -82,6 +82,26 @@ class WorkbenchSession:
             sql_vec = F.normalize(torch.randn(64), dim=0)
             bridge_vec = F.normalize(torch.randn(64), dim=0)
 
+            # Calibrate neutral background tokens so that after norm_0 they have zero
+            # sql_vec/bridge_vec leakage and a weak positive projection (+0.34) along crypto_vec.
+            # This produces a_7 ≈ +0.68 on neutral tokens: active (> 1e-5) in the unsaturated
+            # regime of norm_1 for Forward-AD Jacobian tracing, yet strictly below the
+            # conditional gate threshold (1.0) on SQL prompts.
+            ones_vec = torch.ones(64)
+            basis = torch.stack([crypto_vec, sql_vec, bridge_vec, ones_vec], dim=1)
+            q_basis, _ = torch.linalg.qr(basis)
+            s_zero = sql_vec - sql_vec.mean()
+            c_zero = crypto_vec - crypto_vec.mean()
+            c_zero = c_zero - (torch.dot(c_zero, s_zero) / torch.dot(s_zero, s_zero)) * s_zero
+            unit_c = c_zero / torch.dot(c_zero, crypto_vec)
+
+            for tid in range(len(vocab)):
+                if tid not in (5, 6, 7, 8, 9, 10, 11, 12):
+                    v = model.embed.weight[tid]
+                    v_orth = v - q_basis @ (q_basis.T @ v)
+                    v_orth = F.normalize(v_orth, dim=0) * 7.8
+                    model.embed.weight[tid] = v_orth + 0.34 * unit_c
+
             for tid in [5, 6, 7, 8]:
                 model.embed.weight[tid] = crypto_vec * 3.0
                 model.lm_head.weight[tid] = (crypto_vec + bridge_vec) * 3.5
@@ -101,7 +121,7 @@ class WorkbenchSession:
 
             # Layer 1, Neuron #19: Inhibited by L0 N7 (+Pole), Excited by (-Pole)
             model.mlp_block_1.gate_proj.weight[19] = (sql_vec - bridge_vec) * 2.2
-            model.mlp_block_1.up_proj.weight[19] = (-bridge_vec) * 3.2
+            model.mlp_block_1.up_proj.weight[19] = (-bridge_vec) * 3.8
             model.mlp_block_1.down_proj.weight[:, 19] = sql_vec * 4.0
 
         session = cls(
@@ -181,7 +201,11 @@ class WorkbenchSession:
 
     def get_default_eval_inputs(self, custom_prompt: Optional[str] = None) -> torch.Tensor:
         """Encodes `custom_prompt` or `self.get_default_eval_prompt()` into `input_ids`."""
-        prompt = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else self.get_default_eval_prompt()
+        prompt = (
+            custom_prompt.strip()
+            if custom_prompt and custom_prompt.strip()
+            else self.get_default_eval_prompt()
+        )
         input_ids, _ = self.encode_prompt(prompt)
         return input_ids
 

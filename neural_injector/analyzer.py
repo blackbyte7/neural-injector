@@ -910,10 +910,10 @@ class StreamingLayerStats:
             pos_tax = self._classify_pole_taxonomy(pos_sel_i, pos_r, float(pos_std_cpu[idx]), wnorm)
             neg_tax = self._classify_pole_taxonomy(neg_sel_i, neg_r, float(neg_std_cpu[idx]), wnorm)
 
-            # Statistical tail-selectivity prior
+            # Statistical tail-selectivity prior (whole-neuron or dominant monosemantic pole)
             if std_v < 1e-5 or wnorm < 1e-5 or tot_rate < 1e-4:
                 tax = NeuronTaxonomy.DEAD_OR_NOISY
-            elif sel >= 2.1:
+            elif sel >= 2.0 or max(pos_sel_i, neg_sel_i) >= 2.1:
                 tax = NeuronTaxonomy.CLEAN_MONOSEMANTIC
             elif sel >= 1.35 or (sel >= 1.15 and bip >= 0.45):
                 tax = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE
@@ -1040,9 +1040,9 @@ class LogitLensAttributor:
 class ContrastivePoleFinder:
     """
     Contrastive Pole Discovery Engine (Section 5.3):
-    Ranks all native-basis neurons across one or more layers by Welch's Bipolar
-    Separation t-statistic between two contrastive input sets (D+ and D-):
-        t_i = (mu+(a_i) - mu-(a_i)) / sqrt(var+(a_i)/N+ + var-(a_i)/N- + eps)
+    Ranks all native-basis neurons across one or more layers by regularized Welch's
+    Bipolar Separation t-statistic between two contrastive input sets (D+ and D-):
+        t_i = (mu+(a_i) - mu-(a_i)) / (sqrt(var+(a_i)/N+ + var-(a_i)/N-) + s_0)
     Directly surfaces native 'verb' neurons that route between positive and negative
     behaviors without requiring an external Sparse Autoencoder (SAE).
     """
@@ -1124,8 +1124,11 @@ class ContrastivePoleFinder:
 
             var_pos = ps.m2 / n_pos
             var_neg = ns.m2 / n_neg
-            se_vec = torch.sqrt((var_pos / n_pos) + (var_neg / n_neg) + 1e-9)
-            t_vec = (ps.mean - ns.mean) / se_vec
+            raw_se_vec = torch.sqrt((var_pos / n_pos) + (var_neg / n_neg) + 1e-9)
+            # Regularize denominator with baseline standard-error floor s0 so near-dead
+            # background neurons with tiny variance do not outrank large-effect routers.
+            s0 = float(raw_se_vec.median().item()) * 0.25 + 0.25
+            t_vec = (ps.mean - ns.mean) / (raw_se_vec + s0)
 
             std_pos = torch.sqrt(torch.clamp(var_pos, min=0.0))
             std_neg = torch.sqrt(torch.clamp(var_neg, min=0.0))

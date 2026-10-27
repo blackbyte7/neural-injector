@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import time
@@ -244,8 +245,11 @@ class HeuristicSynthesisClient:
     to formulate a BipolarVerbHypothesis.
     """
 
-    def complete_json(self, _system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-        evidence = json.loads(user_prompt)
+    def complete_json(
+        self, system_prompt: str = "", user_prompt: Optional[str] = None
+    ) -> Dict[str, Any]:
+        raw_json = user_prompt if user_prompt is not None else system_prompt
+        evidence = json.loads(raw_json)
         prof = evidence.get("neuron_profile", {})
         circuit = evidence.get("downstream_circuit", {})
         up_circuit = evidence.get("upstream_circuit", {})
@@ -275,7 +279,7 @@ class HeuristicSynthesisClient:
         neg_sel = float(prof.get("neg_pole_selectivity_score", selectivity))
         best_pole_sel = max(selectivity, pos_sel, neg_sel)
 
-        if best_pole_sel >= 2.1 and (pos_tokens or neg_tokens):
+        if best_pole_sel >= 2.0 and (pos_tokens or neg_tokens):
             taxonomy = NeuronTaxonomy.CLEAN_MONOSEMANTIC.value
             confidence = min(0.96, 0.72 + 0.05 * best_pole_sel)
         elif best_pole_sel >= 1.2:
@@ -375,7 +379,7 @@ class HeuristicSynthesisClient:
             "proposed_experiment": {
                 "positive_pole_test_tokens": pos_tokens[:3] or promoted[:2],
                 "negative_pole_test_tokens": neg_tokens[:3] or suppressed[:2],
-                "expected_promoted_tokens": promoted[:3],
+                "expected_promoted_tokens": promoted[:3] or pos_next_tokens[:3],
                 "expected_suppressed_tokens": suppressed[:3],
                 "expected_excited_dst_neurons": excited_dst,
                 "expected_inhibited_dst_neurons": inhibited_dst,
@@ -427,7 +431,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         llm_client: Optional[LLMClientProtocol] = None,
     ):
         self.injector = injector
-        self.llm_client: LLMClientProtocol = llm_client or HeuristicSynthesisClient()
+        self.llm_client: Any = llm_client or HeuristicSynthesisClient()
 
     @staticmethod
     def _resolve_token_ids(
@@ -570,10 +574,18 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         evidence = self.build_evidence_payload(
             profile, circuit, ecology_neighbors, upstream_circuit=upstream_circuit
         )
-        raw_resp = self.llm_client.complete_json(
-            system_prompt=self.SYSTEM_PROMPT,
-            user_prompt=json.dumps(evidence, indent=2),
-        )
+        user_prompt_str = json.dumps(evidence, indent=2)
+
+        sig = inspect.signature(self.llm_client.complete_json)
+        params = [
+            p
+            for p in sig.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if len(params) == 1:
+            raw_resp = self.llm_client.complete_json(user_prompt_str)
+        else:
+            raw_resp = self.llm_client.complete_json(self.SYSTEM_PROMPT, user_prompt_str)
 
         exp_dict = raw_resp.get("proposed_experiment", {})
         exp_spec = VerificationExperimentSpec(
