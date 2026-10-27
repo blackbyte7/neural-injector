@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import random
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -12,6 +13,7 @@ from torch.utils.hooks import RemovableHandle
 from .discovery import LayerDiscovery
 from .types import (
     ActivationSample,
+    BipolarVerbHypothesis,
     ContrastiveDiscoveryReport,
     ContrastiveNeuronMatch,
     NeuronCheckpointSnapshot,
@@ -30,9 +32,12 @@ class StreamingLayerStats:
       - Full-distribution Welford/Pébay moments (M1, M2, M3, M4), min, max, and firing rates
       - Pole-specific conditional moments (M1+, M2+, M3+, M4+ for a > 0 and M1-, M2-, M3-, M4- for a < 0)
         so Positive and Negative poles are evaluated independently (Cammarata Section 3.1)
+      - SwiGLU Double-Negative Route activations (`gate < 0` and `up < 0` yielding `silu(gate) * up > 0`)
+        so double-negative leakages are separated from true positive (`gate > 0, up > 0`) activations
       - Top-k activating contexts AND Stratified Quantile Activation Buckets per pole
         ("peak_trunk" [80%..100%], "secondary_branch" [40%..80%), "tertiary_offshoot" [15%..40%))
-        to capture recursive generalization offshoots (Cammarata Section 3.3).
+        sampled across the full dynamic range of each batch
+      - Unbiased Algorithm R active-magnitude reservoirs per neuron for accurate empirical percentiles.
     """
 
     QUANTILE_BAND_SPECS: Tuple[Tuple[str, float, float], ...] = (
@@ -70,8 +75,10 @@ class StreamingLayerStats:
         self.neg_m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
         self.neg_m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
 
-        # Per-neuron bounded min-heaps for top positive and negative pole activations
-        # Stores tuples of (score, tie_breaker, ActivationSample)
+        # SwiGLU Double-Negative route counter (a > 0 where gate < 0 and up < 0)
+        self.double_neg_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
+
+        # Per-neuron bounded min-heaps for top positive, negative, and SwiGLU double-negative activations
         self._tie_breaker = 0
         self.pos_heaps: Dict[int, List[Tuple[float, int, ActivationSample]]] = {
             i: [] for i in range(num_neurons)
@@ -79,15 +86,26 @@ class StreamingLayerStats:
         self.neg_heaps: Dict[int, List[Tuple[float, int, ActivationSample]]] = {
             i: [] for i in range(num_neurons)
         }
+        self.double_neg_heaps: Dict[int, List[Tuple[float, int, ActivationSample]]] = {
+            i: [] for i in range(num_neurons)
+        }
 
         # Stratified active sample reservoirs per neuron for quantile-band bucketing
-        self._reservoir_cap = max(top_k * 4, 24)
+        self._reservoir_cap = max(top_k * 6, 36)
         self.pos_band_reservoirs: Dict[int, List[Tuple[float, int, ActivationSample]]] = {
             i: [] for i in range(num_neurons)
         }
         self.neg_band_reservoirs: Dict[int, List[Tuple[float, int, ActivationSample]]] = {
             i: [] for i in range(num_neurons)
         }
+
+        # Unbiased Algorithm R active magnitude reservoirs for accurate empirical percentiles
+        self._mag_reservoir_cap = 128
+        self._rng = random.Random(42)
+        self.pos_mag_reservoirs: Dict[int, List[float]] = {i: [] for i in range(num_neurons)}
+        self.neg_mag_reservoirs: Dict[int, List[float]] = {i: [] for i in range(num_neurons)}
+        self._pos_mag_seen: Dict[int, int] = {i: 0 for i in range(num_neurons)}
+        self._neg_mag_seen: Dict[int, int] = {i: 0 for i in range(num_neurons)}
 
     @staticmethod
     def _update_conditional_moments(
@@ -154,6 +172,19 @@ class StreamingLayerStats:
         m4_vec[:] = torch.where(first_seen, batch_m4, torch.where(continuing, new_m4, m4_vec))
         count_vec.add_(n_b_long)
 
+    def _record_unbiased_magnitude(
+        self, mag: float, reservoir: List[float], seen_dict: Dict[int, int], neuron_idx: int
+    ) -> None:
+        """Algorithm R reservoir sampling over active firing magnitudes for unbiased quantiles."""
+        seen = seen_dict[neuron_idx] + 1
+        seen_dict[neuron_idx] = seen
+        if len(reservoir) < self._mag_reservoir_cap:
+            reservoir.append(mag)
+        else:
+            j = self._rng.randint(0, seen - 1)
+            if j < self._mag_reservoir_cap:
+                reservoir[j] = mag
+
     @torch.no_grad()
     def update(
         self,
@@ -164,10 +195,14 @@ class StreamingLayerStats:
         tracked_neurons: Optional[List[int]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         routed_token_indices: Optional[torch.Tensor] = None,
+        gate_activations: Optional[torch.Tensor] = None,
+        up_activations: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Updates streaming neuron statistics from a batch of activations.
-        activations shape: [B, S, D] or [B, D] or [B, C, H, W] or [N_routed, D] (MoE)
+        activations shape: [B, S, D] or [B, D] or [B, C, H, W] or [N_routed, D] (MoE).
+        When `gate_activations` and `up_activations` are provided (for SwiGLU blocks),
+        automatically detects and separates the 'double-negative' route (`gate < 0` and `up < 0`).
         """
         orig_shape = activations.shape
         spatial_hw: Optional[Tuple[int, int]] = None
@@ -189,6 +224,20 @@ class StreamingLayerStats:
 
         flat_acts = flat_acts.to(self.device)
 
+        # Align optional SwiGLU gate and up projections to the same flattened shape
+        flat_gate: Optional[torch.Tensor] = None
+        flat_up: Optional[torch.Tensor] = None
+        if gate_activations is not None and up_activations is not None:
+            try:
+                g_reshaped = gate_activations.reshape(-1, flat_acts.shape[-1]).to(self.device)
+                u_reshaped = up_activations.reshape(-1, flat_acts.shape[-1]).to(self.device)
+                if g_reshaped.shape == flat_acts.shape and u_reshaped.shape == flat_acts.shape:
+                    flat_gate = g_reshaped
+                    flat_up = u_reshaped
+            except RuntimeError:
+                flat_gate = None
+                flat_up = None
+
         # Map each row back to its original flattened (batch * seq_len + pos) index
         valid_flat_indices: Optional[torch.Tensor] = None
         if routed_token_indices is not None:
@@ -202,6 +251,9 @@ class StreamingLayerStats:
                 if valid_flat_indices.ndim == 0:
                     valid_flat_indices = valid_flat_indices.unsqueeze(0)
                 flat_acts = flat_acts[valid_flat_indices]
+                if flat_gate is not None and flat_up is not None:
+                    flat_gate = flat_gate[valid_flat_indices]
+                    flat_up = flat_up[valid_flat_indices]
 
         batch_n = flat_acts.shape[0]
         if batch_n == 0:
@@ -246,9 +298,15 @@ class StreamingLayerStats:
         self.min_val = torch.minimum(self.min_val, flat_acts.min(dim=0).values)
         self.count = new_count
 
-        # 2. Update Pole-Specific Conditional Moments (Positive Pole a > 0, Negative Pole a < 0)
+        # 2. Update Pole-Specific Conditional Moments and SwiGLU Double-Negative Counts
         pos_mask = flat_acts > 0
         neg_mask = flat_acts < 0
+        if flat_gate is not None and flat_up is not None:
+            dbl_neg_mask = pos_mask & (flat_gate < 0) & (flat_up < 0)
+            self.double_neg_count.add_(dbl_neg_mask.sum(dim=0))
+        else:
+            dbl_neg_mask = None
+
         self._update_conditional_moments(
             pos_mask,
             flat_acts,
@@ -268,7 +326,7 @@ class StreamingLayerStats:
             self.neg_m4,
         )
 
-        # 3. Update top-k positive & negative pole heaps AND stratified reservoirs
+        # 3. Update top-k heaps, stratified quantile reservoirs, and unbiased magnitude reservoirs
         target_indices = (
             tracked_neurons if tracked_neurons is not None else list(range(self.num_neurons))
         )
@@ -276,37 +334,68 @@ class StreamingLayerStats:
             return
 
         sub_acts = flat_acts[:, target_indices]
-        k_curr = min(self._reservoir_cap, batch_n)
+        sub_dbl_neg = dbl_neg_mask[:, target_indices] if dbl_neg_mask is not None else None
 
-        # Vectorized GPU top-k across all tracked neurons simultaneously
-        top_pos_vals, top_pos_flat_idx = torch.topk(sub_acts, k=k_curr, dim=0, largest=True)
-        top_neg_vals, top_neg_flat_idx = torch.topk(sub_acts, k=k_curr, dim=0, largest=False)
-
-        top_pos_vals_cpu = top_pos_vals.T.cpu().tolist()
-        top_pos_idx_cpu = top_pos_flat_idx.T.cpu().tolist()
-        top_neg_vals_cpu = top_neg_vals.T.cpu().tolist()
-        top_neg_idx_cpu = top_neg_flat_idx.T.cpu().tolist()
+        # Sort across the batch dimension once so we can sample both top-k peaks AND
+        # stratified intermediate indices across the entire active distribution in the batch.
+        sorted_vals, sorted_flat_idx = torch.sort(sub_acts, dim=0, descending=True)
+        sorted_vals_cpu = sorted_vals.T.cpu().tolist()
+        sorted_idx_cpu = sorted_flat_idx.T.cpu().tolist()
+        dbl_neg_cpu = sub_dbl_neg.T.cpu().tolist() if sub_dbl_neg is not None else None
         valid_idx_cpu = valid_flat_indices.cpu().tolist() if valid_flat_indices is not None else None
+        curr_max_cpu = self.max_val[target_indices].cpu().tolist()
+        curr_min_cpu = self.min_val[target_indices].cpu().tolist()
 
         for local_i, neuron_idx in enumerate(target_indices):
             pos_heap = self.pos_heaps[neuron_idx]
             neg_heap = self.neg_heaps[neuron_idx]
+            dbl_heap = self.double_neg_heaps[neuron_idx]
             pos_res = self.pos_band_reservoirs[neuron_idx]
             neg_res = self.neg_band_reservoirs[neuron_idx]
+            pos_mag_res = self.pos_mag_reservoirs[neuron_idx]
+            neg_mag_res = self.neg_mag_reservoirs[neuron_idx]
 
-            # Process positive activations in this batch
-            for rank_i, (val, r_idx) in enumerate(
-                zip(top_pos_vals_cpu[local_i], top_pos_idx_cpu[local_i])
-            ):
-                if val <= 0:
+            vals_row = sorted_vals_cpu[local_i]
+            idx_row = sorted_idx_cpu[local_i]
+            dbl_row = dbl_neg_cpu[local_i] if dbl_neg_cpu is not None else None
+            running_pos_max = max(float(curr_max_cpu[local_i]), 1e-9)
+            running_neg_max = max(abs(min(float(curr_min_cpu[local_i]), 0.0)), 1e-9)
+
+            # Collect positive entries (vals_row is descending, so positive entries are at the front)
+            pos_positions: List[int] = []
+            for rank_i, val in enumerate(vals_row):
+                if val <= 0.0:
                     break
+                pos_positions.append(rank_i)
+                self._record_unbiased_magnitude(
+                    float(val), pos_mag_res, self._pos_mag_seen, neuron_idx
+                )
+
+            # Select candidate ranks covering top-k AND evenly spaced quantiles across all positive firings
+            if len(pos_positions) <= self._reservoir_cap:
+                selected_pos_ranks = pos_positions
+            else:
+                stride = max(1, (len(pos_positions) - self.top_k) // max(1, self._reservoir_cap - self.top_k))
+                selected_pos_ranks = list(range(self.top_k)) + pos_positions[self.top_k::stride]
+
+            for rank_i in selected_pos_ranks:
+                val = float(vals_row[rank_i])
+                r_idx = idx_row[rank_i]
                 f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
+                is_dbl_neg = bool(dbl_row[r_idx]) if dbl_row is not None else False
+
                 need_top = rank_i < self.top_k and (
                     len(pos_heap) < self.top_k or val > pos_heap[0][0]
                 )
-                need_res = len(pos_res) < self._reservoir_cap or (rank_i % 2 == 1)
-                if not need_top and not need_res:
+                need_dbl = is_dbl_neg and (
+                    len(dbl_heap) < self.top_k or val > dbl_heap[0][0]
+                )
+                # Keep double-negative activations out of true positive quantile bands when gate/up are tracked
+                need_res = not is_dbl_neg
+
+                if not (need_top or need_dbl or need_res):
                     continue
+
                 sample = self._build_sample(
                     val,
                     f_idx,
@@ -315,26 +404,41 @@ class StreamingLayerStats:
                     tokens_per_sample,
                     contexts_per_sample,
                     spatial_hw=spatial_hw,
+                    is_double_negative_route=is_dbl_neg,
                 )
                 if need_top:
                     self._push_heap(pos_heap, val, sample, self.top_k)
+                if need_dbl:
+                    self._push_heap(dbl_heap, val, sample, self.top_k)
                 if need_res:
-                    self._push_diversified_reservoir(pos_res, val, sample)
+                    self._push_stratified_reservoir(pos_res, val, sample, running_pos_max)
 
-            # Process negative activations in this batch
-            for rank_i, (val, r_idx) in enumerate(
-                zip(top_neg_vals_cpu[local_i], top_neg_idx_cpu[local_i])
-            ):
-                if val >= 0:
+            # Collect negative entries from the tail (ascending magnitude from the end of vals_row)
+            neg_positions: List[int] = []
+            for rev_i in range(len(vals_row) - 1, -1, -1):
+                val = vals_row[rev_i]
+                if val >= 0.0:
                     break
-                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
+                neg_positions.append(rev_i)
+                self._record_unbiased_magnitude(
+                    float(-val), neg_mag_res, self._neg_mag_seen, neuron_idx
+                )
+
+            if len(neg_positions) <= self._reservoir_cap:
+                selected_neg_ranks = neg_positions
+            else:
+                stride = max(1, (len(neg_positions) - self.top_k) // max(1, self._reservoir_cap - self.top_k))
+                selected_neg_ranks = neg_positions[:self.top_k] + neg_positions[self.top_k::stride]
+
+            for rank_pos, rev_i in enumerate(selected_neg_ranks):
+                val = float(vals_row[rev_i])
                 mag = -val
-                need_top = rank_i < self.top_k and (
+                r_idx = idx_row[rev_i]
+                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
+
+                need_top = rank_pos < self.top_k and (
                     len(neg_heap) < self.top_k or mag > neg_heap[0][0]
                 )
-                need_res = len(neg_res) < self._reservoir_cap or (rank_i % 2 == 1)
-                if not need_top and not need_res:
-                    continue
                 sample = self._build_sample(
                     val,
                     f_idx,
@@ -343,11 +447,11 @@ class StreamingLayerStats:
                     tokens_per_sample,
                     contexts_per_sample,
                     spatial_hw=spatial_hw,
+                    is_double_negative_route=False,
                 )
                 if need_top:
                     self._push_heap(neg_heap, mag, sample, self.top_k)
-                if need_res:
-                    self._push_diversified_reservoir(neg_res, mag, sample)
+                self._push_stratified_reservoir(neg_res, mag, sample, running_neg_max)
 
     @staticmethod
     def _build_sample(
@@ -358,20 +462,33 @@ class StreamingLayerStats:
         tokens_per_sample: Optional[List[List[str]]],
         contexts_per_sample: Optional[List[str]],
         spatial_hw: Optional[Tuple[int, int]] = None,
+        is_double_negative_route: bool = False,
     ) -> ActivationSample:
         b_idx = flat_idx // seq_len
         pos_idx = flat_idx % seq_len
         s_id = sample_ids[b_idx] if sample_ids and b_idx < len(sample_ids) else b_idx
         tok_str = None
+        next_tok_str = None
+        window_str = None
+
         if tokens_per_sample and b_idx < len(tokens_per_sample):
             tok_list = tokens_per_sample[b_idx]
             if pos_idx < len(tok_list):
                 tok_str = tok_list[pos_idx]
+                next_tok_str = tok_list[pos_idx + 1] if (pos_idx + 1) < len(tok_list) else "<eos>"
+                start_w = max(0, pos_idx - 2)
+                end_w = min(len(tok_list), pos_idx + 3)
+                prefix = " ".join(tok_list[start_w:pos_idx])
+                suffix = " ".join(tok_list[pos_idx + 1:end_w])
+                focal = f"[{tok_str}] -> {next_tok_str}"
+                parts = [p for p in (prefix, focal, suffix) if p]
+                window_str = " ".join(parts)
         elif spatial_hw is not None:
             # Automatic Vision / Conv2d patch coordinate label when no text tokens are supplied
             h_dim, w_dim = spatial_hw
             row, col = pos_idx // w_dim, pos_idx % w_dim
             tok_str = f"patch_({row},{col})"
+            window_str = tok_str
 
         ctx_str = (
             contexts_per_sample[b_idx]
@@ -384,6 +501,9 @@ class StreamingLayerStats:
             position_idx=pos_idx,
             token_str=tok_str,
             context_str=ctx_str,
+            next_token_str=next_tok_str,
+            window_str=window_str,
+            is_double_negative_route=is_double_negative_route,
         )
 
     def _push_heap(
@@ -400,27 +520,63 @@ class StreamingLayerStats:
         elif priority > heap[0][0]:
             heapq.heapreplace(heap, item)
 
-    def _push_diversified_reservoir(
+    def _push_stratified_reservoir(
         self,
         reservoir: List[Tuple[float, int, ActivationSample]],
         magnitude: float,
         sample: ActivationSample,
+        running_pole_max: float,
     ) -> None:
         """
-        Maintains a magnitude-diversified pool of active samples across the neuron's
-        dynamic range so that secondary (40..80%) and tertiary (15..40%) recursive
-        offshoots are retained alongside peak (80..100%) trunk activations.
+        Maintains a stratified pool of active samples across all quantile bands
+        (`peak_trunk` >= 0.80, `secondary_branch` [0.40..0.80), `tertiary_offshoot` [0.15..0.40)).
+        Unlike naive nearest-neighbor replacement, each band has a protected quota of
+        `self._reservoir_cap // 3` slots, preventing new peak activations from collapsing
+        unto a single slot or starving intermediate bands.
         """
         self._tie_breaker += 1
         item = (magnitude, self._tie_breaker, sample)
         if len(reservoir) < self._reservoir_cap:
             reservoir.append(item)
             return
-        # Replace an entry with the closest magnitude to preserve coverage across all quantile bands
-        closest_idx = min(
-            range(len(reservoir)), key=lambda i: abs(reservoir[i][0] - magnitude)
-        )
-        reservoir[closest_idx] = item
+
+        pole_max = max(running_pole_max, magnitude, max((x[0] for x in reservoir), default=1e-9))
+
+        def _band_of(mag_val: float) -> int:
+            r = mag_val / pole_max
+            if r >= 0.80:
+                return 0  # peak_trunk
+            elif r >= 0.40:
+                return 1  # secondary_branch
+            elif r >= 0.15:
+                return 2  # tertiary_offshoot
+            return 3      # sub-tertiary (< 15% of max)
+
+        target_band = _band_of(magnitude)
+        if target_band == 3:
+            return
+
+        band_indices: Dict[int, List[int]] = {0: [], 1: [], 2: [], 3: []}
+        for idx, (m_val, _, _) in enumerate(reservoir):
+            band_indices[_band_of(m_val)].append(idx)
+
+        # 1. Always evict sub-tertiary (< 15% of current max) entries first
+        if band_indices[3]:
+            evict_idx = band_indices[3][0]
+            reservoir[evict_idx] = item
+            return
+
+        # 2. If another band is over-represented (> cap // 3), evict from the largest band
+        quota = max(1, self._reservoir_cap // 3)
+        if len(band_indices[target_band]) < quota:
+            overfull_band = max((0, 1, 2), key=lambda b: len(band_indices[b]))
+            candidates = band_indices[overfull_band]
+        else:
+            candidates = band_indices[target_band]
+
+        if candidates:
+            evict_idx = self._rng.choice(candidates)
+            reservoir[evict_idx] = item
 
     def _build_quantile_buckets(
         self,
@@ -433,6 +589,8 @@ class StreamingLayerStats:
           - `peak_trunk`:        [0.80 * max_abs, 1.00 * max_abs]
           - `secondary_branch`:  [0.40 * max_abs, 0.80 * max_abs)
           - `tertiary_offshoot`: [0.15 * max_abs, 0.40 * max_abs)
+        Excludes SwiGLU double-negative (`gate < 0, up < 0`) samples from positive quantile
+        buckets unless no true positive (`gate > 0, up > 0`) samples exist.
         """
         buckets: Dict[str, List[ActivationSample]] = {
             name: [] for name, _, _ in self.QUANTILE_BAND_SPECS
@@ -451,6 +609,8 @@ class StreamingLayerStats:
         seen = set()
         candidates: List[ActivationSample] = []
         for mag, _, s in sorted(heap_items + res_items, key=lambda x: x[0], reverse=True):
+            if is_positive and s.is_double_negative_route and res_items:
+                continue
             key = (s.sample_id, s.position_idx, round(s.activation_value, 6))
             if key not in seen and mag > 0:
                 seen.add(key)
@@ -467,6 +627,9 @@ class StreamingLayerStats:
                         token_str=s.token_str,
                         context_str=s.context_str,
                         quantile_band=band_name,
+                        next_token_str=s.next_token_str,
+                        window_str=s.window_str,
+                        is_double_negative_route=s.is_double_negative_route,
                     )
                     if len(buckets[band_name]) < self.top_k:
                         buckets[band_name].append(tagged)
@@ -527,16 +690,17 @@ class StreamingLayerStats:
         return pos_std, pos_sel, neg_std, neg_sel
 
     def compute_adaptive_thresholds(
-            self,
-            neuron_indices: List[int],
-            std_multiplier: Optional[float] = None,
-            percentile: Optional[float] = None,
+        self,
+        neuron_indices: List[int],
+        std_multiplier: Optional[float] = None,
+        percentile: Optional[float] = None,
     ) -> List[float]:
         """
         Computes per-neuron native activation thresholds from audited statistics
         (Cammarata Section 3.4: Respecting Native Activation Ranges & Percentiles).
-          - If `percentile` (in (0, 100)) is provided, estimates each neuron's native
-            active magnitude percentile from its audited conditional distribution and reservoir.
+          - If `percentile` (in (0, 100)) is provided, computes the empirical quantile over
+            each neuron's unbiased Algorithm R active-magnitude reservoir (`pos_mag_reservoirs`
+            + `neg_mag_reservoirs`), avoiding top-k outlier bias.
           - Otherwise uses `|mean_i| + k * std_i` where `k = std_multiplier or 1.0`.
         """
         n = max(self.count, 1)
@@ -547,21 +711,17 @@ class StreamingLayerStats:
         for idx in neuron_indices:
             if percentile is not None:
                 q = min(max(float(percentile) / 100.0, 0.01), 0.99)
-                # Gather observed active magnitudes from positive & negative reservoirs and heaps
-                mags: List[float] = []
-                for collection in (
-                        self.pos_band_reservoirs.get(idx, []),
-                        self.neg_band_reservoirs.get(idx, []),
-                        self.pos_heaps.get(idx, []),
-                        self.neg_heaps.get(idx, []),
-                ):
-                    for _priority, _tb, sample in collection:
-                        mags.append(abs(sample.activation_value))
-
+                mags = list(self.pos_mag_reservoirs.get(idx, [])) + list(
+                    self.neg_mag_reservoirs.get(idx, [])
+                )
                 if len(mags) >= 4:
-                    mags_t = torch.tensor(sorted(mags), dtype=torch.float32)
-                    q_idx = min(int(math.floor(q * (len(mags_t) - 1))), len(mags_t) - 1)
-                    thresholds.append(float(mags_t[q_idx].item()))
+                    mags_sorted = sorted(mags)
+                    pos_f = q * (len(mags_sorted) - 1)
+                    lo = int(math.floor(pos_f))
+                    hi = int(math.ceil(pos_f))
+                    frac = pos_f - lo
+                    interp = mags_sorted[lo] * (1.0 - frac) + mags_sorted[hi] * frac
+                    thresholds.append(float(interp))
                 else:
                     # Fallback to Gaussian quantile on neuron's native std
                     z_approx = math.sqrt(2.0) * torch.erfinv(torch.tensor(2.0 * q - 1.0)).item()
@@ -597,6 +757,10 @@ class StreamingLayerStats:
         pos_rate = float(self.pos_count[neuron_idx].item() / n)
         neg_rate = float(self.neg_count[neuron_idx].item() / n)
 
+        pos_cnt = int(self.pos_count[neuron_idx].item())
+        dbl_neg_cnt = int(self.double_neg_count[neuron_idx].item())
+        dbl_neg_rate = float(dbl_neg_cnt / max(pos_cnt, 1)) if pos_cnt > 0 else 0.0
+
         pos_tax = self._classify_pole_taxonomy(pos_sel, pos_rate, pos_std)
         neg_tax = self._classify_pole_taxonomy(neg_sel, neg_rate, neg_std)
 
@@ -607,6 +771,12 @@ class StreamingLayerStats:
         neg_samples = [
             item[2]
             for item in sorted(self.neg_heaps.get(neuron_idx, []), key=lambda x: x[0], reverse=True)
+        ]
+        dbl_neg_samples = [
+            item[2]
+            for item in sorted(
+                self.double_neg_heaps.get(neuron_idx, []), key=lambda x: x[0], reverse=True
+            )
         ]
 
         max_v = float(self.max_val[neuron_idx].item())
@@ -643,16 +813,25 @@ class StreamingLayerStats:
             neg_taxonomy_class=neg_tax,
             positive_quantile_buckets=pos_buckets,
             negative_quantile_buckets=neg_buckets,
+            double_negative_positive_rate=round(dbl_neg_rate, 4),
+            double_negative_samples=dbl_neg_samples,
         )
 
     @torch.no_grad()
     def scan_layer_cleanliness(
         self,
         down_proj_module: Optional[nn.Module] = None,
+        verified_hypotheses: Optional[Dict[Tuple[str, int], BipolarVerbHypothesis]] = None,
     ) -> Tuple[Dict[str, int], Dict[str, float], List[NeuronScanSummary]]:
         """
         Vectorized GPU pass over all tracked moments in the layer to classify every neuron
         AND every individual neuron pole into the Cammarata (2026) cleanliness taxonomy.
+
+        Note: Kurtosis thresholds provide a fast statistical tail-selectivity prior across
+        all neurons in O(1) memory. When `verified_hypotheses` (from `CircuitEcologyMap`)
+        contains a semantically verified hypothesis for `(self.layer_name, idx)` with
+        `empirical_verification_score >= 0.6`, the neuron's `taxonomy_class` is promoted
+        to the verified semantic classification and `semantic_verified=True` is set.
         """
         n = max(self.count, 1)
         var_vec = self.m2 / n
@@ -664,6 +843,10 @@ class StreamingLayerStats:
         pos_rate_vec = self.pos_count.to(torch.float64) / n
         neg_rate_vec = self.neg_count.to(torch.float64) / n
         total_rate_vec = pos_rate_vec + neg_rate_vec
+
+        dbl_neg_rate_vec = self.double_neg_count.to(torch.float64) / torch.clamp(
+            self.pos_count.to(torch.float64), min=1.0
+        )
 
         bipolar_vec = (4.0 * pos_rate_vec * neg_rate_vec) / (total_rate_vec.pow(2) + 1e-9)
         pos_std_vec, pos_sel_vec, neg_std_vec, neg_sel_vec = (
@@ -691,6 +874,7 @@ class StreamingLayerStats:
         bip_cpu = bipolar_vec.cpu().tolist()
         pos_cpu = pos_rate_vec.cpu().tolist()
         neg_cpu = neg_rate_vec.cpu().tolist()
+        dbl_cpu = dbl_neg_rate_vec.cpu().tolist()
         mean_cpu = self.mean.cpu().tolist()
         std_cpu = std_vec.cpu().tolist()
         max_cpu = self.max_val.cpu().tolist()
@@ -718,6 +902,7 @@ class StreamingLayerStats:
             wnorm = float(wnorm_cpu[idx])
             pos_r = float(pos_cpu[idx])
             neg_r = float(neg_cpu[idx])
+            dbl_r = float(dbl_cpu[idx]) if pos_r > 0 else 0.0
             tot_rate = pos_r + neg_r
 
             pos_sel_i = float(pos_sel_cpu[idx])
@@ -725,7 +910,7 @@ class StreamingLayerStats:
             pos_tax = self._classify_pole_taxonomy(pos_sel_i, pos_r, float(pos_std_cpu[idx]), wnorm)
             neg_tax = self._classify_pole_taxonomy(neg_sel_i, neg_r, float(neg_std_cpu[idx]), wnorm)
 
-            # Taxonomy classification rules aligned with Cammarata (2026)
+            # Statistical tail-selectivity prior
             if std_v < 1e-5 or wnorm < 1e-5 or tot_rate < 1e-4:
                 tax = NeuronTaxonomy.DEAD_OR_NOISY
             elif sel >= 2.1:
@@ -734,6 +919,17 @@ class StreamingLayerStats:
                 tax = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE
             else:
                 tax = NeuronTaxonomy.TRUE_POLYSEMANTIC
+
+            # Override with semantically verified taxonomy if present in CircuitEcologyMap
+            is_verified = False
+            if verified_hypotheses and (self.layer_name, idx) in verified_hypotheses:
+                v_hyp = verified_hypotheses[(self.layer_name, idx)]
+                if (
+                    v_hyp.verification_report is not None
+                    and v_hyp.verification_report.empirical_verification_score >= 0.6
+                ):
+                    tax = v_hyp.taxonomy_class
+                    is_verified = True
 
             counts[tax.value] += 1
 
@@ -762,6 +958,8 @@ class StreamingLayerStats:
                     neg_pole_selectivity_score=round(neg_sel_i, 3),
                     pos_taxonomy_class=pos_tax,
                     neg_taxonomy_class=neg_tax,
+                    double_negative_positive_rate=round(dbl_r, 4),
+                    semantic_verified=is_verified,
                 )
             )
 
@@ -852,13 +1050,13 @@ class ContrastivePoleFinder:
     @staticmethod
     @torch.no_grad()
     def discover(
-            model: nn.Module,
-            pos_inputs: Union[torch.Tensor, Iterable[Any]],
-            neg_inputs: Union[torch.Tensor, Iterable[Any]],
-            layer_names: List[str],
-            forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-            top_k: int = 16,
-            device: str = "cpu",
+        model: nn.Module,
+        pos_inputs: Union[torch.Tensor, Iterable[Any]],
+        neg_inputs: Union[torch.Tensor, Iterable[Any]],
+        layer_names: List[str],
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        top_k: int = 16,
+        device: str = "cpu",
     ) -> ContrastiveDiscoveryReport:
         run_fwd = forward_fn or (lambda m, inp: m(inp))
 
@@ -981,12 +1179,12 @@ class CheckpointEvolutionTracker:
     @staticmethod
     @torch.no_grad()
     def track_neuron_evolution(
-            checkpoints: List[Tuple[str, nn.Module]],
-            layer_name: str,
-            neuron_idx: int,
-            batches: Iterable[Dict[str, Any]],
-            forward_fn: Callable[[nn.Module, Dict[str, Any]], Any],
-            top_k: int = 8,
+        checkpoints: List[Tuple[str, nn.Module]],
+        layer_name: str,
+        neuron_idx: int,
+        batches: Iterable[Dict[str, Any]],
+        forward_fn: Callable[[nn.Module, Dict[str, Any]], Any],
+        top_k: int = 8,
     ) -> NeuronEvolutionReport:
         from .injector import NeuralInjector
 
@@ -994,7 +1192,6 @@ class CheckpointEvolutionTracker:
         snapshots: List[NeuronCheckpointSnapshot] = []
         write_vecs: List[torch.Tensor] = []
 
-        # First pass: extract outgoing write vectors for cosine similarity to the final checkpoint
         for _label, ckpt_model in checkpoints:
             mod, _, _ = LayerDiscovery.resolve_module(ckpt_model, layer_name)
             if hasattr(mod, "weight") and isinstance(mod.weight, torch.Tensor):
@@ -1080,7 +1277,7 @@ class CheckpointEvolutionTracker:
                 + snapshots[0].tertiary_offshoot_tokens
             )
             final_offshoots = (
-                    snapshots[-1].secondary_branch_tokens + snapshots[-1].tertiary_offshoot_tokens
+                snapshots[-1].secondary_branch_tokens + snapshots[-1].tertiary_offshoot_tokens
             )
             emerged = list(dict.fromkeys(t for t in final_offshoots if t not in initial_tokens))
             sel_delta_pos = round(

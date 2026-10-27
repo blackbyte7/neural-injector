@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -41,8 +41,8 @@ class _DemoTwoLayerTransformer(nn.Module):
 class WorkbenchSession:
     """
     Stateful manager holding the active model, tokenizer mappings, NeuralInjector instance,
-    and helper methods for JSON-serializable inspection, intervention, circuit tracing,
-    and side-by-side logit comparison.
+    cached evaluation prompts, and helper methods for JSON-serializable inspection,
+    intervention, circuit tracing, and side-by-side logit comparison.
     """
 
     def __init__(
@@ -61,6 +61,7 @@ class WorkbenchSession:
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.injector = NeuralInjector(model, tokenizer=tokenizer)
+        self.last_audit_prompts: List[str] = []
 
     @classmethod
     def create_demo_session(cls) -> WorkbenchSession:
@@ -126,12 +127,27 @@ class WorkbenchSession:
         return session
 
     @classmethod
-    def from_huggingface(cls, model_id: str, device: str = "cpu") -> WorkbenchSession:
-        """Loads any HuggingFace AutoModelForCausalLM and AutoTokenizer into the Workbench."""
+    def from_huggingface(
+        cls,
+        model_id: str,
+        device: str = "cpu",
+        torch_dtype: Union[str, torch.dtype] = "auto",
+        low_cpu_mem_usage: bool = True,
+    ) -> WorkbenchSession:
+        """
+        Loads any HuggingFace AutoModelForCausalLM and AutoTokenizer into the Workbench
+        using `torch_dtype="auto"` and `low_cpu_mem_usage=True` to avoid FP32 RAM spikes.
+        """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
+        load_kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
+        if low_cpu_mem_usage:
+            load_kwargs["low_cpu_mem_usage"] = True
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
         model.eval()
 
         vocab = tokenizer.get_vocab()
@@ -150,6 +166,24 @@ class WorkbenchSession:
             tokenizer=tokenizer,
             model_name=model_id,
         )
+
+    def get_default_eval_prompt(self) -> str:
+        """
+        Returns the most relevant default evaluation prompt for the active session:
+        uses the first prompt from the most recent `run_audit` call if available,
+        or a natural sentence valid for the active vocabulary.
+        """
+        if self.last_audit_prompts:
+            return self.last_audit_prompts[0]
+        if "AES256" in self.tok_to_id:
+            return "the system negotiated AES256 TLS cipher"
+        return "The quick brown fox jumps over the lazy dog."
+
+    def get_default_eval_inputs(self, custom_prompt: Optional[str] = None) -> torch.Tensor:
+        """Encodes `custom_prompt` or `self.get_default_eval_prompt()` into `input_ids`."""
+        prompt = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else self.get_default_eval_prompt()
+        input_ids, _ = self.encode_prompt(prompt)
+        return input_ids
 
     def encode_prompt_with_mask(self, text: str) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
         """
@@ -195,6 +229,7 @@ class WorkbenchSession:
         tracked_neurons: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """Streams a list of text prompts through the model to populate bipolar neuron stats."""
+        self.last_audit_prompts = list(prompts)
         batches = []
         for idx, text in enumerate(prompts):
             input_ids, tok_strs, attn_mask = self.encode_prompt_with_mask(text)

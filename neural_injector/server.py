@@ -43,6 +43,15 @@ class CircuitTraceRequest(BaseModel):
     top_k: int = Field(default=8, ge=1, le=64)
 
 
+class IncomingCircuitTraceRequest(BaseModel):
+    src_layer: str
+    dst_layer: str
+    dst_neuron: int = Field(..., ge=0)
+    dst_pole: PoleType = Field(default=PoleType.POSITIVE)
+    prompt: str = Field(..., description="Input prompt used to activate the target neuron")
+    top_k: int = Field(default=8, ge=1, le=64)
+
+
 class EvaluateRequest(BaseModel):
     prompt: str = Field(..., description="Prompt to compare Clean vs. Surgically Intervened outputs")
     top_k_logits: int = Field(default=6, ge=1, le=20)
@@ -52,7 +61,8 @@ class ExplainRequest(BaseModel):
     layer_name: str
     neuron_idx: int = Field(..., ge=0)
     dst_layer: Optional[str] = Field(default=None)
-    circuit_prompt: Optional[str] = Field(default="the system negotiated AES256 TLS cipher")
+    src_layer: Optional[str] = Field(default=None)
+    circuit_prompt: Optional[str] = Field(default=None)
 
 
 class ExportPresetRequest(BaseModel):
@@ -68,7 +78,7 @@ class ImportPresetRequest(BaseModel):
 
 
 # =============================================================================
-# 2. FastAPI Factory & Thread-Safe, Path-Hardened Endpoints (Sections 4.1 & 4.2)
+# 2. FastAPI Factory & Non-Blocking Thread-Safe Endpoints
 # =============================================================================
 def create_workbench_app(
     session: Optional[WorkbenchSession] = None,
@@ -113,7 +123,8 @@ def create_workbench_app(
     async def audit_layers(req: AuditRequest) -> Dict[str, Any]:
         async with session_lock:
             try:
-                return wb_session.run_audit(
+                return await asyncio.to_thread(
+                    wb_session.run_audit,
                     layer_names=req.layer_names,
                     prompts=req.prompts,
                     top_k=req.top_k,
@@ -128,33 +139,44 @@ def create_workbench_app(
         sort_by: str = "pole_selectivity_score",
         compute_kl_top_n: int = 3,
         limit: int = 64,
+        kl_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         async with session_lock:
             try:
-                kl_inputs, _ = wb_session.encode_prompt("the system negotiated AES256 TLS cipher")
-                report = wb_session.injector.scan_layer_cleanliness(
-                    layer_name=layer_name,
-                    sort_by=sort_by,
-                    compute_kl_for_top_n=compute_kl_top_n,
-                    kl_eval_inputs=kl_inputs if compute_kl_top_n > 0 else None,
-                    limit=limit,
-                )
-                return asdict(report)
+                def _run_scan() -> Dict[str, Any]:
+                    kl_inputs = (
+                        wb_session.get_default_eval_inputs(kl_prompt)
+                        if compute_kl_top_n > 0
+                        else None
+                    )
+                    report = wb_session.injector.scan_layer_cleanliness(
+                        layer_name=layer_name,
+                        sort_by=sort_by,
+                        compute_kl_for_top_n=compute_kl_top_n,
+                        kl_eval_inputs=kl_inputs,
+                        limit=limit,
+                    )
+                    return asdict(report)
+
+                return await asyncio.to_thread(_run_scan)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/layers/{layer_name}/neurons/{neuron_idx}")
     async def get_neuron_profile(layer_name: str, neuron_idx: int) -> Dict[str, Any]:
         try:
-            profile = wb_session.injector.get_neuron_profile(
-                layer_name=layer_name,
-                neuron_idx=neuron_idx,
-                unembed_weight=wb_session.unembed_weight,
-                idx_to_token=wb_session.id_to_tok,
-            )
-            data = asdict(profile)
-            data["is_clean_candidate"] = profile.is_clean_candidate
-            return data
+            def _get_prof() -> Dict[str, Any]:
+                profile = wb_session.injector.get_neuron_profile(
+                    layer_name=layer_name,
+                    neuron_idx=neuron_idx,
+                    unembed_weight=wb_session.unembed_weight,
+                    idx_to_token=wb_session.id_to_tok,
+                )
+                data = asdict(profile)
+                data["is_clean_candidate"] = profile.is_clean_candidate
+                return data
+
+            return await asyncio.to_thread(_get_prof)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except IndexError as exc:
@@ -190,25 +212,50 @@ def create_workbench_app(
     @app.post("/api/evaluate")
     async def evaluate_prompt(req: EvaluateRequest) -> Dict[str, Any]:
         async with session_lock:
-            return wb_session.evaluate_prompt_comparison(
-                prompt=req.prompt, top_k_logits=req.top_k_logits
+            return await asyncio.to_thread(
+                wb_session.evaluate_prompt_comparison,
+                prompt=req.prompt,
+                top_k_logits=req.top_k_logits,
             )
 
     @app.post("/api/circuits/trace")
     async def trace_circuit(req: CircuitTraceRequest) -> Dict[str, Any]:
         async with session_lock:
             try:
-                input_ids, _ = wb_session.encode_prompt(req.prompt)
-                graph = wb_session.injector.trace_circuit(
-                    src_layer=req.src_layer,
-                    dst_layer=req.dst_layer,
-                    src_neuron=req.src_neuron,
-                    inputs=input_ids,
-                    src_pole=req.src_pole,
-                    compute_jacobian=req.compute_jacobian,
-                    top_k=req.top_k,
-                )
-                return graph.to_agent_payload()
+                def _run_trace() -> Dict[str, Any]:
+                    input_ids, _ = wb_session.encode_prompt(req.prompt)
+                    graph = wb_session.injector.trace_circuit(
+                        src_layer=req.src_layer,
+                        dst_layer=req.dst_layer,
+                        src_neuron=req.src_neuron,
+                        inputs=input_ids,
+                        src_pole=req.src_pole,
+                        compute_jacobian=req.compute_jacobian,
+                        top_k=req.top_k,
+                    )
+                    return graph.to_agent_payload()
+
+                return await asyncio.to_thread(_run_trace)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/circuits/trace-incoming")
+    async def trace_incoming_circuit(req: IncomingCircuitTraceRequest) -> Dict[str, Any]:
+        async with session_lock:
+            try:
+                def _run_inc_trace() -> Dict[str, Any]:
+                    input_ids, _ = wb_session.encode_prompt(req.prompt)
+                    graph = wb_session.injector.trace_incoming_circuit(
+                        src_layer=req.src_layer,
+                        dst_layer=req.dst_layer,
+                        dst_neuron=req.dst_neuron,
+                        inputs=input_ids,
+                        dst_pole=req.dst_pole,
+                        top_k=req.top_k,
+                    )
+                    return graph.to_incoming_agent_payload()
+
+                return await asyncio.to_thread(_run_inc_trace)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -216,20 +263,24 @@ def create_workbench_app(
     async def explain_neuron(req: ExplainRequest) -> Dict[str, Any]:
         async with session_lock:
             try:
-                circuit_inputs = None
-                if req.dst_layer and req.circuit_prompt:
-                    circuit_inputs, _ = wb_session.encode_prompt(req.circuit_prompt)
+                def _run_explain() -> Dict[str, Any]:
+                    circuit_inputs = None
+                    if req.dst_layer or req.src_layer:
+                        circuit_inputs = wb_session.get_default_eval_inputs(req.circuit_prompt)
 
-                hypothesis = wb_session.injector.explain_neuron(
-                    layer_name=req.layer_name,
-                    neuron_idx=req.neuron_idx,
-                    tok_to_id=wb_session.tok_to_id,
-                    idx_to_token=wb_session.id_to_tok,
-                    unembed_weight=wb_session.unembed_weight,
-                    dst_layer=req.dst_layer,
-                    circuit_inputs=circuit_inputs,
-                )
-                return asdict(hypothesis)
+                    hypothesis = wb_session.injector.explain_neuron(
+                        layer_name=req.layer_name,
+                        neuron_idx=req.neuron_idx,
+                        tok_to_id=wb_session.tok_to_id,
+                        idx_to_token=wb_session.id_to_tok,
+                        unembed_weight=wb_session.unembed_weight,
+                        dst_layer=req.dst_layer,
+                        circuit_inputs=circuit_inputs,
+                        src_layer=req.src_layer,
+                    )
+                    return asdict(hypothesis)
+
+                return await asyncio.to_thread(_run_explain)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -237,7 +288,8 @@ def create_workbench_app(
     async def export_preset(req: ExportPresetRequest) -> Dict[str, Any]:
         async with session_lock:
             try:
-                bundle = wb_session.injector.export_production_preset(
+                bundle = await asyncio.to_thread(
+                    wb_session.injector.export_production_preset,
                     preset_name=req.preset_name,
                     model_name=wb_session.model_name,
                     description=req.description,
@@ -251,7 +303,8 @@ def create_workbench_app(
     @app.post("/api/import/preset")
     async def import_preset(req: ImportPresetRequest) -> Dict[str, Any]:
         async with session_lock:
-            bundle = wb_session.injector.load_production_preset(
+            bundle = await asyncio.to_thread(
+                wb_session.injector.load_production_preset,
                 preset_data_or_path=req.preset_payload,
                 replace_existing=req.replace_existing,
             )
@@ -264,7 +317,7 @@ def create_workbench_app(
     @app.post("/api/export/fold-weights")
     async def fold_weights() -> Dict[str, Any]:
         async with session_lock:
-            return wb_session.injector.fold_interventions_into_weights()
+            return await asyncio.to_thread(wb_session.injector.fold_interventions_into_weights)
 
     @app.get("/", response_class=HTMLResponse)
     async def workbench_ui() -> HTMLResponse:
@@ -375,14 +428,14 @@ WORKBENCH_HTML = """<!DOCTYPE html>
       </div>
 
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-        <h2 class="text-lg font-semibold text-emerald-400">4. Circuit Tracer &amp; Steering Exporter</h2>
+        <h2 class="text-lg font-semibold text-emerald-400">4. Circuit Tracer & Steering Exporter</h2>
         <div class="grid grid-cols-2 gap-2">
           <div>
-            <label class="text-xs text-slate-400">Destination Layer</label>
+            <label class="text-xs text-slate-400">Connected Layer</label>
             <select id="dst-layer-select" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"></select>
           </div>
           <div>
-            <label class="text-xs text-slate-400">Source Pole</label>
+            <label class="text-xs text-slate-400">Pole</label>
             <select id="trace-pole" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm">
               <option value="positive">positive (+)</option>
               <option value="negative">negative (-)</option>
@@ -390,7 +443,10 @@ WORKBENCH_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <div class="flex gap-2">
-          <button onclick="traceCircuit()" class="flex-1 bg-teal-600 hover:bg-teal-500 text-white text-xs font-medium py-2 rounded">Trace Circuit</button>
+          <button onclick="traceCircuit()" class="flex-1 bg-teal-600 hover:bg-teal-500 text-white text-xs font-medium py-2 rounded">Trace Downstream</button>
+          <button onclick="traceIncomingCircuit()" class="flex-1 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-medium py-2 rounded">Trace Incoming</button>
+        </div>
+        <div class="flex gap-2">
           <button onclick="exportPreset()" class="flex-1 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium py-2 rounded">Export Steering Preset</button>
           <button onclick="foldWeights()" class="bg-fuchsia-700 hover:bg-fuchsia-600 text-white text-xs font-medium px-2.5 py-2 rounded" title="Fold active interventions into down_proj weights/bias">Fold Weights</button>
         </div>
@@ -504,6 +560,19 @@ WORKBENCH_HTML = """<!DOCTYPE html>
       const res = await fetch('/api/circuits/trace', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({src_layer: srcLayer, dst_layer: dstLayer, src_neuron: idx, src_pole: pole, prompt})
+      });
+      document.getElementById('circuit-output').textContent = JSON.stringify(await res.json(), null, 2);
+    }
+
+    async function traceIncomingCircuit() {
+      const dstLayer = document.getElementById('layer-select').value;
+      const srcLayer = document.getElementById('dst-layer-select').value;
+      const idx = parseInt(document.getElementById('neuron-idx').value);
+      const pole = document.getElementById('trace-pole').value;
+      const prompt = document.getElementById('eval-prompt').value;
+      const res = await fetch('/api/circuits/trace-incoming', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({src_layer: srcLayer, dst_layer: dstLayer, dst_neuron: idx, dst_pole: pole, prompt})
       });
       document.getElementById('circuit-output').textContent = JSON.stringify(await res.json(), null, 2);
     }

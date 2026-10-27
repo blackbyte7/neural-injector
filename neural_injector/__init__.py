@@ -1,3 +1,5 @@
+__version__ = "0.6.0"
+
 from .analyzer import (
     CheckpointEvolutionTracker,
     ContrastivePoleFinder,
@@ -47,6 +49,7 @@ from .types import (
 )
 
 __all__ = [
+    "__version__",
     "PoleType",
     "InterventionMode",
     "InteractionRole",

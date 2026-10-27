@@ -17,7 +17,7 @@ from .analyzer import (
     StreamingLayerStats,
 )
 from .circuit_tracer import CircuitTracer
-from .discovery import LayerDescriptor, LayerDiscovery
+from .discovery import LayerDescriptor, LayerDiscovery, _SlicedLinearView
 from .explainer import CircuitEcologyMap, LLMClientProtocol, NeuronExplainerAgent
 from .exporter import SteeringExporter
 from .interventions import AblationMaskOptimizer, InterventionKernel
@@ -49,8 +49,11 @@ class NeuralInjector:
     (Cammarata / Goodfire, Oct 2026) plus production hardening and frontier capabilities:
       - Direct native-basis neuron inspection (Pre-DownProj SwiGLU/MLP hooks, Conv2d, Linear, 3D MoE)
       - Pole-specific conditional moments (M1+, M2+, M4+ and M1-, M2-, M4-) & Stratified Quantile Buckets
+      - SwiGLU Double-Negative Route detection (`gate < 0` and `up < 0` yielding `silu(gate)*up > 0`)
+      - Forward next-token context (`next_token_str` & `window_str`) for next-token preparer neurons
+      - Downstream & Upstream (`trace_incoming_circuit`) causal circuit tracing
       - Crossword / Circuit Ecology propagation store (`CircuitEcologyMap` & `solve_layer_ecology`)
-      - Native per-neuron adaptive thresholds (`std_multiplier` / `percentile`)
+      - Native per-neuron adaptive thresholds (`std_multiplier` / unbiased Algorithm R `percentile`)
       - Superposition readout auditing (`verify_downstream_readout`)
       - Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) multi-layer Jacobian tracing
       - Closed-loop dynamic concept gating (`CONDITIONAL_GATE`)
@@ -68,7 +71,11 @@ class NeuralInjector:
         allowed_workspace_dir: Optional[Union[str, Path]] = None,
     ):
         self.model = model
-        self.device = device or next(model.parameters()).device.type
+        try:
+            default_dev = str(next(model.parameters()).device)
+        except StopIteration:
+            default_dev = "cpu"
+        self.device = str(device) if device is not None else default_dev
         self.tokenizer = tokenizer
         self.allowed_workspace_dir = allowed_workspace_dir
         self._lock = threading.RLock()
@@ -124,12 +131,33 @@ class NeuralInjector:
         with self._lock:
             return [spec for specs in self._interventions.values() for spec in specs]
 
+    def _validate_detector_layer_order(self, detector_layer: str, target_layer: str) -> None:
+        """
+        Ensures `detector_layer` executes before or at the same module as `target_layer`
+        so cross-layer conditional gate masks are never missing or stale.
+        """
+        if detector_layer == target_layer:
+            return
+        module_order = [name for name, _ in self.model.named_modules() if name]
+        if detector_layer in module_order and target_layer in module_order:
+            det_pos = module_order.index(detector_layer)
+            tgt_pos = module_order.index(target_layer)
+            if det_pos > tgt_pos:
+                raise ValueError(
+                    f"Invalid CONDITIONAL_GATE: detector_layer '{detector_layer}' executes after "
+                    f"target_layer '{target_layer}'. The detector must be upstream of or in the same layer as the target."
+                )
+
     # -------------------------------------------------------------------------
     # 2. Surgical Neuron Manipulation (Zero-Ablate, Clamp, Steer, Prune, Gate)
     # -------------------------------------------------------------------------
     def add_intervention(self, spec: InterventionSpec) -> None:
         """Registers a surgical intervention specification on a target layer."""
         with self._lock:
+            if spec.gate_condition is not None:
+                self._validate_detector_layer_order(
+                    spec.gate_condition.detector_layer, spec.layer_name
+                )
             if spec.layer_name not in self._interventions:
                 self._interventions[spec.layer_name] = []
             self._interventions[spec.layer_name].append(spec)
@@ -271,6 +299,7 @@ class NeuralInjector:
         when `detector_neuron` in `detector_layer` fires on `detector_pole` above `threshold`
         (or above its audited `detector_percentile`).
         """
+        self._validate_detector_layer_order(detector_layer, target_layer)
         indices = [target_neurons] if isinstance(target_neurons, int) else list(target_neurons)
         if threshold is not None:
             resolved_thresh = float(threshold)
@@ -318,6 +347,11 @@ class NeuralInjector:
         with self._lock:
             self.detach_hooks()
             conditional_masks: Dict[int, torch.Tensor] = {}
+
+            # Reset conditional_masks at the start of every forward pass on the root model
+            self._active_handles.append(
+                self.model.register_forward_pre_hook(lambda _m, _inp: conditional_masks.clear())
+            )
 
             # 1. Register detector hooks first so upstream detector masks are populated before target hooks fire
             for layer_name, specs in self._interventions.items():
@@ -498,14 +532,23 @@ class NeuralInjector:
     ) -> Dict[str, StreamingLayerStats]:
         """
         Streams batches through the model and records bipolar activation statistics,
-        pole-specific conditional moments, and quantile-stratified activating contexts.
+        pole-specific conditional moments, SwiGLU double-negative (`gate < 0, up < 0`)
+        diagnostics, forward next-token context, and quantile-stratified activating contexts.
         """
         with self._lock:
             handles: List[RemovableHandle] = []
             current_batch_meta: Dict[str, Any] = {}
+            latest_gate_acts: Dict[str, torch.Tensor] = {}
+            latest_up_acts: Dict[str, torch.Tensor] = {}
 
             for layer_name in layer_names:
                 module, hook_target, num_neurons = LayerDiscovery.resolve_module(
+                    self.model, layer_name
+                )
+                _, up_mod, gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(
+                    self.model, layer_name
+                )
+                fused_mod = LayerDiscovery.resolve_fused_gate_up_module(
                     self.model, layer_name
                 )
                 tracker = StreamingLayerStats(
@@ -516,9 +559,54 @@ class NeuralInjector:
                 )
                 self._stats_trackers[layer_name] = tracker
 
+                # Case A: Split gate_proj and up_proj sibling modules
+                if (
+                    hook_target == "input"
+                    and gate_mod is not None
+                    and up_mod is not None
+                    and not isinstance(gate_mod, _SlicedLinearView)
+                    and not isinstance(up_mod, _SlicedLinearView)
+                ):
+
+                    def _make_gate_hook(lname: str):
+                        def _g_hook(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
+                            t0 = out[0] if isinstance(out, tuple) else out
+                            if isinstance(t0, torch.Tensor):
+                                latest_gate_acts[lname] = t0.detach()
+
+                        return _g_hook
+
+                    def _make_up_hook(lname: str):
+                        def _u_hook(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
+                            t0 = out[0] if isinstance(out, tuple) else out
+                            if isinstance(t0, torch.Tensor):
+                                latest_up_acts[lname] = t0.detach()
+
+                        return _u_hook
+
+                    handles.append(gate_mod.register_forward_hook(_make_gate_hook(layer_name)))
+                    handles.append(up_mod.register_forward_hook(_make_up_hook(layer_name)))
+
+                # Case B: Single fused gate_up_proj module returning [..., 2 * d_mlp]
+                elif hook_target == "input" and fused_mod is not None:
+
+                    def _make_fused_hook(lname: str, n_neurons: int):
+                        def _f_hook(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
+                            t0 = out[0] if isinstance(out, tuple) else out
+                            if isinstance(t0, torch.Tensor) and t0.shape[-1] == 2 * n_neurons:
+                                g_act, u_act = t0.detach().chunk(2, dim=-1)
+                                latest_gate_acts[lname] = g_act
+                                latest_up_acts[lname] = u_act
+
+                        return _f_hook
+
+                    handles.append(
+                        fused_mod.register_forward_hook(_make_fused_hook(layer_name, num_neurons))
+                    )
+
                 if hook_target == "input":
 
-                    def _make_audit_pre_hook(t: StreamingLayerStats):
+                    def _make_audit_pre_hook(t: StreamingLayerStats, lname: str):
                         def _hook(_mod: nn.Module, inputs: Tuple[Any, ...]) -> None:
                             if inputs and isinstance(inputs[0], torch.Tensor):
                                 t.update(
@@ -533,11 +621,15 @@ class NeuralInjector:
                                     routed_token_indices=current_batch_meta.get(
                                         "routed_token_indices"
                                     ),
+                                    gate_activations=latest_gate_acts.pop(lname, None),
+                                    up_activations=latest_up_acts.pop(lname, None),
                                 )
 
                         return _hook
 
-                    handles.append(module.register_forward_pre_hook(_make_audit_pre_hook(tracker)))
+                    handles.append(
+                        module.register_forward_pre_hook(_make_audit_pre_hook(tracker, layer_name))
+                    )
                 else:
 
                     def _make_audit_fwd_hook(t: StreamingLayerStats):
@@ -567,6 +659,8 @@ class NeuralInjector:
             try:
                 with self.without_interventions():
                     for batch in dataloader_or_batches:
+                        latest_gate_acts.clear()
+                        latest_up_acts.clear()
                         current_batch_meta = {
                             "sample_ids": batch.get("sample_ids"),
                             "tokens_per_sample": batch.get("tokens_per_sample"),
@@ -684,6 +778,32 @@ class NeuralInjector:
                 top_k=top_k,
             )
 
+    def trace_incoming_circuit(
+        self,
+        src_layer: str,
+        dst_layer: str,
+        dst_neuron: int,
+        inputs: Any,
+        dst_pole: PoleType = PoleType.POSITIVE,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        top_k: int = 8,
+    ) -> CircuitGraph:
+        """
+        Traces incoming upstream connections from ALL neurons in `src_layer` into a single
+        target `(dst_layer, dst_neuron, dst_pole)` to decompose which upstream routers drive
+        a neuron's trunk or recursive offshoots.
+        """
+        with self._lock:
+            return self.tracer.trace_incoming_circuit(
+                src_layer=src_layer,
+                dst_layer=dst_layer,
+                dst_neuron=dst_neuron,
+                inputs=inputs,
+                forward_fn=forward_fn,
+                dst_pole=dst_pole,
+                top_k=top_k,
+            )
+
     def trace_forward_ad_all_layers(
         self,
         src_layer: str,
@@ -750,10 +870,12 @@ class NeuralInjector:
         dst_layer: Optional[str] = None,
         circuit_inputs: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
+        src_layer: Optional[str] = None,
     ) -> BipolarVerbHypothesis:
         """
-        Synthesizes a bipolar 'verb' explanation for `(layer_name, neuron_idx)` and runs
-        automated surgical Zero-Ablation and Pole-Clamping experiments to empirically verify it.
+        Synthesizes a bipolar 'verb' explanation for `(layer_name, neuron_idx)` (optionally
+        tracing downstream to `dst_layer` and upstream from `src_layer`) and runs automated
+        surgical Zero-Ablation and Pole-Clamping experiments to empirically verify it.
         """
         with self._lock:
             return self.explainer.explain_and_verify(
@@ -765,6 +887,7 @@ class NeuralInjector:
                 dst_layer=dst_layer,
                 circuit_inputs=circuit_inputs,
                 tokenizer=tokenizer or self.tokenizer,
+                src_layer=src_layer,
             )
 
     def solve_layer_ecology(
@@ -778,6 +901,7 @@ class NeuralInjector:
         top_anchors: int = 3,
         top_contextual: int = 3,
         tokenizer: Optional[Any] = None,
+        src_layer: Optional[str] = None,
     ) -> LayerEcologySolveReport:
         """
         Implements Cammarata's Crossword / Circuit Ecology propagation loop (Section 3.2:
@@ -826,6 +950,7 @@ class NeuralInjector:
                     dst_layer=dst_layer,
                     circuit_inputs=circuit_inputs,
                     tokenizer=tokenizer,
+                    src_layer=src_layer,
                 )
                 solved[n_idx] = hyp
                 if hyp.verification_report is not None:
@@ -842,6 +967,7 @@ class NeuralInjector:
                     dst_layer=dst_layer,
                     circuit_inputs=circuit_inputs,
                     tokenizer=tokenizer,
+                    src_layer=src_layer,
                 )
                 solved[n_idx] = hyp
                 if hyp.verification_report is not None:
@@ -861,20 +987,17 @@ class NeuralInjector:
     # -------------------------------------------------------------------------
     @torch.no_grad()
     def scan_layer_cleanliness(
-            self,
-            layer_name: str,
-            sort_by: str = "pole_selectivity_score",
-            compute_kl_for_top_n: int = 0,
-            kl_eval_inputs: Optional[torch.Tensor] = None,
-            limit: Optional[int] = None,
+        self,
+        layer_name: str,
+        sort_by: str = "pole_selectivity_score",
+        compute_kl_for_top_n: int = 0,
+        kl_eval_inputs: Optional[torch.Tensor] = None,
+        limit: Optional[int] = None,
     ) -> LayerCleanlinessReport:
         """
         Scans all neurons in `layer_name` in parallel using GPU Welford moments and
-        outgoing weight norms, returning the exact cleanliness breakdown (Clean Monosemantic %,
-        Structured Recursive Mixture %, Polysemantic %, Dead/Noisy %) and ranked neuron list.
-
-        Optionally computes exact causal ablation KL-divergence for the top `compute_kl_for_top_n`
-        neurons when `kl_eval_inputs` is provided.
+        outgoing weight norms as a fast statistical prior, then promotes any neuron
+        with a verified hypothesis in `self.ecology_map` (`semantic_verified=True`).
         """
         if layer_name not in self._stats_trackers:
             raise KeyError(
@@ -884,7 +1007,10 @@ class NeuralInjector:
         tracker = self._stats_trackers[layer_name]
         module, _, _ = LayerDiscovery.resolve_module(self.model, layer_name)
 
-        counts, pcts, summaries = tracker.scan_layer_cleanliness(down_proj_module=module)
+        counts, pcts, summaries = tracker.scan_layer_cleanliness(
+            down_proj_module=module,
+            verified_hypotheses=self.ecology_map.hypotheses,
+        )
 
         # Aggregate independent pole-level taxonomy counts across all 2 * num_neurons poles (Section 3.1)
         pole_counts: Dict[str, int] = {
@@ -1044,7 +1170,7 @@ class NeuralInjector:
     ) -> ProductionPresetBundle:
         """
         Packages all currently active interventions and compiles their linear residual-stream
-        steering vectors v_steer = sum_i delta_i * W_down[:, i] into a ProductionPresetBundle.
+        steering vectors v_steer = sum_i shift_i * W_down[:, i] into a ProductionPresetBundle.
         """
         with self._lock:
             bundle = SteeringExporter.build_preset_bundle(

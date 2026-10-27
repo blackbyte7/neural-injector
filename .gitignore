@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Pytest & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments & IDE
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Exported presets & PyTorch artifacts
+*.pt
+*.pth
+*.safetensors
+*_preset.json

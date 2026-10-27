@@ -12,7 +12,7 @@ from .types import InterventionMode, PoleType
 class NeuralInjectorREPL(cmd.Cmd):
     """
     Stateful interactive terminal workbench for auditing neurons, manipulating poles,
-    tracing layer-to-layer circuits, solving crossword circuit ecology, discovering
+    tracing downstream & incoming circuits, solving crossword circuit ecology, discovering
     contrastive neurons, and running closed-loop agent explanations.
     """
 
@@ -52,7 +52,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         sort_by = parts[1] if len(parts) >= 2 else "pole_selectivity_score"
         limit = int(parts[2]) if len(parts) >= 3 else 12
 
-        kl_inputs, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        kl_inputs = self.session.get_default_eval_inputs()
         report = self.session.injector.scan_layer_cleanliness(
             layer_name=layer_name,
             sort_by=sort_by,
@@ -86,14 +86,15 @@ class NeuralInjectorREPL(cmd.Cmd):
             )
             sel_pair = f"{n.pole_selectivity_score:4.1f} ({n.pos_pole_selectivity_score:4.1f}/{n.neg_pole_selectivity_score:4.1f})"
             tok_pair = f"{n.top_pos_token or '-'} / {n.top_neg_token or '-'}"
+            tax_label = f"{n.taxonomy_class.value}{'*' if n.semantic_verified else ''}"
             print(
-                f"N{n.neuron_idx:<4} | {n.taxonomy_class.value:<28} | {sel_pair:<19} | "
+                f"N{n.neuron_idx:<4} | {tax_label:<28} | {sel_pair:<19} | "
                 f"{n.bipolar_balance:<7.3f} | {n.estimated_causal_impact:<8.3f} | {kl_str:<8} | {tok_pair}"
             )
         print()
 
     def do_profile(self, arg: str) -> None:
-        """profile <layer_name> <neuron_idx> : Inspect Positive & Negative poles, Quantile Bands, and Logit Attribution."""
+        """profile <layer_name> <neuron_idx> : Inspect Positive & Negative poles, Next-Token clues, SwiGLU Double-Negative rate, Quantile Bands, and Logit Attribution."""
         parts = shlex.split(arg)
         if len(parts) < 2:
             print("Usage: profile <layer_name> <neuron_idx>  (e.g., profile mlp_block_0.down_proj 7)")
@@ -112,14 +113,17 @@ class NeuralInjectorREPL(cmd.Cmd):
             )
             print(
                 f"+Pole Selectivity: {p.pos_pole_selectivity_score:.2f} ({p.pos_taxonomy_class.value}) | "
-                f"-Pole Selectivity: {p.neg_pole_selectivity_score:.2f} ({p.neg_taxonomy_class.value})"
+                f"-Pole Selectivity: {p.neg_pole_selectivity_score:.2f} ({p.neg_taxonomy_class.value}) | "
+                f"SwiGLU Double-Neg (+Pole): {p.double_negative_positive_rate * 100:.1f}%"
             )
             print(
                 f"\n[+] POSITIVE POLE (Firing Rate: {p.positive_firing_rate * 100:.1f}%, Max: {p.max_val:+.3f}):"
             )
             for s in p.top_positive_samples[:4]:
+                nxt = f" -> '{s.next_token_str}'" if s.next_token_str else ""
+                dbl = " [SwiGLU g<0,u<0]" if s.is_double_negative_route else ""
                 print(
-                    f"    Act: {s.activation_value:+.3f} | Token: '{s.token_str}' | Context: \"{s.context_str}\""
+                    f"    Act: {s.activation_value:+.3f}{dbl} | Token: '{s.token_str}'{nxt} | Context: \"{s.context_str}\""
                 )
             for band, b_samples in p.positive_quantile_buckets.items():
                 toks = [s.token_str for s in b_samples[:4] if s.token_str]
@@ -130,8 +134,9 @@ class NeuralInjectorREPL(cmd.Cmd):
                 f"\n[-] NEGATIVE POLE (Firing Rate: {p.negative_firing_rate * 100:.1f}%, Min: {p.min_val:+.3f}):"
             )
             for s in p.top_negative_samples[:4]:
+                nxt = f" -> '{s.next_token_str}'" if s.next_token_str else ""
                 print(
-                    f"    Act: {s.activation_value:+.3f} | Token: '{s.token_str}' | Context: \"{s.context_str}\""
+                    f"    Act: {s.activation_value:+.3f} | Token: '{s.token_str}'{nxt} | Context: \"{s.context_str}\""
                 )
             print(f"\nDirect Vocab Attribution (+Pole Promotes) : {p.top_promoted_tokens[:5]}")
             print(f"Direct Vocab Attribution (-Pole Promotes) : {p.top_suppressed_tokens[:5]}\n")
@@ -221,7 +226,7 @@ class NeuralInjectorREPL(cmd.Cmd):
 
     def do_eval(self, arg: str) -> None:
         """eval <prompt> : Compare Clean vs. Surgically Intervened next-token probabilities and KL divergence."""
-        prompt = arg.strip() or "the system negotiated AES256"
+        prompt = arg.strip() or self.session.get_default_eval_prompt()
         res = self.session.evaluate_prompt_comparison(prompt)
         print(f"\nPrompt: \"{res['prompt']}\" | Sequence KL-Divergence: {res['kl_divergence']:.5f}")
         print(f"Active Interventions: {len(res['active_interventions'])}")
@@ -234,14 +239,14 @@ class NeuralInjectorREPL(cmd.Cmd):
         print()
 
     def do_trace(self, arg: str) -> None:
-        """trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt] : Trace layer-to-layer circuit."""
+        """trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt] : Trace downstream layer-to-layer circuit."""
         parts = shlex.split(arg)
         if len(parts) < 3:
             print("Usage: trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt]")
             return
         src_l, dst_l, n_idx = parts[0], parts[1], int(parts[2])
         pole = PoleType(parts[3]) if len(parts) >= 4 else PoleType.POSITIVE
-        prompt = " ".join(parts[4:]) if len(parts) >= 5 else "the system negotiated AES256 TLS"
+        prompt = " ".join(parts[4:]) if len(parts) >= 5 else self.session.get_default_eval_prompt()
         input_ids, _ = self.session.encode_prompt(prompt)
         graph = self.session.injector.trace_circuit(
             src_layer=src_l,
@@ -267,6 +272,39 @@ class NeuralInjectorREPL(cmd.Cmd):
             )
         print()
 
+    def do_trace_incoming(self, arg: str) -> None:
+        """trace_incoming <src_layer> <dst_layer> <dst_neuron> [positive|negative] [prompt] : Trace upstream neurons driving dst_neuron."""
+        parts = shlex.split(arg)
+        if len(parts) < 3:
+            print("Usage: trace_incoming <src_layer> <dst_layer> <dst_neuron> [positive|negative] [prompt]")
+            return
+        src_l, dst_l, n_idx = parts[0], parts[1], int(parts[2])
+        pole = PoleType(parts[3]) if len(parts) >= 4 else PoleType.POSITIVE
+        prompt = " ".join(parts[4:]) if len(parts) >= 5 else self.session.get_default_eval_prompt()
+        input_ids, _ = self.session.encode_prompt(prompt)
+        graph = self.session.injector.trace_incoming_circuit(
+            src_layer=src_l,
+            dst_layer=dst_l,
+            dst_neuron=n_idx,
+            inputs=input_ids,
+            dst_pole=pole,
+            top_k=6,
+        )
+        print(f"\n--- INCOMING UPSTREAM TRACE: {src_l} --> ({dst_l}, N{n_idx}, {pole.value}) ---")
+        print("[Top Excitatory Upstream Neurons]:")
+        for e in graph.top_excitatory(3):
+            print(
+                f"  N{e.src_neuron:02d} ({e.src_pole.value}) -> | Role: {e.role.value:<10} | Causal Delta: {e.mean_causal_delta:+.4f} "
+                f"| Jacobian: {e.jacobian_sensitivity:+.4f} | W_up: {e.virtual_weight_up:+.3f}, W_gate: {e.virtual_weight_gate:+.3f}"
+            )
+        print("[Top Inhibitory Upstream Neurons]:")
+        for e in graph.top_inhibitory(3):
+            print(
+                f"  N{e.src_neuron:02d} ({e.src_pole.value}) -> | Role: {e.role.value:<10} | Causal Delta: {e.mean_causal_delta:+.4f} "
+                f"| Jacobian: {e.jacobian_sensitivity:+.4f} | W_up: {e.virtual_weight_up:+.3f}, W_gate: {e.virtual_weight_gate:+.3f}"
+            )
+        print()
+
     def do_readout(self, arg: str) -> None:
         """readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold] : Audit whether weak cross-activations are read downstream."""
         parts = shlex.split(arg)
@@ -276,7 +314,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         src_l, dst_l = parts[0], parts[1]
         neurons = [int(x.strip()) for x in parts[2].split(",") if x.strip()]
         thresh = float(parts[3]) if len(parts) >= 4 else None
-        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        input_ids = self.session.get_default_eval_inputs()
         rep = self.session.injector.verify_downstream_readout(
             src_layer=src_l,
             dst_layer=dst_l,
@@ -295,14 +333,15 @@ class NeuralInjectorREPL(cmd.Cmd):
         )
 
     def do_explain(self, arg: str) -> None:
-        """explain <layer_name> <neuron_idx> [dst_layer] : Run the Automated LLM Explainer & Surgical Verifier."""
+        """explain <layer_name> <neuron_idx> [dst_layer] [src_layer] : Run the Automated LLM Explainer & Surgical Verifier."""
         parts = shlex.split(arg)
         if len(parts) < 2:
-            print("Usage: explain <layer_name> <neuron_idx> [dst_layer]")
+            print("Usage: explain <layer_name> <neuron_idx> [dst_layer] [src_layer]")
             return
         layer_name, idx = parts[0], int(parts[1])
-        dst_layer = parts[2] if len(parts) >= 3 else None
-        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        dst_layer = parts[2] if len(parts) >= 3 and parts[2] != "-" else None
+        src_layer = parts[3] if len(parts) >= 4 and parts[3] != "-" else None
+        input_ids = self.session.get_default_eval_inputs()
         hyp = self.session.injector.explain_neuron(
             layer_name=layer_name,
             neuron_idx=idx,
@@ -310,7 +349,8 @@ class NeuralInjectorREPL(cmd.Cmd):
             idx_to_token=self.session.id_to_tok,
             unembed_weight=self.session.unembed_weight,
             dst_layer=dst_layer,
-            circuit_inputs=input_ids if dst_layer else None,
+            circuit_inputs=input_ids if (dst_layer or src_layer) else None,
+            src_layer=src_layer,
         )
         print(f"\n=== AGENTIC EXPLANATION: {hyp.layer_name} [Neuron #{hyp.neuron_idx}] ===")
         print(f"Taxonomy       : {hyp.taxonomy_class.value} (Confidence: {hyp.confidence_score:.2f})")
@@ -336,7 +376,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         dst_layer = parts[1] if len(parts) >= 2 else None
         top_a = int(parts[2]) if len(parts) >= 3 else 2
         top_c = int(parts[3]) if len(parts) >= 4 else 2
-        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        input_ids = self.session.get_default_eval_inputs()
         rep = self.session.injector.solve_layer_ecology(
             layer_name=layer_name,
             tok_to_id=self.session.tok_to_id,
@@ -388,7 +428,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         layer_name = parts[0]
         k = int(parts[1]) if len(parts) >= 2 else 3
         method = parts[2] if len(parts) >= 3 else "greedy"
-        input_ids, _ = self.session.encode_prompt("the system negotiated AES256 TLS cipher")
+        input_ids = self.session.get_default_eval_inputs()
         res = self.session.injector.find_synergistic_ablation_set(
             layer_name=layer_name, inputs=input_ids, max_subset_size=k, method=method
         )
@@ -463,7 +503,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         default=None,
         help="Optional HuggingFace model ID to load (e.g. 'gpt2' or 'Qwen/Qwen2.5-1.5B'). Defaults to built-in 2-layer SwiGLU model.",
     )
-    parser.add_argument("--device", type=str, default="cpu", help="Device ('cpu' or 'cuda')")
+    parser.add_argument("--device", type=str, default="cpu", help="Device ('cpu', 'cuda', 'cuda:0', etc.)")
 
     sub = parser.add_subparsers(dest="command")
 
@@ -476,7 +516,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     serve_p.add_argument("--port", type=int, default=8000)
 
     # 3. Direct one-shot profile command
-    prof_p = sub.add_parser("profile", help="Inspect a neuron's bipolar profile as JSON")
+    prof_p = sub.add_parser("profile", help="Inspect a neuron's bipolar profile")
     prof_p.add_argument("layer_name", type=str)
     prof_p.add_argument("neuron_idx", type=int)
 
@@ -487,6 +527,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     exp_p.add_argument("layer_name", type=str)
     exp_p.add_argument("neuron_idx", type=int)
     exp_p.add_argument("--dst-layer", type=str, default=None)
+    exp_p.add_argument("--src-layer", type=str, default=None)
 
     args = parser.parse_args(argv)
 
@@ -510,10 +551,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     elif args.command == "explain":
         repl = NeuralInjectorREPL(session)
-        cmd_str = f"{args.layer_name} {args.neuron_idx}" + (
-            f" {args.dst_layer}" if args.dst_layer else ""
-        )
-        repl.do_explain(cmd_str)
+        dst_arg = args.dst_layer or "-"
+        src_arg = args.src_layer or "-"
+        repl.do_explain(f"{args.layer_name} {args.neuron_idx} {dst_arg} {src_arg}")
 
     else:
         # Default to interactive REPL

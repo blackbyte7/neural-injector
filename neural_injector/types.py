@@ -41,20 +41,29 @@ class NeuronTaxonomy(str, Enum):
 
 @dataclass
 class ActivationSample:
-    """Stores a single top-activating or quantile-stratified context example for a neuron pole."""
+    """
+    Stores a single top-activating or quantile-stratified context example for a neuron pole.
+    Includes `next_token_str` and `window_str` to surface forward next-token prediction motifs
+    (e.g., Cammarata's 'Titanic -> boat' finding) and `is_double_negative_route` to flag
+    SwiGLU activations where `gate < 0` and `up < 0` multiply to a positive value.
+    """
     activation_value: float
     sample_id: int
     position_idx: Optional[int] = None  # Token index (for sequences) or spatial index (for CNNs)
     token_str: Optional[str] = None  # Decoded focal token or patch label
     context_str: Optional[str] = None  # Surrounding text window or sample metadata
     quantile_band: Optional[str] = None  # "peak_trunk", "secondary_branch", or "tertiary_offshoot"
+    next_token_str: Optional[str] = None  # Token at position_idx + 1 (forward prediction clue)
+    window_str: Optional[str] = None  # Local snippet highlighting "... prev [FOCAL] -> next ..."
+    is_double_negative_route: bool = False  # True when SwiGLU gate < 0 and up < 0 yield a > 0
 
 
 @dataclass
 class NeuronPoleProfile:
     """
     Detailed statistical and semantic profile for a single neuron across both poles,
-    including conditional pole-specific selectivity/taxonomy and stratified quantile bands.
+    including conditional pole-specific selectivity/taxonomy, stratified quantile bands,
+    and SwiGLU double-negative route diagnostics.
     """
     layer_name: str
     neuron_idx: int
@@ -84,6 +93,10 @@ class NeuronPoleProfile:
     # Keys: "peak_trunk" ([80%..100%]), "secondary_branch" ([40%..80%)), "tertiary_offshoot" ([15%..40%))
     positive_quantile_buckets: Dict[str, List[ActivationSample]] = field(default_factory=dict)
     negative_quantile_buckets: Dict[str, List[ActivationSample]] = field(default_factory=dict)
+
+    # SwiGLU Double-Negative Route diagnostics (gate < 0 and up < 0 -> silu(gate)*up > 0)
+    double_negative_positive_rate: float = 0.0
+    double_negative_samples: List[ActivationSample] = field(default_factory=list)
 
     @property
     def is_clean_candidate(self) -> bool:
@@ -177,26 +190,28 @@ class CircuitEdge:
 class CircuitGraph:
     """
     Stores a traced multi-neuron or multi-layer circuit subgraph.
-    Provides filtering, pruning, and export utilities for downstream LLM agent explanation.
+    Supports both downstream traces (1 source neuron -> many destination neurons)
+    and upstream incoming traces (many source neurons -> 1 destination neuron).
     """
     src_layer: str
     dst_layer: str
     src_neuron: int
     src_pole: PoleType
     edges: List[CircuitEdge] = field(default_factory=list)
+    dst_neuron: Optional[int] = None
 
     def top_excitatory(self, k: int = 5) -> List[CircuitEdge]:
-        """Returns downstream neurons most strongly excited (pushed positive) by the source pole."""
+        """Returns edges with the strongest positive causal contribution (+Delta)."""
         pos = [e for e in self.edges if e.mean_causal_delta > 0]
         return sorted(pos, key=lambda e: e.mean_causal_delta, reverse=True)[:k]
 
     def top_inhibitory(self, k: int = 5) -> List[CircuitEdge]:
-        """Returns downstream neurons most strongly inhibited or driven negative by the source pole."""
+        """Returns edges with the strongest negative/inhibitory causal contribution (-Delta)."""
         neg = [e for e in self.edges if e.mean_causal_delta < 0]
         return sorted(neg, key=lambda e: e.mean_causal_delta, reverse=False)[:k]
 
     def to_agent_payload(self) -> Dict[str, Any]:
-        """Serializes the circuit into a structured dictionary ready for an LLM Explainer Agent."""
+        """Serializes a downstream circuit into a structured dictionary for the LLM Explainer Agent."""
         return {
             "source": {
                 "layer": self.src_layer,
@@ -221,6 +236,46 @@ class CircuitGraph:
                 {
                     "dst_neuron": e.dst_neuron,
                     "dst_pole_tendency": e.dst_pole_tendency.value,
+                    "role": e.role.value,
+                    "mean_causal_delta": round(e.mean_causal_delta, 4),
+                    "max_causal_delta": round(e.max_causal_delta, 4),
+                    "jacobian_sensitivity": round(e.jacobian_sensitivity, 4),
+                    "virtual_weight_up": round(e.virtual_weight_up, 4),
+                    "virtual_weight_gate": round(e.virtual_weight_gate, 4),
+                }
+                for e in self.top_inhibitory(5)
+            ],
+        }
+
+    def to_incoming_agent_payload(self) -> Dict[str, Any]:
+        """Serializes an upstream incoming circuit (L_src -> dst_neuron) for the LLM Explainer Agent."""
+        target_n = self.dst_neuron if self.dst_neuron is not None else (
+            self.edges[0].dst_neuron if self.edges else -1
+        )
+        return {
+            "source_layer": self.src_layer,
+            "target": {
+                "layer": self.dst_layer,
+                "neuron_idx": target_n,
+                "pole": self.src_pole.value,
+            },
+            "top_excitatory_upstream": [
+                {
+                    "src_neuron": e.src_neuron,
+                    "src_pole": e.src_pole.value,
+                    "role": e.role.value,
+                    "mean_causal_delta": round(e.mean_causal_delta, 4),
+                    "max_causal_delta": round(e.max_causal_delta, 4),
+                    "jacobian_sensitivity": round(e.jacobian_sensitivity, 4),
+                    "virtual_weight_up": round(e.virtual_weight_up, 4),
+                    "virtual_weight_gate": round(e.virtual_weight_gate, 4),
+                }
+                for e in self.top_excitatory(5)
+            ],
+            "top_inhibitory_upstream": [
+                {
+                    "src_neuron": e.src_neuron,
+                    "src_pole": e.src_pole.value,
                     "role": e.role.value,
                     "mean_causal_delta": round(e.mean_causal_delta, 4),
                     "max_causal_delta": round(e.max_causal_delta, 4),
@@ -414,7 +469,11 @@ class SynergisticAblationResult:
 
 @dataclass
 class NeuronScanSummary:
-    """Compact layer-wide audit metrics for a single neuron used in rankings and heatmaps."""
+    """
+    Compact layer-wide audit metrics for a single neuron used in rankings and heatmaps.
+    Note: Initial taxonomy classification is a statistical tail-selectivity prior unless
+    `semantic_verified=True` (updated after closed-loop agentic verification).
+    """
     neuron_idx: int
     taxonomy_class: NeuronTaxonomy
     pole_selectivity_score: float
@@ -434,6 +493,8 @@ class NeuronScanSummary:
     neg_pole_selectivity_score: float = 0.0
     pos_taxonomy_class: NeuronTaxonomy = NeuronTaxonomy.DEAD_OR_NOISY
     neg_taxonomy_class: NeuronTaxonomy = NeuronTaxonomy.DEAD_OR_NOISY
+    double_negative_positive_rate: float = 0.0
+    semantic_verified: bool = False
 
 
 @dataclass

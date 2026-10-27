@@ -48,6 +48,33 @@ class LayerDiscovery:
         return any(seg in cls.ATTN_PATH_SEGMENTS for seg in parts[:-1])
 
     @classmethod
+    def resolve_fused_gate_up_module(
+        cls, model: nn.Module, layer_name: str
+    ) -> Optional[nn.Module]:
+        """
+        If the MLP block containing `layer_name` uses a single fused `gate_up_proj` module
+        (e.g., `gate_up_proj`, `c_fc_fused`, `w13`), returns that executable `nn.Module` so
+        forward hooks can split its output into `(gate_activations, up_activations)`.
+        """
+        _, _, num_neurons = cls.resolve_module(model, layer_name)
+        parent_path = ".".join(layer_name.split(".")[:-1])
+        if not parent_path:
+            return None
+        parent_mod = model.get_submodule(parent_path)
+        for child_name, child_mod in parent_mod.named_children():
+            if any(child_name.endswith(p) for p in cls.FUSED_GATE_UP_PATTERNS) and hasattr(
+                child_mod, "weight"
+            ):
+                w = child_mod.weight
+                if (
+                    (w.ndim == 3 and w.shape[-2] == 2 * num_neurons)
+                    or (child_mod.__class__.__name__ == "Conv1D" and w.shape[1] == 2 * num_neurons)
+                    or (w.ndim == 2 and w.shape[0] == 2 * num_neurons)
+                ):
+                    return child_mod
+        return None
+
+    @classmethod
     def resolve_mlp_read_write_modules(
         cls, model: nn.Module, layer_name: str
     ) -> Tuple[nn.Module, Optional[nn.Module], Optional[nn.Module]]:

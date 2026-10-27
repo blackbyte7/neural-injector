@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from neural_injector import (
+    __version__,
     AgentHypothesisResponseSchema,
     BipolarVerbHypothesis,
     InteractionRole,
@@ -58,6 +59,9 @@ def sql_prompt_ids(demo_session: WorkbenchSession) -> torch.Tensor:
 # 1. Layer Discovery & Architecture Resolution Tests
 # =============================================================================
 class TestLayerDiscovery:
+    def test_package_version_unified(self):
+        assert __version__ == "0.6.0"
+
     def test_discover_swiglu_down_proj_layers(self, demo_session: WorkbenchSession):
         layers = demo_session.injector.list_targetable_layers(include_all_linear=False)
         assert "mlp_block_0.down_proj" in layers
@@ -67,6 +71,10 @@ class TestLayerDiscovery:
         assert desc0.num_neurons == 128
         assert desc0.hook_target == "input"
         assert "Pre-DownProj" in desc0.module_type
+
+    def test_device_string_preserves_index(self, demo_session: WorkbenchSession):
+        inj = NeuralInjector(demo_session.model, device="cuda:1")
+        assert inj.device == "cuda:1"
 
     def test_discover_all_linear_and_conv2d_fallback(self):
         class VisionCNN(nn.Module):
@@ -360,7 +368,7 @@ class TestAgenticNeuronExplainer:
         self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
     ):
         class MockLLMClient:
-            def complete_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+            def complete_json(self, user_prompt: str) -> Dict[str, Any]:
                 data = json.loads(user_prompt)
                 assert "neuron_profile" in data
                 assert "downstream_circuit" in data
@@ -611,7 +619,7 @@ class TestFastAPIAndCLIWorkbench:
         assert imp_resp.status_code == 200
         assert imp_resp.json()["active_interventions"] == 1
 
-        # 7. POST /api/circuits/trace
+        # 7. POST /api/circuits/trace & POST /api/circuits/trace-incoming
         trace_resp = client.post(
             "/api/circuits/trace",
             json={
@@ -626,6 +634,20 @@ class TestFastAPIAndCLIWorkbench:
         )
         assert trace_resp.status_code == 200
         assert trace_resp.json()["source"]["neuron_idx"] == 7
+
+        inc_trace_resp = client.post(
+            "/api/circuits/trace-incoming",
+            json={
+                "src_layer": "mlp_block_0.down_proj",
+                "dst_layer": "mlp_block_1.down_proj",
+                "dst_neuron": 12,
+                "dst_pole": "positive",
+                "prompt": "the system negotiated AES256 TLS",
+                "top_k": 5,
+            },
+        )
+        assert inc_trace_resp.status_code == 200
+        assert inc_trace_resp.json()["target"]["neuron_idx"] == 12
 
         # 8. POST /api/explain
         explain_resp = client.post(
@@ -658,12 +680,14 @@ class TestFastAPIAndCLIWorkbench:
         repl.do_clear("")
         repl.do_import(str(preset_file))
         repl.do_trace("mlp_block_0.down_proj mlp_block_1.down_proj 7 positive")
+        repl.do_trace_incoming("mlp_block_0.down_proj mlp_block_1.down_proj 12 positive")
         repl.do_explain("mlp_block_0.down_proj 7 mlp_block_1.down_proj")
 
         captured = capsys.readouterr().out
         assert "LAYER-WIDE CLEANLINESS SCAN" in captured
         assert "NEURON PROFILE: mlp_block_0.down_proj [Neuron #7]" in captured
         assert "CIRCUIT TRACE" in captured
+        assert "INCOMING UPSTREAM TRACE" in captured
         assert "AGENTIC EXPLANATION" in captured
 
         # One-shot CLI entrypoint test
@@ -1100,8 +1124,8 @@ class TestProductionHardeningAndSection5Capabilities:
         assert attempts["count"] == 2
         assert out["confidence_score"] == 0.91
         assert (
-                AgentHypothesisResponseSchema.model_validate(out).taxonomy_class
-                == NeuronTaxonomy.CLEAN_MONOSEMANTIC
+            AgentHypothesisResponseSchema.model_validate(out).taxonomy_class
+            == NeuronTaxonomy.CLEAN_MONOSEMANTIC
         )
 
     def test_section_5_1_forward_mode_ad_single_pass_circuit_tracer(
@@ -1227,3 +1251,198 @@ class TestProductionHardeningAndSection5Capabilities:
         )
         assert len(res_l1.selected_neurons) == 2
         assert res_l1.joint_ablation_kl > 0.0
+
+
+# =============================================================================
+# 12. New Tests for SwiGLU Double-Neg, Next-Token,
+#     Upstream Circuits, Stratified Reservoir, Sequential Specs & Runtime Gates
+# =============================================================================
+class TestReviewFixesAndEssayCompleteness:
+    def test_swiglu_double_negative_route_detection_and_separation(self):
+        """
+        Verifies that when SwiGLU gate < 0 and up < 0 multiply to produce a > 0,
+        StreamingLayerStats flags `is_double_negative_route`, increments `double_neg_count`,
+        and keeps double-negative activations out of the true positive quantile buckets.
+        """
+        tracker = StreamingLayerStats("swiglu_layer", num_neurons=1, top_k=4)
+        # Token 0: gate=+3.0, up=+4.0 -> act=+11.43 (True positive peak)
+        # Token 1: gate=-1.2, up=-5.0 -> act=+1.40  (SwiGLU Double-Negative route!)
+        # Token 2: gate=+2.0, up=+3.0 -> act=+5.28  (True positive secondary branch)
+        acts = torch.tensor([[[11.43], [1.40], [5.28]]])
+        gates = torch.tensor([[[3.0], [-1.2], [2.0]]])
+        ups = torch.tensor([[[4.0], [-5.0], [3.0]]])
+        tokens = [["peak_tok", "dbl_neg_tok", "sec_tok"]]
+
+        tracker.update(
+            acts,
+            sample_ids=[0],
+            tokens_per_sample=tokens,
+            contexts_per_sample=["peak_tok dbl_neg_tok sec_tok"],
+            gate_activations=gates,
+            up_activations=ups,
+        )
+        prof = tracker.export_profile(0)
+        assert prof.double_negative_positive_rate == pytest.approx(1.0 / 3.0, rel=1e-3)
+        assert len(prof.double_negative_samples) == 1
+        assert prof.double_negative_samples[0].token_str == "dbl_neg_tok"
+        assert prof.double_negative_samples[0].is_double_negative_route is True
+
+        bucket_tokens = {
+            s.token_str
+            for samples in prof.positive_quantile_buckets.values()
+            for s in samples
+        }
+        assert "peak_tok" in bucket_tokens
+        assert "sec_tok" in bucket_tokens
+        assert "dbl_neg_tok" not in bucket_tokens
+
+    def test_forward_next_token_context_populated(self, demo_session: WorkbenchSession):
+        """
+        Verifies that `next_token_str` and `window_str` (`[token] -> next_token`)
+        are populated on audited ActivationSamples ("Titanic -> boat" forward context).
+        """
+        prof = demo_session.injector.get_neuron_profile("mlp_block_0.down_proj", 7)
+        assert any(s.next_token_str is not None for s in prof.top_positive_samples)
+        assert any(
+            s.window_str is not None and "->" in s.window_str
+            for s in prof.top_positive_samples
+        )
+
+    def test_incoming_upstream_circuit_decomposition(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies `trace_incoming_circuit` decomposes which upstream neurons in Layer 0
+        drive target Neuron #12 in Layer 1, surfacing Layer 0 Neuron #7 as the top driver.
+        """
+        inc_graph = demo_session.injector.trace_incoming_circuit(
+            src_layer="mlp_block_0.down_proj",
+            dst_layer="mlp_block_1.down_proj",
+            dst_neuron=12,
+            inputs=sample_prompt_ids,
+            dst_pole=PoleType.POSITIVE,
+            top_k=6,
+        )
+        assert inc_graph.dst_neuron == 12
+        top_up_ids = [e.src_neuron for e in inc_graph.top_excitatory(3)]
+        assert 7 in top_up_ids
+
+        l1_hyp = demo_session.injector.explain_neuron(
+            layer_name="mlp_block_1.down_proj",
+            neuron_idx=12,
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=demo_session.unembed_weight,
+            src_layer="mlp_block_0.down_proj",
+            circuit_inputs=sample_prompt_ids,
+        )
+        assert any("Upstream incoming circuit drivers" in b for b in l1_hyp.recursive_offshoots)
+
+    def test_stratified_quantile_reservoir_and_unbiased_percentile(self):
+        """
+        Verifies that streaming small activations followed by large activations populates
+        all three quantile bands (`peak_trunk`, `secondary_branch`, `tertiary_offshoot`)
+        and computes accurate empirical percentiles without top-k outlier bias.
+        """
+        tracker = StreamingLayerStats("test_layer", num_neurons=1, top_k=4)
+        b1 = torch.linspace(0.1, 0.5, steps=40).unsqueeze(1)
+        b2 = torch.linspace(1.0, 10.0, steps=60).unsqueeze(1)
+
+        tracker.update(b1, tokens_per_sample=[[f"small_{i}" for i in range(40)]])
+        tracker.update(b2, tokens_per_sample=[[f"full_{i}" for i in range(60)]])
+
+        prof = tracker.export_profile(0)
+        assert len(prof.positive_quantile_buckets["peak_trunk"]) > 0
+        assert len(prof.positive_quantile_buckets["secondary_branch"]) > 0
+        assert len(prof.positive_quantile_buckets["tertiary_offshoot"]) > 0
+
+        p50 = tracker.compute_adaptive_thresholds([0], percentile=50.0)[0]
+        assert 1.5 <= p50 <= 4.0
+
+    def test_sequential_same_neuron_specs_compiled_and_weight_folded_equivalence(
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        tmp_path: Path,
+    ):
+        """
+        Verifies that registering multiple sequential interventions on the same neuron
+        (HARD_CLAMP=-10.0 followed by HARD_CLAMP=+6.0 and ADDITIVE_STEER=+2.0 -> final +8.0)
+        yields identical outputs across active hooks, compiled residual vectors, and weight folding.
+        """
+        model_copy = copy.deepcopy(demo_session.model)
+        inj = NeuralInjector(model_copy)
+        layer = "mlp_block_0.down_proj"
+
+        inj.clamp_neurons(layer, neuron_indices=[7], value=-10.0)
+        inj.clamp_neurons(layer, neuron_indices=[7], value=6.0)
+        inj.steer_neurons(layer, neuron_indices=[7], delta=2.0)
+
+        with torch.no_grad(), inj.active_injection():
+            expected_hook_logits = model_copy(sample_prompt_ids)
+
+        json_file = tmp_path / "seq_preset.json"
+        inj.export_production_preset(save_json_path=str(json_file))
+
+        runtime = ProductionSteeringRuntime(model_copy, json_file)
+        with torch.no_grad(), runtime.active(use_compiled_residual_vectors=True):
+            compiled_logits = model_copy(sample_prompt_ids)
+
+        assert torch.allclose(expected_hook_logits, compiled_logits, atol=1e-4)
+
+        inj.fold_interventions_into_weights()
+        with torch.no_grad():
+            folded_logits = model_copy(sample_prompt_ids)
+
+        assert torch.allclose(expected_hook_logits, folded_logits, atol=1e-4)
+
+    def test_cross_layer_conditional_gate_in_production_runtime_and_order_check(
+        self,
+        demo_session: WorkbenchSession,
+        sample_prompt_ids: torch.Tensor,
+        sql_prompt_ids: torch.Tensor,
+        tmp_path: Path,
+    ):
+        """
+        Verifies that a downstream detector raises ValueError and an upstream cross-layer
+        CONDITIONAL_GATE exported to a preset JSON triggers properly inside `ProductionSteeringRuntime`.
+        """
+        inj = demo_session.injector
+        inj.clear_interventions()
+
+        with pytest.raises(ValueError, match="executes after"):
+            inj.add_conditional_gate(
+                target_layer="mlp_block_0.down_proj",
+                target_neurons=[7],
+                detector_layer="mlp_block_1.down_proj",
+                detector_neuron=12,
+                threshold=0.5,
+            )
+
+        inj.add_conditional_gate(
+            target_layer="mlp_block_1.down_proj",
+            target_neurons=[12],
+            detector_layer="mlp_block_0.down_proj",
+            detector_neuron=7,
+            detector_pole=PoleType.POSITIVE,
+            threshold=1.0,
+            action_mode=InterventionMode.HARD_CLAMP,
+            value=-15.0,
+            sequence_scope="any_token",
+        )
+
+        with torch.no_grad(), inj.active_injection():
+            expected_pos_logits = demo_session.model(sample_prompt_ids)
+            expected_neg_logits = demo_session.model(sql_prompt_ids)
+
+        json_file = tmp_path / "cond_gate_preset.json"
+        inj.export_production_preset(save_json_path=str(json_file))
+        inj.clear_interventions()
+
+        runtime = ProductionSteeringRuntime(demo_session.model, json_file)
+        with torch.no_grad(), runtime.active(use_compiled_residual_vectors=False):
+            rt_pos_logits = demo_session.model(sample_prompt_ids)
+            rt_neg_logits = demo_session.model(sql_prompt_ids)
+
+        assert torch.allclose(expected_pos_logits, rt_pos_logits, atol=1e-4)
+        assert torch.allclose(expected_neg_logits, rt_neg_logits, atol=1e-4)

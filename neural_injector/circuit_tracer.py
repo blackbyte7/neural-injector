@@ -24,14 +24,16 @@ if TYPE_CHECKING:
 
 class CircuitTracer:
     """
-    Traces structural and causal neuron-to-neuron circuits across layers.
+    Traces structural and causal neuron-to-neuron circuits across layers (both
+    downstream L_src -> L_dst and incoming upstream L_src -> dst_neuron).
     Designed around the 'Neural Networks Are Already Clean' paradigm:
     treats individual neuron poles as interpretable routing units ('verbs')
     and measures how an upstream pole excites, inhibits, or gates downstream neurons.
 
     Uses Single-Pass Forward-Mode Automatic Differentiation (`torch.autograd.forward_ad`)
     to compute exact Jacobians d(A_dst)/d(a_src) across all downstream neurons and layers
-    simultaneously in a single forward pass (Sections 4.4 & 5.1).
+    simultaneously in a single forward pass (Sections 4.4 & 5.1), and reverse-mode
+    vector-Jacobian products for incoming circuit decomposition.
     """
 
     def __init__(self, injector: NeuralInjector):
@@ -39,7 +41,7 @@ class CircuitTracer:
         self.model = injector.model
 
     # -------------------------------------------------------------------------
-    # 1. Static Structural Virtual Weights (Weight-Space Circuitry)
+    # 1. Static Structural Virtual Weights (Downstream & Incoming)
     # -------------------------------------------------------------------------
     @torch.no_grad()
     def compute_virtual_weights(
@@ -122,6 +124,89 @@ class CircuitTracer:
             virtual_gate = (
                 torch.mv(w_gate, src_vec) if w_gate.shape[1] == src_vec.shape[0] else zeros
             )
+        else:
+            virtual_gate = zeros
+
+        return virtual_up, virtual_gate, cos_sim
+
+    @torch.no_grad()
+    def compute_incoming_virtual_weights(
+        self,
+        src_layer: str,
+        dst_layer: str,
+        dst_neuron: int,
+        apply_pre_norm_scaling: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Computes incoming virtual weights from ALL neurons in `src_layer` into a single
+        target `dst_neuron` in `dst_layer`.
+
+        Returns three 1D tensors of shape [num_src_neurons]:
+          - virtual_up:   <W_up^{(dst)}[dst_neuron, :], W_down^{(src)}[:, i]>
+          - virtual_gate: <W_gate^{(dst)}[dst_neuron, :], W_down^{(src)}[:, i]>
+          - cos_sim:      Cosine similarity between each src write vector and dst_neuron's read vector
+        """
+        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
+        dst_write_mod, dst_up_mod, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(
+            self.model, dst_layer
+        )
+        _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
+
+        device = next(self.model.parameters()).device
+        zeros = torch.zeros(num_src, dtype=torch.float32, device=device)
+
+        if not hasattr(src_write_mod, "weight"):
+            return zeros, zeros, zeros
+
+        # Extract all src write columns: shape [d_model, num_src]
+        w_src = src_write_mod.weight.detach()
+        if w_src.ndim == 3:
+            w_down = w_src.mean(dim=0).to(dtype=torch.float32)
+        elif src_write_mod.__class__.__name__ == "Conv1D":
+            w_down = w_src.T.to(dtype=torch.float32)
+        else:
+            w_down = w_src.to(dtype=torch.float32)
+
+        target_device = w_down.device
+        zeros = zeros.to(target_device)
+
+        if apply_pre_norm_scaling:
+            pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, dst_layer)
+            if pre_norm is not None and hasattr(pre_norm, "weight"):
+                norm_w = pre_norm.weight.detach().to(device=target_device, dtype=torch.float32)
+                if norm_w.shape[0] == w_down.shape[0]:
+                    w_down = w_down * norm_w.unsqueeze(1)
+
+        read_mod = dst_up_mod if dst_up_mod is not None else dst_write_mod
+        if read_mod is None or not hasattr(read_mod, "weight"):
+            return zeros, zeros, zeros
+
+        w_up = read_mod.weight.detach().to(device=target_device, dtype=torch.float32)
+        if w_up.ndim == 3:
+            w_up = w_up.mean(dim=0)
+        elif read_mod.__class__.__name__ == "Conv1D":
+            w_up = w_up.T
+
+        if w_up.shape[1] != w_down.shape[0] or dst_neuron >= w_up.shape[0]:
+            return zeros, zeros, zeros
+
+        dst_up_vec = w_up[dst_neuron, :]  # [d_model]
+        virtual_up = torch.mv(w_down.T, dst_up_vec)
+
+        dst_up_norm = F.normalize(dst_up_vec.unsqueeze(0), dim=-1).squeeze(0)
+        w_down_norm = F.normalize(w_down.T, dim=-1)
+        cos_sim = torch.mv(w_down_norm, dst_up_norm)
+
+        if dst_gate_mod is not None and hasattr(dst_gate_mod, "weight"):
+            w_gate = dst_gate_mod.weight.detach().to(device=target_device, dtype=torch.float32)
+            if w_gate.ndim == 3:
+                w_gate = w_gate.mean(dim=0)
+            elif dst_gate_mod.__class__.__name__ == "Conv1D":
+                w_gate = w_gate.T
+            if w_gate.shape[1] == w_down.shape[0] and dst_neuron < w_gate.shape[0]:
+                virtual_gate = torch.mv(w_down.T, w_gate[dst_neuron, :])
+            else:
+                virtual_gate = zeros
         else:
             virtual_gate = zeros
 
@@ -239,12 +324,12 @@ class CircuitTracer:
                     else:
                         dst_tang_flat = tang.reshape(-1, n_dst)
                     if (
-                            active_mask_holder
-                            and active_mask_holder[-1].shape[0] == dst_tang_flat.shape[0]
+                        active_mask_holder
+                        and active_mask_holder[-1].shape[0] == dst_tang_flat.shape[0]
                     ):
                         d_mask = active_mask_holder[-1].to(dst_tang_flat.device)
                         jac_vec = (
-                                dst_tang_flat[d_mask].float().sum(dim=0) / active_count_holder[0]
+                            dst_tang_flat[d_mask].float().sum(dim=0) / active_count_holder[0]
                         )
                     else:
                         jac_vec = dst_tang_flat.float().mean(dim=0)
@@ -284,7 +369,7 @@ class CircuitTracer:
         return captured_tangents
 
     # -------------------------------------------------------------------------
-    # 3. Causal Pole-to-Pole Circuit Tracing (Activation Patching + Forward AD)
+    # 3. Causal Pole-to-Pole Circuit Tracing (Downstream & Incoming Upstream)
     # -------------------------------------------------------------------------
     def trace_circuit(
         self,
@@ -660,6 +745,224 @@ class CircuitTracer:
             self.injector.ecology_map.register_circuit_graph(graph)
         return graph
 
+    def trace_incoming_circuit(
+        self,
+        src_layer: str,
+        dst_layer: str,
+        dst_neuron: int,
+        inputs: Any,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        dst_pole: PoleType = PoleType.POSITIVE,
+        active_threshold: float = 1e-5,
+        top_k: int = 8,
+    ) -> CircuitGraph:
+        """
+        Traces the incoming upstream circuit from ALL neurons in `src_layer` into a single
+        target `(dst_layer, dst_neuron)` (Cammarata's upstream decomposition of recursive offshoots):
+          1. Computes exact reverse-mode Jacobian sensitivities `d(A_dst[dst_neuron]) / d(a_src)`
+             across all upstream neurons in `src_layer` in a single backward pass.
+          2. Combines first-order attribution `a_src * d(A_dst)/d(a_src)` with incoming virtual
+             weights (`W_up` and `W_gate`) to select the top candidate upstream contributors.
+          3. Runs exact surgical pole-ablation verification on the top candidates to populate
+             `mean_causal_delta` and registers all discovered edges into `self.injector.ecology_map`.
+        """
+        run_fwd = forward_fn or (lambda m, inp: m(inp))
+        src_mod, src_target, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
+        dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
+        is_src_conv = isinstance(src_mod, nn.Conv2d)
+        is_dst_conv = isinstance(dst_mod, nn.Conv2d)
+
+        captured_src: List[torch.Tensor] = []
+        captured_dst: List[torch.Tensor] = []
+
+        def _cap_src_pre(_m: nn.Module, inp: Tuple[Any, ...]):
+            if inp and isinstance(inp[0], torch.Tensor):
+                t = inp[0].detach().clone().requires_grad_(True)
+                captured_src.append(t)
+                return (t,) + inp[1:]
+            return inp
+
+        def _cap_src_fwd(_m: nn.Module, _inp: Tuple[Any, ...], out: Any):
+            t0 = out[0] if isinstance(out, tuple) else out
+            if isinstance(t0, torch.Tensor):
+                t = t0.detach().clone().requires_grad_(True)
+                captured_src.append(t)
+                return (t,) + out[1:] if isinstance(out, tuple) else t
+            return out
+
+        h_src = (
+            src_mod.register_forward_pre_hook(_cap_src_pre)
+            if src_target == "input"
+            else src_mod.register_forward_hook(_cap_src_fwd)
+        )
+        h_dst = (
+            dst_mod.register_forward_pre_hook(
+                lambda _m, inp: (
+                    captured_dst.append(inp[0])
+                    if inp and isinstance(inp[0], torch.Tensor)
+                    else None
+                )
+            )
+            if dst_target == "input"
+            else dst_mod.register_forward_hook(
+                lambda _m, _inp, out: captured_dst.append(
+                    out[0] if isinstance(out, tuple) else out
+                )
+            )
+        )
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with self.injector.without_interventions(), torch.enable_grad():
+                run_fwd(self.model, inputs)
+                src_act = captured_src[-1]
+                dst_act = captured_dst[-1]
+
+                dst_flat = (
+                    dst_act.permute(0, 2, 3, 1).reshape(-1, num_dst)
+                    if (is_dst_conv and dst_act.ndim == 4)
+                    else dst_act.reshape(-1, num_dst)
+                )
+                dst_col = dst_flat[:, dst_neuron]
+                if dst_pole == PoleType.POSITIVE:
+                    amask = dst_col.detach() > active_threshold
+                elif dst_pole == PoleType.NEGATIVE:
+                    amask = dst_col.detach() < -active_threshold
+                else:
+                    amask = dst_col.detach().abs() > active_threshold
+                if not amask.any():
+                    amask = torch.ones_like(dst_col, dtype=torch.bool)
+
+                target_scalar = dst_col[amask].float().mean()
+                grad_src = torch.autograd.grad(
+                    outputs=target_scalar,
+                    inputs=src_act,
+                    retain_graph=False,
+                    allow_unused=True,
+                )[0]
+        finally:
+            h_src.remove()
+            h_dst.remove()
+
+        src_flat = (
+            src_act.detach().permute(0, 2, 3, 1).reshape(-1, num_src).float()
+            if (is_src_conv and src_act.ndim == 4)
+            else src_act.detach().reshape(-1, num_src).float()
+        )
+        clean_dst_col = dst_col.detach().float()
+        clean_dst_mean = float(clean_dst_col[amask].mean().item())
+
+        if grad_src is not None:
+            g_flat = (
+                grad_src.detach().permute(0, 2, 3, 1).reshape(-1, num_src).float()
+                if (is_src_conv and grad_src.ndim == 4)
+                else grad_src.detach().reshape(-1, num_src).float()
+            )
+            # Note: target_scalar was mean over `amask`, so sum across positions gives mean sensitivity
+            jac_vec = g_flat.sum(dim=0)
+            first_order_attrib = (src_flat * g_flat).sum(dim=0)
+        else:
+            jac_vec = torch.zeros(num_src, dtype=torch.float32, device=src_flat.device)
+            first_order_attrib = torch.zeros(num_src, dtype=torch.float32, device=src_flat.device)
+
+        v_up, v_gate, cos_sim = self.compute_incoming_virtual_weights(
+            src_layer, dst_layer, dst_neuron
+        )
+        v_up = v_up.to(device=src_flat.device)
+        v_gate = v_gate.to(device=src_flat.device)
+        cos_sim = cos_sim.to(device=src_flat.device)
+
+        src_mean_act = src_flat.mean(dim=0)
+        ranking_score = (
+            first_order_attrib.abs()
+            + 0.1 * (src_mean_act.abs() * (v_up.abs() + v_gate.abs()))
+        )
+        k_select = min(top_k, num_src)
+        _, top_src_indices = torch.topk(ranking_score, k=k_select)
+
+        edges: List[CircuitEdge] = []
+        dst_ab_list: List[torch.Tensor] = []
+        h_dst_ab = (
+            dst_mod.register_forward_pre_hook(
+                lambda _m, inp: (
+                    dst_ab_list.append(inp[0].detach())
+                    if inp and isinstance(inp[0], torch.Tensor)
+                    else None
+                )
+            )
+            if dst_target == "input"
+            else dst_mod.register_forward_hook(
+                lambda _m, _inp, out: dst_ab_list.append(
+                    (out[0] if isinstance(out, tuple) else out).detach()
+                )
+            )
+        )
+
+        try:
+            with torch.no_grad():
+                for s_idx in top_src_indices.tolist():
+                    s_mean = float(src_mean_act[s_idx].item())
+                    s_pole = PoleType.POSITIVE if s_mean >= 0.0 else PoleType.NEGATIVE
+                    spec = InterventionSpec(
+                        layer_name=src_layer,
+                        neuron_indices=[s_idx],
+                        mode=InterventionMode.ZERO_ABLATE,
+                        pole=s_pole,
+                        value=0.0,
+                    )
+                    dst_ab_list.clear()
+                    with self.injector.temporary_interventions([spec]):
+                        run_fwd(self.model, inputs)
+                    ab_raw = dst_ab_list[-1]
+                    ab_flat = (
+                        ab_raw.permute(0, 2, 3, 1).reshape(-1, num_dst).float()
+                        if (is_dst_conv and ab_raw.ndim == 4)
+                        else ab_raw.reshape(-1, num_dst).float()
+                    )
+                    ab_col = ab_flat[:, dst_neuron]
+                    delta_vec = clean_dst_col[amask] - ab_col[amask]
+                    m_delta = float(delta_vec.mean().item())
+                    max_idx = int(delta_vec.abs().argmax().item())
+                    max_delta = float(delta_vec[max_idx].item())
+                    ab_mean = float(ab_col[amask].mean().item())
+
+                    edges.append(
+                        CircuitEdge(
+                            src_layer=src_layer,
+                            src_neuron=s_idx,
+                            src_pole=s_pole,
+                            dst_layer=dst_layer,
+                            dst_neuron=dst_neuron,
+                            dst_pole_tendency=dst_pole,
+                            mean_causal_delta=m_delta,
+                            max_causal_delta=max_delta,
+                            clean_dst_mean=clean_dst_mean,
+                            ablated_dst_mean=ab_mean,
+                            jacobian_sensitivity=float(jac_vec[s_idx].item()),
+                            virtual_weight_up=float(v_up[s_idx].item()),
+                            virtual_weight_gate=float(v_gate[s_idx].item()),
+                            static_alignment_cos=float(cos_sim[s_idx].item()),
+                        )
+                    )
+        finally:
+            h_dst_ab.remove()
+            if was_training:
+                self.model.train()
+
+        edges.sort(key=lambda e: abs(e.mean_causal_delta), reverse=True)
+        graph = CircuitGraph(
+            src_layer=src_layer,
+            dst_layer=dst_layer,
+            src_neuron=edges[0].src_neuron if edges else 0,
+            src_pole=dst_pole,
+            edges=edges,
+            dst_neuron=dst_neuron,
+        )
+        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
+            self.injector.ecology_map.register_circuit_graph(graph)
+        return graph
+
     # -------------------------------------------------------------------------
     # 4. Multi-Hop Circuit Subgraph Tracing (L_0 -> L_1 -> ... -> L_n)
     # -------------------------------------------------------------------------
@@ -717,16 +1020,16 @@ class CircuitTracer:
     # -------------------------------------------------------------------------
     @torch.no_grad()
     def verify_downstream_readout(
-            self,
-            src_layer: str,
-            dst_layer: str,
-            src_neurons: List[int],
-            inputs: Any,
-            weak_threshold: Optional[Union[float, List[float]]] = None,
-            std_multiplier: Optional[float] = 0.75,
-            percentile: Optional[float] = None,
-            readout_tolerance: float = 0.05,
-            forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        self,
+        src_layer: str,
+        dst_layer: str,
+        src_neurons: List[int],
+        inputs: Any,
+        weak_threshold: Optional[Union[float, List[float]]] = None,
+        std_multiplier: Optional[float] = 0.75,
+        percentile: Optional[float] = None,
+        readout_tolerance: float = 0.05,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
     ) -> DownstreamReadoutReport:
         """
         Tests Cammarata's 'Nothing Reads That Combination' hypothesis (Section 3.5):
@@ -779,7 +1082,7 @@ class CircuitTracer:
 
         h_gate = None
         if dst_gate_mod is not None and isinstance(dst_gate_mod, nn.Module) and not isinstance(
-                dst_gate_mod, _SlicedLinearView
+            dst_gate_mod, _SlicedLinearView
         ):
             h_gate = dst_gate_mod.register_forward_hook(
                 lambda _m, _inp, out: captured_gate.append(

@@ -146,7 +146,7 @@ class CircuitEcologyMap:
     Persistent Crossword Graph Store implementing Cammarata's 'Understanding Compounds'
     loop (Section 3.2):
       - Stores verified `BipolarVerbHypothesis` objects indexed by `(layer_name, neuron_idx)`.
-      - Stores directed `CircuitEdge` connections traced across layers.
+      - Stores directed `CircuitEdge` connections traced across layers (both outgoing and incoming).
       - Retrieves upstream and downstream neighbor hypotheses so that when explaining
         neuron `(L, i)`, already-verified motifs of connected neurons in `L-1` and `L+1`
         are injected into the Explainer Agent's context.
@@ -169,19 +169,21 @@ class CircuitEcologyMap:
 
     def register_circuit_graph(self, graph: CircuitGraph) -> None:
         """Indexes all directed edges from a traced CircuitGraph for bidirectional lookup."""
-        src_key = (graph.src_layer, graph.src_neuron)
-        existing_out = {
-            (e.dst_layer, e.dst_neuron): e for e in self.edges_from.get(src_key, [])
-        }
         for edge in graph.edges:
-            existing_out[(edge.dst_layer, edge.dst_neuron)] = edge
+            src_key = (edge.src_layer, edge.src_neuron)
             dst_key = (edge.dst_layer, edge.dst_neuron)
+
+            existing_out = {
+                (e.dst_layer, e.dst_neuron): e for e in self.edges_from.get(src_key, [])
+            }
+            existing_out[dst_key] = edge
+            self.edges_from[src_key] = list(existing_out.values())
+
             existing_in = {
                 (e.src_layer, e.src_neuron): e for e in self.edges_to.get(dst_key, [])
             }
             existing_in[src_key] = edge
             self.edges_to[dst_key] = list(existing_in.values())
-        self.edges_from[src_key] = list(existing_out.values())
 
     def get_neighbor_contexts(
         self, layer_name: str, neuron_idx: int, max_neighbors: int = 6
@@ -236,26 +238,37 @@ class CircuitEcologyMap:
 class HeuristicSynthesisClient:
     """
     Built-in offline analytical synthesizer that inspects the structured NeuronPoleProfile
-    (including Stratified Quantile Activation Buckets and Pole-Specific Selectivity),
-    CircuitGraph, and Crossword Ecology Neighbor clues to formulate a BipolarVerbHypothesis.
+    (including Forward Next-Token clues, SwiGLU Double-Negative Route diagnostics,
+    Stratified Quantile Activation Buckets, and Pole-Specific Selectivity),
+    Downstream & Upstream CircuitGraphs, and Crossword Ecology Neighbor clues
+    to formulate a BipolarVerbHypothesis.
     """
 
     def complete_json(self, _system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         evidence = json.loads(user_prompt)
         prof = evidence.get("neuron_profile", {})
         circuit = evidence.get("downstream_circuit", {})
+        up_circuit = evidence.get("upstream_circuit", {})
         neighbors = evidence.get("ecology_neighbors", [])
 
         pos_samples = prof.get("top_positive_samples", [])
         neg_samples = prof.get("top_negative_samples", [])
         pos_tokens = list(dict.fromkeys(s["token"] for s in pos_samples if s.get("token")))
         neg_tokens = list(dict.fromkeys(s["token"] for s in neg_samples if s.get("token")))
+        pos_next_tokens = list(
+            dict.fromkeys(
+                s["next_token"]
+                for s in pos_samples
+                if s.get("next_token") and s.get("next_token") != "<eos>"
+            )
+        )
 
         promoted = [t[0] for t in prof.get("top_promoted_tokens", [])[:4]]
         suppressed = [t[0] for t in prof.get("top_suppressed_tokens", [])[:4]]
 
         excited_dst = [e["dst_neuron"] for e in circuit.get("top_excited_downstream", [])[:3]]
         inhibited_dst = [e["dst_neuron"] for e in circuit.get("top_inhibited_downstream", [])[:3]]
+        excited_up = [e["src_neuron"] for e in up_circuit.get("top_excitatory_upstream", [])[:3]]
 
         selectivity = float(prof.get("pole_selectivity_score", 0.0))
         pos_sel = float(prof.get("pos_pole_selectivity_score", selectivity))
@@ -272,8 +285,13 @@ class HeuristicSynthesisClient:
             taxonomy = NeuronTaxonomy.DEAD_OR_NOISY.value
             confidence = 0.40
 
+        next_clue = (
+            f" (preparing next-token prediction toward [{' / '.join(pos_next_tokens[:2])}])"
+            if pos_next_tokens
+            else ""
+        )
         pos_motif = (
-            f"Detects and amplifies [{' / '.join(pos_tokens[:3])}] features, driving output toward [{' / '.join(promoted[:2])}]"
+            f"Detects and amplifies [{' / '.join(pos_tokens[:3])}] features{next_clue}, driving output toward [{' / '.join(promoted[:2])}]"
             if pos_tokens
             else "Latent excitatory activation regime"
         )
@@ -313,6 +331,22 @@ class HeuristicSynthesisClient:
         if tert_tokens:
             offshoots.append(
                 f"Tertiary quantile offshoot (15-40% max): weak semantic extension onto {tert_tokens[:3]}"
+            )
+        dbl_neg_rate = float(prof.get("double_negative_positive_rate", 0.0))
+        if dbl_neg_rate > 0.0:
+            dbl_toks = list(
+                dict.fromkeys(
+                    s["token"]
+                    for s in prof.get("double_negative_samples", [])
+                    if s.get("token")
+                )
+            )
+            offshoots.append(
+                f"SwiGLU double-negative route (gate<0, up<0; {dbl_neg_rate * 100:.1f}% of +Pole): separated from main positive pole on {dbl_toks[:3]}"
+            )
+        if excited_up:
+            offshoots.append(
+                f"Upstream incoming circuit drivers from {up_circuit.get('source_layer', 'L-1')}: neurons {excited_up}"
             )
         if len(pos_tokens) > 2 and not offshoots:
             offshoots.append(
@@ -356,9 +390,10 @@ class NeuronExplainerAgent:
     Automated Mechanistic Interpretability Agent implementing the methodology from
     'Neural Networks Are Already Clean' (Cammarata / Goodfire, 2026).
 
-    1. Packages Bipolar Neuron Profiles (+Pole / -Pole contexts, Pole-Specific Selectivities,
-       Stratified Quantile Activation Buckets, and Direct Logit Attribution) alongside
-       Downstream Circuit Ecology and verified Crossword Neighbor Clues (`CircuitEcologyMap`).
+    1. Packages Bipolar Neuron Profiles (+Pole / -Pole contexts, Forward Next-Token clues,
+       SwiGLU Double-Negative Route diagnostics, Pole-Specific Selectivities, Stratified
+       Quantile Activation Buckets, and Direct Logit Attribution) alongside Downstream &
+       Upstream Circuit Ecology and verified Crossword Neighbor Clues (`CircuitEcologyMap`).
     2. Prompts an LLM Agent to synthesize a unified 'Verb' hypothesis and recursive offshoots.
     3. Automatically runs closed-loop surgical interventions (Zero-Ablation & Pole Clamping)
        on the live PyTorch model to empirically verify or falsify the agent's hypothesis.
@@ -366,14 +401,14 @@ class NeuronExplainerAgent:
 
     SYSTEM_PROMPT = """You are a senior mechanistic interpretability researcher auditing single neurons under the 'Neural Networks Are Already Clean' framework.
 Your task is to analyze the provided JSON evidence for a single neuron (including its Positive Pole activating contexts,
- Negative Pole activating contexts, Stratified Quantile Activation Buckets, Direct Vocabulary Logit Attribution,
- Downstream Layer Circuit Connections, and any already-verified Crossword Ecology Neighbor Clues) and
- return a strict JSON object with the following schema:
+ Negative Pole activating contexts, `next_token` forward predictions, SwiGLU `double_negative_samples` where gate<0 and up<0,
+ Stratified Quantile Activation Buckets, Direct Vocabulary Logit Attribution, Upstream/Downstream Layer Circuit Connections,
+ and any already-verified Crossword Ecology Neighbor Clues) and return a strict JSON object with the following schema:
 {
-  "positive_pole_motif": "Concise description of what excites the positive pole (>0)",
+  "positive_pole_motif": "Concise description of what excites the positive pole (>0), noting both current-token detection and next-token preparation",
   "negative_pole_motif": "Concise description of what drives the negative pole (<0)",
   "unified_verb_hypothesis": "Single sentence explaining how this neuron acts as a differential 'verb' or router separating the Positive Pole from the Negative Pole and routing signals to downstream neurons.",
-  "recursive_offshoots": ["List of related secondary semantic offshoots across quantile bands or downstream specializations"],
+  "recursive_offshoots": ["List of related secondary semantic offshoots across quantile bands, upstream drivers, or downstream specializations"],
   "taxonomy_class": "clean_monosemantic | structured_recursive_mixture | true_polysemantic | dead_or_noisy",
   "confidence_score": 0.0 to 1.0,
   "proposed_experiment": {
@@ -454,22 +489,27 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         profile: NeuronPoleProfile,
         circuit: Optional[CircuitGraph] = None,
         ecology_neighbors: Optional[List[EcologyNeighborContext]] = None,
+        upstream_circuit: Optional[CircuitGraph] = None,
     ) -> Dict[str, Any]:
         """
-        Serializes a NeuronPoleProfile (including pole-specific selectivities and
-        stratified quantile buckets), optional CircuitGraph, and optional Crossword
-        Ecology Neighbor contexts into a compact agent JSON payload.
+        Serializes a NeuronPoleProfile (including forward next-token clues, SwiGLU
+        double-negative route diagnostics, pole-specific selectivities, and stratified
+        quantile buckets), optional downstream & upstream CircuitGraphs, and optional
+        Crossword Ecology Neighbor contexts into a compact agent JSON payload.
         """
+        def _fmt_sample(s: Any) -> Dict[str, Any]:
+            return {
+                "activation": round(s.activation_value, 4),
+                "token": s.token_str,
+                "next_token": s.next_token_str,
+                "window": s.window_str,
+                "context": s.context_str,
+                "is_double_negative_route": s.is_double_negative_route,
+            }
+
         def _fmt_buckets(buckets: Dict[str, List[Any]]) -> Dict[str, List[Dict[str, Any]]]:
             return {
-                band: [
-                    {
-                        "activation": round(s.activation_value, 4),
-                        "token": s.token_str,
-                        "context": s.context_str,
-                    }
-                    for s in samples[:4]
-                ]
+                band: [_fmt_sample(s) for s in samples[:4]]
                 for band, samples in buckets.items()
             }
 
@@ -488,22 +528,10 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 "pos_taxonomy_class": profile.pos_taxonomy_class.value,
                 "neg_pole_selectivity_score": round(profile.neg_pole_selectivity_score, 3),
                 "neg_taxonomy_class": profile.neg_taxonomy_class.value,
-                "top_positive_samples": [
-                    {
-                        "activation": round(s.activation_value, 4),
-                        "token": s.token_str,
-                        "context": s.context_str,
-                    }
-                    for s in profile.top_positive_samples
-                ],
-                "top_negative_samples": [
-                    {
-                        "activation": round(s.activation_value, 4),
-                        "token": s.token_str,
-                        "context": s.context_str,
-                    }
-                    for s in profile.top_negative_samples
-                ],
+                "double_negative_positive_rate": round(profile.double_negative_positive_rate, 4),
+                "double_negative_samples": [_fmt_sample(s) for s in profile.double_negative_samples[:4]],
+                "top_positive_samples": [_fmt_sample(s) for s in profile.top_positive_samples],
+                "top_negative_samples": [_fmt_sample(s) for s in profile.top_negative_samples],
                 "positive_quantile_buckets": _fmt_buckets(profile.positive_quantile_buckets),
                 "negative_quantile_buckets": _fmt_buckets(profile.negative_quantile_buckets),
                 "top_promoted_tokens": profile.top_promoted_tokens,
@@ -512,6 +540,8 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         }
         if circuit is not None:
             payload["downstream_circuit"] = circuit.to_agent_payload()
+        if upstream_circuit is not None:
+            payload["upstream_circuit"] = upstream_circuit.to_incoming_agent_payload()
         if ecology_neighbors:
             payload["ecology_neighbors"] = [
                 {
@@ -534,9 +564,12 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         profile: NeuronPoleProfile,
         circuit: Optional[CircuitGraph] = None,
         ecology_neighbors: Optional[List[EcologyNeighborContext]] = None,
+        upstream_circuit: Optional[CircuitGraph] = None,
     ) -> BipolarVerbHypothesis:
         """Calls the LLM agent to synthesize a BipolarVerbHypothesis and verification plan."""
-        evidence = self.build_evidence_payload(profile, circuit, ecology_neighbors)
+        evidence = self.build_evidence_payload(
+            profile, circuit, ecology_neighbors, upstream_circuit=upstream_circuit
+        )
         raw_resp = self.llm_client.complete_json(
             system_prompt=self.SYSTEM_PROMPT,
             user_prompt=json.dumps(evidence, indent=2),
@@ -826,11 +859,12 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
         dst_layer: Optional[str] = None,
         circuit_inputs: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
+        src_layer: Optional[str] = None,
     ) -> BipolarVerbHypothesis:
         """
         Full end-to-end closed-loop agentic workflow:
           1. Extracts the audited NeuronPoleProfile (+ Direct Logit Attribution + Quantile Buckets).
-          2. Optionally traces the downstream circuit to `dst_layer`.
+          2. Optionally traces the downstream circuit to `dst_layer` and incoming upstream circuit from `src_layer`.
           3. Queries `self.injector.ecology_map` for already-verified upstream/downstream neighbor clues.
           4. Synthesizes a BipolarVerbHypothesis via the LLM Agent and empirically verifies it.
           5. Registers the verified hypothesis back into `self.injector.ecology_map`.
@@ -854,11 +888,27 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 top_k=8,
             )
 
+        upstream_circuit: Optional[CircuitGraph] = None
+        if src_layer is not None and circuit_inputs is not None:
+            upstream_circuit = self.injector.trace_incoming_circuit(
+                src_layer=src_layer,
+                dst_layer=layer_name,
+                dst_neuron=neuron_idx,
+                inputs=circuit_inputs,
+                dst_pole=PoleType.POSITIVE,
+                top_k=6,
+            )
+
         neighbors: List[EcologyNeighborContext] = []
         if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
             neighbors = self.injector.ecology_map.get_neighbor_contexts(layer_name, neuron_idx)
 
-        hypothesis = self.generate_hypothesis(profile, circuit, ecology_neighbors=neighbors)
+        hypothesis = self.generate_hypothesis(
+            profile,
+            circuit,
+            ecology_neighbors=neighbors,
+            upstream_circuit=upstream_circuit,
+        )
         self.verify_hypothesis(
             hypothesis,
             tok_to_id=tok_to_id,
