@@ -24,7 +24,9 @@ class InterventionKernel:
     High-efficiency vectorized tensor operations that manipulate neuron values
     during forward passes with minimal memory or latency overhead.
     Supports scalar values, native per-neuron adaptive thresholds/values, and
-    closed-loop dynamic concept gating (`InterventionMode.CONDITIONAL_GATE`).
+    closed-loop dynamic concept gating (`InterventionMode.CONDITIONAL_GATE`),
+    including stateful KV-cache latching (`sticky_on_decode`) across single-token
+    autoregressive generation steps.
     """
 
     @staticmethod
@@ -32,11 +34,20 @@ class InterventionKernel:
         detector_acts: torch.Tensor,
         condition: GateConditionSpec,
         is_conv2d: bool = False,
+        latched_masks: Optional[Dict[int, torch.Tensor]] = None,
+        spec_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Evaluates whether `condition.detector_neuron` in `detector_acts` satisfies
         the pole and threshold trigger criteria.
         Returns a boolean mask of shape `[B, S, 1]` (3D), `[B, 1]` (2D), or `[B, 1, H, W]` (4D).
+
+        When `condition.sequence_scope == "any_token"` and `condition.sticky_on_decode == True`:
+          - On a multi-token prompt prefill (`S > 1`), stores the sequence-level trigger
+            `[B, 1, 1]` into `latched_masks[spec_id]`.
+          - On subsequent single-token KV-cached decoding steps (`S == 1`), OR-combines
+            the current step's trigger with `latched_masks[spec_id]`, keeping the gate
+            latched open for the remainder of the generated response.
         """
         n_idx = condition.detector_neuron
         if is_conv2d and detector_acts.ndim == 4:
@@ -53,8 +64,24 @@ class InterventionKernel:
             mask = det_slice.abs() > thresh
 
         if condition.sequence_scope == "any_token" and mask.ndim == 3:
-            # Broadcast sequence-wide trigger across all tokens in the sample: [B, 1, 1] -> [B, S, 1]
-            mask = mask.any(dim=1, keepdim=True).expand_as(mask)
+            step_trigger = mask.any(dim=1, keepdim=True)  # [B, 1, 1]
+            if (
+                condition.sticky_on_decode
+                and latched_masks is not None
+                and spec_id is not None
+            ):
+                seq_len = mask.shape[1]
+                if seq_len > 1:
+                    latched_masks[spec_id] = step_trigger.detach().clone()
+                else:
+                    prev_latch = latched_masks.get(spec_id)
+                    if prev_latch is not None and prev_latch.shape[0] == step_trigger.shape[0]:
+                        step_trigger = step_trigger | prev_latch.to(
+                            device=step_trigger.device, dtype=torch.bool
+                        )
+                    latched_masks[spec_id] = step_trigger.detach().clone()
+
+            mask = step_trigger.expand_as(mask)
 
         return mask
 
@@ -64,6 +91,7 @@ class InterventionKernel:
         specs: List[InterventionSpec],
         is_conv2d: bool = False,
         conditional_masks: Optional[Dict[int, torch.Tensor]] = None,
+        latched_masks: Optional[Dict[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Applies a list of InterventionSpecs to an activation tensor.
@@ -95,7 +123,11 @@ class InterventionKernel:
                 ):
                     # Same-layer detector: evaluate directly on the incoming activation tensor
                     cond_mask = InterventionKernel.compute_detector_mask(
-                        tensor, spec.gate_condition, is_conv2d=is_conv2d
+                        tensor,
+                        spec.gate_condition,
+                        is_conv2d=is_conv2d,
+                        latched_masks=latched_masks,
+                        spec_id=id(spec),
                     )
                 if cond_mask is None or not cond_mask.any():
                     continue
@@ -255,18 +287,18 @@ class AblationMaskOptimizer:
         self.model = injector.model
 
     def find_synergistic_ablation_set(
-            self,
-            layer_name: str,
-            inputs: Any,
-            max_subset_size: int = 3,
-            candidate_pool_size: int = 16,
-            method: str = "greedy",
-            target_token_ids: Optional[List[int]] = None,
-            pole: PoleType = PoleType.BOTH,
-            l1_steps: int = 15,
-            l1_lr: float = 0.25,
-            l1_penalty: float = 0.01,
-            forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        self,
+        layer_name: str,
+        inputs: Any,
+        max_subset_size: int = 3,
+        candidate_pool_size: int = 16,
+        method: str = "greedy",
+        target_token_ids: Optional[List[int]] = None,
+        pole: PoleType = PoleType.BOTH,
+        l1_steps: int = 15,
+        l1_lr: float = 0.25,
+        l1_penalty: float = 0.01,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
     ) -> SynergisticAblationResult:
         run_fwd = forward_fn or (lambda m, inp: m(inp))
         mod, hook_target, num_neurons = LayerDiscovery.resolve_module(self.model, layer_name)
@@ -330,8 +362,8 @@ class AblationMaskOptimizer:
             if target_token_ids:
                 drop = float(
                     (
-                            clean_logits[..., target_token_ids].mean()
-                            - mod_logits.float()[..., target_token_ids].mean()
+                        clean_logits[..., target_token_ids].mean()
+                        - mod_logits.float()[..., target_token_ids].mean()
                     ).item()
                 )
                 return kl + max(drop, 0.0)
@@ -383,8 +415,8 @@ class AblationMaskOptimizer:
                         kl_term = (clean_probs * (clean_log_probs - step_log_probs)).sum(dim=-1).mean()
                         if target_token_ids:
                             t_drop = (
-                                    clean_logits[..., target_token_ids].mean()
-                                    - step_logits[..., target_token_ids].mean()
+                                clean_logits[..., target_token_ids].mean()
+                                - step_logits[..., target_token_ids].mean()
                             )
                             objective = kl_term + t_drop
                         else:
@@ -458,8 +490,8 @@ class AblationMaskOptimizer:
                 target_shift = (
                     float(
                         (
-                                clean_logits[..., target_token_ids].mean()
-                                - j_logits[..., target_token_ids].mean()
+                            clean_logits[..., target_token_ids].mean()
+                            - j_logits[..., target_token_ids].mean()
                         ).item()
                     )
                     if target_token_ids

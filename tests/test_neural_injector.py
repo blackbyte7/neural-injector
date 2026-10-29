@@ -1446,3 +1446,104 @@ class TestReviewFixesAndEssayCompleteness:
 
         assert torch.allclose(expected_pos_logits, rt_pos_logits, atol=1e-4)
         assert torch.allclose(expected_neg_logits, rt_neg_logits, atol=1e-4)
+
+    def test_multi_token_chain_of_thought_generate_comparison(
+            self, demo_session: WorkbenchSession, tmp_path: Path, capsys: pytest.CaptureFixture
+    ):
+        """
+        Verifies `WorkbenchSession.generate_comparison`, the `generate` CLI command,
+        and `POST /api/generate` steer multi-token autoregressive completions from
+        Cryptography tokens to SQL tokens when Neuron #7 is clamped negatively.
+        """
+        demo_session.injector.clear_interventions()
+        demo_session.injector.clamp_neurons(
+            "mlp_block_0.down_proj", neuron_indices=[7], value=-15.0
+        )
+
+        res = demo_session.generate_comparison(
+            prompt="the system negotiated AES256", max_new_tokens=4
+        )
+        assert len(res["clean_generated_tokens"]) == 4
+        assert len(res["intervened_generated_tokens"]) == 4
+        assert res["tokens_changed_count"] > 0
+        assert set(res["intervened_generated_tokens"]).intersection(
+            {"SELECT", "WHERE", "postgres", "index_scan"}
+        )
+
+        # Verify CLI `generate` command
+        repl = NeuralInjectorREPL(demo_session)
+        repl.do_generate("4 the system negotiated AES256")
+        out = capsys.readouterr().out
+        assert "MULTI-TOKEN GENERATION COMPARISON" in out
+
+        # Verify FastAPI `POST /api/generate`
+        from fastapi.testclient import TestClient
+        from neural_injector.server import create_workbench_app
+
+        app = create_workbench_app(demo_session, allowed_workspace_dir=tmp_path)
+        client = TestClient(app)
+        api_res = client.post(
+            "/api/generate",
+            json={"prompt": "the system negotiated AES256", "max_new_tokens": 4},
+        )
+        assert api_res.status_code == 200
+        assert api_res.json()["tokens_changed_count"] > 0
+        demo_session.injector.clear_interventions()
+
+    def test_sticky_on_decode_kv_cache_latching_across_single_token_steps(
+            self,
+            demo_session: WorkbenchSession,
+            sample_prompt_ids: torch.Tensor,
+            tmp_path: Path,
+    ):
+        """
+        Verifies that when a model decodes token-by-token (`seq_len == 1`, as in
+        KV-cached `model.generate(use_cache=True)`), an `any_token` conditional gate
+        with `sticky_on_decode=True` latches open after the prompt prefill (`seq_len > 1`)
+        and stays active on subsequent neutral single-token steps (`seq_len == 1`).
+        """
+        inj = demo_session.injector
+        inj.clear_interventions()
+
+        inj.add_conditional_gate(
+            target_layer="mlp_block_1.down_proj",
+            target_neurons=[12],
+            detector_layer="mlp_block_0.down_proj",
+            detector_neuron=7,
+            detector_pole=PoleType.POSITIVE,
+            threshold=1.0,
+            action_mode=InterventionMode.HARD_CLAMP,
+            value=-20.0,
+            sequence_scope="any_token",
+            sticky_on_decode=True,
+        )
+
+        # Neutral single-token input ("the" -> token ID 1) where L0 N7 < 1.0 on its own
+        neutral_single_token = torch.tensor([[1]], dtype=torch.long)
+
+        with torch.no_grad():
+            with inj.without_interventions():
+                clean_single_out = demo_session.model(neutral_single_token)
+
+            with inj.active_injection():
+                # Step 0 (Before prompt trigger): neutral single token does NOT open the gate
+                unlatched_out = demo_session.model(neutral_single_token)
+                assert torch.allclose(clean_single_out, unlatched_out, atol=1e-5)
+
+                # Step 1 (Prompt prefill, seq_len=6): Crypto prompt triggers L0 N7 > 1.0 and latches gate
+                _ = demo_session.model(sample_prompt_ids)
+
+                # Step 2 (Decode step, seq_len=1): Neutral token now stays gated because latch is active!
+                latched_out = demo_session.model(neutral_single_token)
+                assert not torch.allclose(clean_single_out, latched_out, atol=1e-3)
+
+        # Also verify the same KV-cache latching inside ProductionSteeringRuntime
+        json_file = tmp_path / "sticky_gate.json"
+        inj.export_production_preset(save_json_path=str(json_file))
+        inj.clear_interventions()
+
+        runtime = ProductionSteeringRuntime(demo_session.model, json_file)
+        with torch.no_grad(), runtime.active(use_compiled_residual_vectors=False):
+            _ = demo_session.model(sample_prompt_ids)
+            rt_latched_out = demo_session.model(neutral_single_token)
+            assert torch.allclose(latched_out, rt_latched_out, atol=1e-4)

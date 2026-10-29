@@ -36,6 +36,7 @@ class NeuronTaxonomy(str, Enum):
     CLEAN_MONOSEMANTIC = "clean_monosemantic"
     STRUCTURED_RECURSIVE_MIXTURE = "structured_recursive_mixture"
     TRUE_POLYSEMANTIC = "true_polysemantic"
+    TRUE_POLYSEMANTIC_ALIAS = "true_polysemantic"
     DEAD_OR_NOISY = "dead_or_noisy"
 
 
@@ -114,6 +115,10 @@ class GateConditionSpec:
     Defines a closed-loop conditional trigger for `InterventionMode.CONDITIONAL_GATE` (Section 5.2):
     Only applies `action_mode` to the target neuron(s) when `detector_neuron` in `detector_layer`
     fires on `detector_pole` with magnitude exceeding `threshold`.
+
+    When `sequence_scope == "any_token"` and `sticky_on_decode == True`, a trigger during
+    prompt prefill (`seq_len > 1`) or an earlier decoding step latches the gate open across
+    subsequent single-token KV-cached decoding steps (`seq_len == 1`).
     """
     detector_layer: str
     detector_neuron: int
@@ -121,6 +126,7 @@ class GateConditionSpec:
     threshold: float = 0.5
     action_mode: InterventionMode = InterventionMode.ADDITIVE_STEER
     sequence_scope: str = "token_wise"  # "token_wise" (per token position) or "any_token" (whole sequence)
+    sticky_on_decode: bool = True  # Latches "any_token" trigger across seq_len=1 KV-cached generation steps
 
 
 @dataclass
@@ -395,7 +401,7 @@ class ContrastiveNeuronMatch:
     """
     layer_name: str
     neuron_idx: int
-    t_statistic: float  # Signed Welch's t-statistic: (mu_pos - mu_neg) / sqrt(var_pos/N+ + var_neg/N-)
+    t_statistic: float  # Signed Welch's t-statistic: (mu_pos - mu_neg) / (sqrt(var_pos/N+ + var_neg/N-) + s0)
     abs_t_statistic: float
     pos_mean: float
     neg_mean: float
@@ -435,6 +441,7 @@ class NeuronCheckpointSnapshot:
     peak_trunk_tokens: List[str] = field(default_factory=list)
     secondary_branch_tokens: List[str] = field(default_factory=list)
     tertiary_offshoot_tokens: List[str] = field(default_factory=list)
+    double_negative_positive_rate: float = 0.0
 
 
 @dataclass

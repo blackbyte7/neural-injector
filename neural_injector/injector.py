@@ -56,7 +56,7 @@ class NeuralInjector:
       - Native per-neuron adaptive thresholds (`std_multiplier` / unbiased Algorithm R `percentile`)
       - Superposition readout auditing (`verify_downstream_readout`)
       - Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) multi-layer Jacobian tracing
-      - Closed-loop dynamic concept gating (`CONDITIONAL_GATE`)
+      - Closed-loop dynamic concept gating (`CONDITIONAL_GATE`) with KV-cache latching (`sticky_on_decode`)
       - Contrastive Pole Discovery (`discover_contrastive_neurons`)
       - Cross-checkpoint Recursive Growth tracking (`track_checkpoint_evolution`)
       - Multi-neuron synergistic group ablation (`find_synergistic_ablation_set`)
@@ -87,6 +87,7 @@ class NeuralInjector:
         # Active surgical interventions keyed by layer_name
         self._interventions: Dict[str, List[InterventionSpec]] = {}
         self._active_handles: List[RemovableHandle] = []
+        self._latched_masks: Dict[int, torch.Tensor] = {}
 
         # Streaming bipolar neuron statistics keyed by layer_name
         self._stats_trackers: Dict[str, StreamingLayerStats] = {}
@@ -130,6 +131,11 @@ class NeuralInjector:
         """Returns a flat list of all registered InterventionSpecs."""
         with self._lock:
             return [spec for specs in self._interventions.values() for spec in specs]
+
+    def reset_latched_gates(self) -> None:
+        """Clears any latched KV-cache masks accumulated by `sticky_on_decode` conditional gates."""
+        with self._lock:
+            self._latched_masks.clear()
 
     def _validate_detector_layer_order(self, detector_layer: str, target_layer: str) -> None:
         """
@@ -292,12 +298,17 @@ class NeuralInjector:
         value: float = 0.0,
         target_pole: PoleType = PoleType.BOTH,
         sequence_scope: str = "token_wise",
+        sticky_on_decode: bool = True,
     ) -> InterventionSpec:
         """
         Registers a Closed-Loop Dynamic Concept Gate (`CONDITIONAL_GATE`, Section 5.2):
         Only applies `action_mode` (with `value`) to `target_neurons` in `target_layer`
         when `detector_neuron` in `detector_layer` fires on `detector_pole` above `threshold`
         (or above its audited `detector_percentile`).
+
+        When `sequence_scope="any_token"` and `sticky_on_decode=True`, a trigger during
+        prompt prefill (`seq_len > 1`) latches the gate open across subsequent `seq_len == 1`
+        KV-cached decoding steps.
         """
         self._validate_detector_layer_order(detector_layer, target_layer)
         indices = [target_neurons] if isinstance(target_neurons, int) else list(target_neurons)
@@ -321,6 +332,7 @@ class NeuralInjector:
             threshold=resolved_thresh,
             action_mode=action_mode,
             sequence_scope=sequence_scope,
+            sticky_on_decode=sticky_on_decode,
         )
         spec = InterventionSpec(
             layer_name=target_layer,
@@ -338,6 +350,7 @@ class NeuralInjector:
         with self._lock:
             self.detach_hooks()
             self._interventions.clear()
+            self._latched_masks.clear()
 
     def attach_hooks(self) -> None:
         """
@@ -347,8 +360,9 @@ class NeuralInjector:
         with self._lock:
             self.detach_hooks()
             conditional_masks: Dict[int, torch.Tensor] = {}
+            latched_masks = self._latched_masks
 
-            # Reset conditional_masks at the start of every forward pass on the root model
+            # Reset per-pass conditional_masks at the start of every forward pass on the root model
             self._active_handles.append(
                 self.model.register_forward_pre_hook(lambda _m, _inp: conditional_masks.clear())
             )
@@ -360,7 +374,6 @@ class NeuralInjector:
                         continue
                     det_layer = spec.gate_condition.detector_layer
                     if det_layer == layer_name:
-                        # Handled inline inside InterventionKernel.apply
                         continue
                     det_mod, det_target, _ = LayerDiscovery.resolve_module(self.model, det_layer)
                     is_det_conv = isinstance(det_mod, nn.Conv2d)
@@ -370,7 +383,11 @@ class NeuralInjector:
                             if inputs and isinstance(inputs[0], torch.Tensor) and s_obj.gate_condition:
                                 conditional_masks[id(s_obj)] = (
                                     InterventionKernel.compute_detector_mask(
-                                        inputs[0].detach(), s_obj.gate_condition, is_conv2d=conv_f
+                                        inputs[0].detach(),
+                                        s_obj.gate_condition,
+                                        is_conv2d=conv_f,
+                                        latched_masks=latched_masks,
+                                        spec_id=id(s_obj),
                                     )
                                 )
 
@@ -382,7 +399,11 @@ class NeuralInjector:
                             if isinstance(act, torch.Tensor) and s_obj.gate_condition:
                                 conditional_masks[id(s_obj)] = (
                                     InterventionKernel.compute_detector_mask(
-                                        act.detach(), s_obj.gate_condition, is_conv2d=conv_f
+                                        act.detach(),
+                                        s_obj.gate_condition,
+                                        is_conv2d=conv_f,
+                                        latched_masks=latched_masks,
+                                        spec_id=id(s_obj),
                                     )
                                 )
 
@@ -415,6 +436,7 @@ class NeuralInjector:
                                 layer_specs,
                                 is_conv2d=conv_flag,
                                 conditional_masks=conditional_masks,
+                                latched_masks=latched_masks,
                             )
                             return (modified,) + inputs[1:]
 
@@ -431,6 +453,7 @@ class NeuralInjector:
                                     layer_specs,
                                     is_conv2d=conv_flag,
                                     conditional_masks=conditional_masks,
+                                    latched_masks=latched_masks,
                                 )
                             elif isinstance(output, tuple) and isinstance(output[0], torch.Tensor):
                                 modified = InterventionKernel.apply(
@@ -438,6 +461,7 @@ class NeuralInjector:
                                     layer_specs,
                                     is_conv2d=conv_flag,
                                     conditional_masks=conditional_masks,
+                                    latched_masks=latched_masks,
                                 )
                                 return (modified,) + output[1:]
                             return output
@@ -462,11 +486,13 @@ class NeuralInjector:
         for the duration of a block and guarantees cleanup afterward.
         """
         with self._lock:
+            self.reset_latched_gates()
             self.attach_hooks()
             try:
                 yield self
             finally:
                 self.detach_hooks()
+                self.reset_latched_gates()
 
     @contextmanager
     def without_interventions(self):
@@ -494,9 +520,11 @@ class NeuralInjector:
         """
         with self._lock:
             saved_interventions = {k: list(v) for k, v in self._interventions.items()}
+            saved_latches = dict(self._latched_masks)
             was_attached = len(self._active_handles) > 0
             self.detach_hooks()
             self._interventions = {}
+            self._latched_masks.clear()
             for spec in temp_specs or []:
                 self.add_intervention(spec)
             if temp_specs:
@@ -506,6 +534,8 @@ class NeuralInjector:
             finally:
                 self.detach_hooks()
                 self._interventions = saved_interventions
+                self._latched_masks.clear()
+                self._latched_masks.update(saved_latches)
                 if was_attached:
                     self.attach_hooks()
 

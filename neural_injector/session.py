@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -42,7 +43,8 @@ class WorkbenchSession:
     """
     Stateful manager holding the active model, tokenizer mappings, NeuralInjector instance,
     cached evaluation prompts, and helper methods for JSON-serializable inspection,
-    intervention, circuit tracing, and side-by-side logit comparison.
+    intervention, circuit tracing, side-by-side next-token logit comparison, and
+    multi-token Chain-of-Thought autoregressive generation (`generate_comparison`).
     """
 
     def __init__(
@@ -244,6 +246,146 @@ class WorkbenchSession:
         """Tokenizes a text string into an input_ids tensor [1, seq_len] and list of token strings."""
         input_ids, tokens, _ = self.encode_prompt_with_mask(text)
         return input_ids, tokens
+
+    def _decode_token_ids(self, token_ids: List[int]) -> Tuple[List[str], str]:
+        """Decodes a list of integer token IDs into token strings and a joined completion string."""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
+            tok_strs = [self.tokenizer.decode([tid]) for tid in token_ids]
+            text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            return tok_strs, text
+        tok_strs = [self.id_to_tok.get(tid, f"token_{tid}") for tid in token_ids]
+        return tok_strs, " ".join(tok_strs)
+
+    def _supports_kv_cache(self) -> bool:
+        """Checks whether `self.model.forward` accepts `past_key_values` and `use_cache`."""
+        try:
+            sig = inspect.signature(self.model.forward)
+            return "past_key_values" in sig.parameters and "use_cache" in sig.parameters
+        except (ValueError, TypeError):
+            return False
+
+    @torch.no_grad()
+    def _autoregressive_generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 12,
+        temperature: float = 0.0,
+        use_kv_cache: bool = True,
+        repetition_penalty: float = 1.15,
+    ) -> Tuple[List[int], List[str], str]:
+        """
+        Runs multi-token autoregressive decoding for `max_new_tokens` steps.
+        Supports both HuggingFace KV-cached decoding (`use_cache=True`, passing `[B, 1]`
+        tokens on steps >= 1) and custom PyTorch models.
+        """
+        self.injector.reset_latched_gates()
+        curr_ids = input_ids.clone()
+        generated_ids: List[int] = []
+        eos_id = getattr(self.tokenizer, "eos_token_id", None) if self.tokenizer is not None else None
+        can_cache = use_kv_cache and self._supports_kv_cache()
+        past_key_values = None
+
+        for step in range(max(1, max_new_tokens)):
+            if can_cache:
+                step_input = curr_ids if step == 0 else curr_ids[:, -1:]
+                out = self.model(
+                    step_input, past_key_values=past_key_values, use_cache=True
+                )
+                past_key_values = getattr(out, "past_key_values", None)
+                logits = (out.logits if hasattr(out, "logits") else out[0]).float()
+            else:
+                out = self.model(curr_ids)
+                logits = (out.logits if hasattr(out, "logits") else out).float()
+
+            next_logits = logits[0, -1, :].clone()
+
+            # Apply mild repetition penalty on already-generated tokens so completions don't loop on 1 token
+            if repetition_penalty != 1.0 and generated_ids:
+                for prev_id in set(generated_ids):
+                    if next_logits[prev_id] > 0:
+                        next_logits[prev_id] /= repetition_penalty
+                    else:
+                        next_logits[prev_id] *= repetition_penalty
+
+            if temperature <= 1e-6:
+                next_id = int(torch.argmax(next_logits, dim=-1).item())
+            else:
+                probs = F.softmax(next_logits / float(temperature), dim=-1)
+                next_id = int(torch.multinomial(probs, num_samples=1).item())
+
+            generated_ids.append(next_id)
+            next_t = torch.tensor([[next_id]], dtype=torch.long, device=curr_ids.device)
+            curr_ids = torch.cat([curr_ids, next_t], dim=1)
+
+            if eos_id is not None and next_id == eos_id:
+                break
+
+        tok_strs, completion_text = self._decode_token_ids(generated_ids)
+        return generated_ids, tok_strs, completion_text
+
+    def generate_comparison(
+        self,
+        prompt: str,
+        max_new_tokens: int = 8,
+        temperature: float = 0.0,
+        use_kv_cache: bool = True,
+        repetition_penalty: float = 1.15,
+    ) -> Dict[str, Any]:
+        """
+        Runs a side-by-side multi-token autoregressive generation (Chain-of-Thought /
+        continuation comparison) comparing:
+          1. Clean (unmodified) multi-token completion
+          2. Surgically intervened multi-token completion (with active hooks & latched gates)
+        """
+        input_ids, prompt_tokens = self.encode_prompt(prompt)
+        self.model.eval()
+
+        with torch.no_grad():
+            with self.injector.without_interventions():
+                clean_ids, clean_toks, clean_text = self._autoregressive_generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    use_kv_cache=use_kv_cache,
+                    repetition_penalty=repetition_penalty,
+                )
+
+            with self.injector.active_injection():
+                mod_ids, mod_toks, mod_text = self._autoregressive_generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    use_kv_cache=use_kv_cache,
+                    repetition_penalty=repetition_penalty,
+                )
+
+        min_len = min(len(clean_ids), len(mod_ids))
+        diff_count = sum(1 for i in range(min_len) if clean_ids[i] != mod_ids[i]) + abs(
+            len(clean_ids) - len(mod_ids)
+        )
+
+        return {
+            "prompt": prompt,
+            "prompt_tokens": prompt_tokens,
+            "max_new_tokens": max_new_tokens,
+            "clean_generated_tokens": clean_toks,
+            "clean_completion_text": clean_text,
+            "clean_full_text": f"{prompt} {clean_text}".strip(),
+            "intervened_generated_tokens": mod_toks,
+            "intervened_completion_text": mod_text,
+            "intervened_full_text": f"{prompt} {mod_text}".strip(),
+            "tokens_changed_count": diff_count,
+            "active_interventions": [
+                {
+                    "layer_name": spec.layer_name,
+                    "neuron_indices": spec.neuron_indices,
+                    "mode": spec.mode.value,
+                    "pole": spec.pole.value,
+                    "value": spec.value,
+                }
+                for spec in self.injector.get_active_interventions()
+            ],
+        }
 
     def run_audit(
         self,

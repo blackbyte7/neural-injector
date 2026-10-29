@@ -57,6 +57,13 @@ class EvaluateRequest(BaseModel):
     top_k_logits: int = Field(default=6, ge=1, le=20)
 
 
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., description="Prompt for side-by-side multi-token CoT generation")
+    max_new_tokens: int = Field(default=8, ge=1, le=256)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    use_kv_cache: bool = Field(default=True)
+
+
 class ExplainRequest(BaseModel):
     layer_name: str
     neuron_idx: int = Field(..., ge=0)
@@ -216,6 +223,17 @@ def create_workbench_app(
                 wb_session.evaluate_prompt_comparison,
                 prompt=req.prompt,
                 top_k_logits=req.top_k_logits,
+            )
+
+    @app.post("/api/generate")
+    async def generate_prompt_comparison(req: GenerateRequest) -> Dict[str, Any]:
+        async with session_lock:
+            return await asyncio.to_thread(
+                wb_session.generate_comparison,
+                prompt=req.prompt,
+                max_new_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                use_kv_cache=req.use_kv_cache,
             )
 
     @app.post("/api/circuits/trace")
@@ -423,7 +441,10 @@ WORKBENCH_HTML = """<!DOCTYPE html>
           <label class="text-xs text-slate-400">Test Prompt</label>
           <input id="eval-prompt" type="text" value="the system negotiated AES256" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm mt-1" />
         </div>
-        <button onclick="evaluatePrompt()" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium py-2 rounded">Compare Clean vs. Intervened</button>
+        <div class="flex gap-2">
+          <button onclick="evaluatePrompt()" class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium py-2 rounded">Compare Next Token</button>
+          <button onclick="generatePrompt()" class="flex-1 bg-teal-600 hover:bg-teal-500 text-white text-xs font-medium py-2 rounded">Generate CoT (Multi-Token)</button>
+        </div>
         <pre id="eval-output" class="bg-slate-950 p-3 rounded text-xs font-mono overflow-auto max-h-64 text-slate-300"></pre>
       </div>
 
@@ -547,6 +568,15 @@ WORKBENCH_HTML = """<!DOCTYPE html>
       const res = await fetch('/api/evaluate', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({prompt, top_k_logits: 5})
+      });
+      document.getElementById('eval-output').textContent = JSON.stringify(await res.json(), null, 2);
+    }
+
+    async function generatePrompt() {
+      const prompt = document.getElementById('eval-prompt').value;
+      const res = await fetch('/api/generate', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt, max_new_tokens: 6, temperature: 0.0})
       });
       document.getElementById('eval-output').textContent = JSON.stringify(await res.json(), null, 2);
     }

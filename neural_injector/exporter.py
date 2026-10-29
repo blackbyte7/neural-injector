@@ -61,7 +61,12 @@ class SteeringExporter:
         """
         return (
             spec.enabled
-            and spec.mode in (InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP)
+            and spec.mode
+            in (
+                InterventionMode.ADDITIVE_STEER,
+                InterventionMode.HARD_CLAMP,
+                InterventionMode.ZERO_ABLATE,
+            )
             and spec.pole == PoleType.BOTH
             and spec.token_positions is None
             and spec.gate_condition is None
@@ -228,6 +233,7 @@ class SteeringExporter:
                         "threshold": float(s.gate_condition.threshold),
                         "action_mode": s.gate_condition.action_mode.value,
                         "sequence_scope": s.gate_condition.sequence_scope,
+                        "sticky_on_decode": bool(s.gate_condition.sticky_on_decode),
                     }
                 serialized_specs.append(item_dict)
 
@@ -289,6 +295,7 @@ class SteeringExporter:
                     threshold=float(gc_raw.get("threshold", 0.5)),
                     action_mode=InterventionMode(gc_raw.get("action_mode", "additive_steer")),
                     sequence_scope=gc_raw.get("sequence_scope", "token_wise"),
+                    sticky_on_decode=bool(gc_raw.get("sticky_on_decode", True)),
                 )
                 if isinstance(gc_raw, dict)
                 else None
@@ -433,7 +440,7 @@ class ProductionSteeringRuntime:
         for layers with compiled vectors (plus dynamic pre-zeroing for any `clamped_neurons`),
         and exact neuron hooks for any remaining layers.
       - Mode B (`use_compiled_residual_vectors=False`): Exact pole-conditional and
-        cross-layer `CONDITIONAL_GATE` neuron hooks.
+        cross-layer `CONDITIONAL_GATE` neuron hooks with KV-cache latching (`sticky_on_decode`).
     """
 
     def __init__(self, model: nn.Module, preset_json_or_dict: Union[str, Path, Dict[str, Any]]):
@@ -445,12 +452,18 @@ class ProductionSteeringRuntime:
 
         self.bundle, self.specs = SteeringExporter.parse_preset_dict(raw)
         self._handles: List[RemovableHandle] = []
+        self._latched_masks: Dict[int, torch.Tensor] = {}
+
+    def reset_latched_gates(self) -> None:
+        """Clears any latched KV-cache masks accumulated by `sticky_on_decode` conditional gates."""
+        self._latched_masks.clear()
 
     def attach(self, use_compiled_residual_vectors: bool = False) -> None:
         self.detach()
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         conditional_masks: Dict[int, torch.Tensor] = {}
+        latched_masks = self._latched_masks
 
         # Clear conditional_masks at the start of every forward pass on the root model
         self._handles.append(
@@ -522,7 +535,11 @@ class ProductionSteeringRuntime:
                         if inputs and isinstance(inputs[0], torch.Tensor) and s_obj.gate_condition:
                             conditional_masks[id(s_obj)] = (
                                 InterventionKernel.compute_detector_mask(
-                                    inputs[0].detach(), s_obj.gate_condition, is_conv2d=conv_f
+                                    inputs[0].detach(),
+                                    s_obj.gate_condition,
+                                    is_conv2d=conv_f,
+                                    latched_masks=latched_masks,
+                                    spec_id=id(s_obj),
                                 )
                             )
 
@@ -534,7 +551,11 @@ class ProductionSteeringRuntime:
                         if isinstance(act, torch.Tensor) and s_obj.gate_condition:
                             conditional_masks[id(s_obj)] = (
                                 InterventionKernel.compute_detector_mask(
-                                    act.detach(), s_obj.gate_condition, is_conv2d=conv_f
+                                    act.detach(),
+                                    s_obj.gate_condition,
+                                    is_conv2d=conv_f,
+                                    latched_masks=latched_masks,
+                                    spec_id=id(s_obj),
                                 )
                             )
 
@@ -559,7 +580,11 @@ class ProductionSteeringRuntime:
                         if inputs and isinstance(inputs[0], torch.Tensor):
                             return (
                                 InterventionKernel.apply(
-                                    inputs[0], ls, is_conv2d=cf, conditional_masks=conditional_masks
+                                    inputs[0],
+                                    ls,
+                                    is_conv2d=cf,
+                                    conditional_masks=conditional_masks,
+                                    latched_masks=latched_masks,
                                 ),
                             ) + inputs[1:]
                         return inputs
@@ -575,12 +600,20 @@ class ProductionSteeringRuntime:
                     def _fwd(_mod: nn.Module, _inputs: Tuple[Any, ...], out: Any) -> Any:
                         if isinstance(out, torch.Tensor):
                             return InterventionKernel.apply(
-                                out, ls, is_conv2d=cf, conditional_masks=conditional_masks
+                                out,
+                                ls,
+                                is_conv2d=cf,
+                                conditional_masks=conditional_masks,
+                                latched_masks=latched_masks,
                             )
                         elif isinstance(out, tuple) and isinstance(out[0], torch.Tensor):
                             return (
                                 InterventionKernel.apply(
-                                    out[0], ls, is_conv2d=cf, conditional_masks=conditional_masks
+                                    out[0],
+                                    ls,
+                                    is_conv2d=cf,
+                                    conditional_masks=conditional_masks,
+                                    latched_masks=latched_masks,
                                 ),
                             ) + out[1:]
                         return out
@@ -598,8 +631,10 @@ class ProductionSteeringRuntime:
 
     @contextmanager
     def active(self, use_compiled_residual_vectors: bool = False):
+        self.reset_latched_gates()
         self.attach(use_compiled_residual_vectors=use_compiled_residual_vectors)
         try:
             yield self
         finally:
             self.detach()
+            self.reset_latched_gates()

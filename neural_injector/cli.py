@@ -20,7 +20,8 @@ def _split_cli_args(arg: str) -> List[str]:
 class NeuralInjectorREPL(cmd.Cmd):
     """
     Stateful interactive terminal workbench for auditing neurons, manipulating poles,
-    tracing downstream & incoming circuits, solving crossword circuit ecology, discovering
+    comparing next-token logits & multi-token Chain-of-Thought completions, tracing
+    downstream & incoming circuits, solving crossword circuit ecology, discovering
     contrastive neurons, and running closed-loop agent explanations.
     """
 
@@ -222,6 +223,7 @@ class NeuralInjectorREPL(cmd.Cmd):
             action_mode=InterventionMode.ADDITIVE_STEER,
             value=delta,
             sequence_scope="any_token",
+            sticky_on_decode=True,
         )
         print(
             f"Registered CONDITIONAL_GATE: steer {t_layer}[N{t_idx}] by {delta:+.2f} when {d_layer}[N{d_idx}] > {thresh}."
@@ -245,6 +247,24 @@ class NeuralInjectorREPL(cmd.Cmd):
             m_str = f"{m['token']:<18} ({m['prob'] * 100:5.1f}%)"
             print(f"{c_str:<36} | {m_str:<36}")
         print()
+
+    def do_generate(self, arg: str) -> None:
+        """generate [max_new_tokens] [prompt] : Compare Clean vs. Surgically Intervened multi-token completions (Chain-of-Thought)."""
+        parts = _split_cli_args(arg)
+        max_new = 6
+        if parts and parts[0].isdigit():
+            max_new = int(parts[0])
+            prompt = " ".join(parts[1:]) or self.session.get_default_eval_prompt()
+        else:
+            prompt = arg.strip() or self.session.get_default_eval_prompt()
+
+        res = self.session.generate_comparison(prompt=prompt, max_new_tokens=max_new)
+        print(
+            f"\n=== MULTI-TOKEN GENERATION COMPARISON (max_new_tokens={res['max_new_tokens']}, changed={res['tokens_changed_count']}) ==="
+        )
+        print(f"Prompt             : \"{res['prompt']}\"")
+        print(f"Clean Completion   : {res['clean_completion_text']}")
+        print(f"Steered Completion : {res['intervened_completion_text']}\n")
 
     def do_trace(self, arg: str) -> None:
         """trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt] : Trace downstream layer-to-layer circuit."""
