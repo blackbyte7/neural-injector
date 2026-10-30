@@ -7,7 +7,12 @@ from .analyzer import (
     StreamingLayerStats,
 )
 from .circuit_tracer import CircuitTracer
-from .discovery import LayerDescriptor, LayerDiscovery
+from .discovery import (
+    ARCHITECTURE_REGISTRY,
+    ArchitectureAdapter,
+    LayerDescriptor,
+    LayerDiscovery,
+)
 from .explainer import (
     AgentHypothesisResponseSchema,
     CircuitEcologyMap,
@@ -43,7 +48,11 @@ from .types import (
     NeuronTaxonomy,
     PoleType,
     ProductionPresetBundle,
+    ResidualSinkEntry,
+    ResidualSinkReport,
+    SparsityTailPrior,
     SynergisticAblationResult,
+    UpstreamAttributionBundle,
     VerificationExperimentSpec,
     VerificationReport,
 )
@@ -54,12 +63,16 @@ __all__ = [
     "InterventionMode",
     "InteractionRole",
     "NeuronTaxonomy",
+    "SparsityTailPrior",
     "ActivationSample",
     "NeuronPoleProfile",
     "GateConditionSpec",
     "InterventionSpec",
     "CircuitEdge",
     "CircuitGraph",
+    "UpstreamAttributionBundle",
+    "ResidualSinkEntry",
+    "ResidualSinkReport",
     "DownstreamReadoutReport",
     "VerificationExperimentSpec",
     "VerificationReport",
@@ -75,6 +88,8 @@ __all__ = [
     "LayerCleanlinessReport",
     "CompiledSteeringVector",
     "ProductionPresetBundle",
+    "ArchitectureAdapter",
+    "ARCHITECTURE_REGISTRY",
     "LayerDiscovery",
     "LayerDescriptor",
     "StreamingLayerStats",

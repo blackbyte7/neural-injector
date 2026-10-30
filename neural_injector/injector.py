@@ -36,7 +36,9 @@ from .types import (
     NeuronTaxonomy,
     PoleType,
     ProductionPresetBundle,
+    ResidualSinkReport,
     SynergisticAblationResult,
+    UpstreamAttributionBundle,
 )
 
 
@@ -49,12 +51,13 @@ class NeuralInjector:
     (Cammarata / Goodfire, Oct 2026) plus production hardening and frontier capabilities:
       - Direct native-basis neuron inspection (Pre-DownProj SwiGLU/MLP hooks, Conv2d, Linear, 3D MoE)
       - Pole-specific conditional moments (M1+, M2+, M4+ and M1-, M2-, M4-) & Stratified Quantile Buckets
-      - SwiGLU Double-Negative Route detection (`gate < 0` and `up < 0` yielding `silu(gate)*up > 0`)
+      - SwiGLU 4-quadrant sign regimes & Double-Negative Route detection (`gate < 0` and `up < 0` yielding `silu(gate)*up > 0`)
       - Forward next-token context (`next_token_str` & `window_str`) for next-token preparer neurons
-      - Downstream & Upstream (`trace_incoming_circuit`) causal circuit tracing
+      - Downstream & Upstream (`trace_incoming_circuit`) causal circuit tracing & attribution bundle clustering
+      - Residual Stream Sink auditing (`audit_residual_stream_sinks`)
       - Crossword / Circuit Ecology propagation store (`CircuitEcologyMap` & `solve_layer_ecology`)
       - Native per-neuron adaptive thresholds (`std_multiplier` / unbiased Algorithm R `percentile`)
-      - Superposition readout auditing (`verify_downstream_readout`)
+      - Superposition readout auditing (`verify_downstream_readout`) with random-neuron null baseline
       - Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) multi-layer Jacobian tracing
       - Closed-loop dynamic concept gating (`CONDITIONAL_GATE`) with KV-cache latching (`sticky_on_decode`)
       - Contrastive Pole Discovery (`discover_contrastive_neurons`)
@@ -250,12 +253,13 @@ class NeuralInjector:
         threshold: Optional[Union[float, List[float]]] = None,
         std_multiplier: Optional[float] = None,
         percentile: Optional[float] = None,
+        pole: PoleType = PoleType.BOTH,
     ) -> InterventionSpec:
         """
         Tests Cammarata's 'Do Weak Activations Matter?' hypothesis by zeroing out
         activations below a scalar `threshold` OR native per-neuron adaptive thresholds
         computed from each neuron's audited distribution via `std_multiplier` or `percentile`
-        (Section 3.4: Respecting Native Activation Ranges & Percentiles).
+        ('Finding Clean Circuits' — Respecting Native Activation Ranges & Percentiles).
         """
         indices = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
         per_neuron_vals: Optional[List[float]] = None
@@ -268,7 +272,7 @@ class NeuralInjector:
         elif self.is_layer_audited(layer_name):
             tracker = self._stats_trackers[layer_name]
             per_neuron_vals = tracker.compute_adaptive_thresholds(
-                indices, std_multiplier=std_multiplier, percentile=percentile
+                indices, std_multiplier=std_multiplier, percentile=percentile, pole=pole
             )
             scalar_val = per_neuron_vals[0] if per_neuron_vals else 0.0
         else:
@@ -278,7 +282,7 @@ class NeuralInjector:
             layer_name=layer_name,
             neuron_indices=indices,
             mode=InterventionMode.WEAK_PRUNE,
-            pole=PoleType.BOTH,
+            pole=pole,
             value=scalar_val,
             per_neuron_values=per_neuron_vals,
         )
@@ -301,7 +305,7 @@ class NeuralInjector:
         sticky_on_decode: bool = True,
     ) -> InterventionSpec:
         """
-        Registers a Closed-Loop Dynamic Concept Gate (`CONDITIONAL_GATE`, Section 5.2):
+        Registers a Closed-Loop Dynamic Concept Gate (`CONDITIONAL_GATE`):
         Only applies `action_mode` (with `value`) to `target_neurons` in `target_layer`
         when `detector_neuron` in `detector_layer` fires on `detector_pole` above `threshold`
         (or above its audited `detector_percentile`).
@@ -316,11 +320,11 @@ class NeuralInjector:
             resolved_thresh = float(threshold)
         elif detector_percentile is not None and self.is_layer_audited(detector_layer):
             resolved_thresh = self._stats_trackers[detector_layer].compute_adaptive_thresholds(
-                [detector_neuron], percentile=detector_percentile
+                [detector_neuron], percentile=detector_percentile, pole=detector_pole
             )[0]
         elif self.is_layer_audited(detector_layer):
             resolved_thresh = self._stats_trackers[detector_layer].compute_adaptive_thresholds(
-                [detector_neuron], std_multiplier=1.0
+                [detector_neuron], std_multiplier=1.0, pole=detector_pole
             )[0]
         else:
             resolved_thresh = 0.5
@@ -691,13 +695,16 @@ class NeuralInjector:
                     for batch in dataloader_or_batches:
                         latest_gate_acts.clear()
                         latest_up_acts.clear()
-                        current_batch_meta = {
-                            "sample_ids": batch.get("sample_ids"),
-                            "tokens_per_sample": batch.get("tokens_per_sample"),
-                            "contexts_per_sample": batch.get("contexts_per_sample"),
-                            "attention_mask": batch.get("attention_mask"),
-                            "routed_token_indices": batch.get("routed_token_indices"),
-                        }
+                        if isinstance(batch, dict):
+                            current_batch_meta = {
+                                "sample_ids": batch.get("sample_ids"),
+                                "tokens_per_sample": batch.get("tokens_per_sample"),
+                                "contexts_per_sample": batch.get("contexts_per_sample"),
+                                "attention_mask": batch.get("attention_mask"),
+                                "routed_token_indices": batch.get("routed_token_indices"),
+                            }
+                        else:
+                            current_batch_meta = {}
                         forward_fn(self.model, batch)
             finally:
                 for h in handles:
@@ -746,37 +753,57 @@ class NeuralInjector:
         self,
         layer_name: str,
         neuron_idx: int,
-        inputs: torch.Tensor,
+        inputs: Any,
         pole: PoleType = PoleType.BOTH,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
     ) -> float:
         """
         Measures the exact causal impact of zero-ablating a single neuron (or one of its poles)
         by computing the KL-Divergence D_KL(P_clean || P_ablated) on the model's output logits.
         """
+        def _default_fwd(m: nn.Module, inp: Any) -> Any:
+            if isinstance(inp, dict):
+                return m(inp["input_ids"]) if "input_ids" in inp else m(**inp)
+            return m(inp)
+
+        run_fwd = forward_fn or _default_fwd
         with self._lock:
+            was_training = self.model.training
             self.model.eval()
-            with self.without_interventions():
-                clean_out = self.model(inputs)
-                clean_logits = clean_out.logits if hasattr(clean_out, "logits") else clean_out
-                clean_log_probs = torch.log_softmax(clean_logits.float(), dim=-1)
-                clean_probs = clean_log_probs.exp()
+            try:
+                with self.without_interventions():
+                    clean_out = run_fwd(self.model, inputs)
+                    clean_logits = (
+                        clean_out.logits if hasattr(clean_out, "logits") else clean_out
+                    )
+                    clean_log_probs = torch.log_softmax(clean_logits.float(), dim=-1)
+                    clean_probs = clean_log_probs.exp()
 
-            ablate_spec = InterventionSpec(
-                layer_name=layer_name,
-                neuron_indices=[neuron_idx],
-                mode=InterventionMode.ZERO_ABLATE,
-                pole=pole,
-                value=0.0,
-            )
-            with self.temporary_interventions([ablate_spec]):
-                ablated_out = self.model(inputs)
-                ablated_logits = (
-                    ablated_out.logits if hasattr(ablated_out, "logits") else ablated_out
+                ablate_spec = InterventionSpec(
+                    layer_name=layer_name,
+                    neuron_indices=[neuron_idx],
+                    mode=InterventionMode.ZERO_ABLATE,
+                    pole=pole,
+                    value=0.0,
                 )
-                ablated_log_probs = torch.log_softmax(ablated_logits.float(), dim=-1)
+                with self.temporary_interventions([ablate_spec]):
+                    ablated_out = run_fwd(self.model, inputs)
+                    ablated_logits = (
+                        ablated_out.logits if hasattr(ablated_out, "logits") else ablated_out
+                    )
+                    ablated_log_probs = torch.log_softmax(ablated_logits.float(), dim=-1)
 
-            kl = (clean_probs * (clean_log_probs - ablated_log_probs)).sum(dim=-1).mean().item()
-            return float(kl)
+                token_kl = (clean_probs * (clean_log_probs - ablated_log_probs)).sum(dim=-1)
+                if isinstance(inputs, dict) and inputs.get("attention_mask") is not None:
+                    mask = inputs["attention_mask"].to(
+                        device=token_kl.device, dtype=torch.bool
+                    )
+                    if mask.shape == token_kl.shape and mask.any():
+                        return float(token_kl[mask].mean().item())
+                return float(token_kl.mean().item())
+            finally:
+                if was_training:
+                    self.model.train()
 
     # -------------------------------------------------------------------------
     # 4. Layer-to-Layer Circuit Tracing & Superposition Readout Verification
@@ -834,6 +861,52 @@ class NeuralInjector:
                 top_k=top_k,
             )
 
+    def cluster_incoming_attribution_bundles(
+        self,
+        src_layer: str,
+        dst_layer: str,
+        dst_neuron: int,
+        inputs: Any,
+        dst_pole: PoleType = PoleType.POSITIVE,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        top_k_upstream: int = 12,
+        num_clusters: int = 3,
+    ) -> List[UpstreamAttributionBundle]:
+        """
+        Clusters incoming upstream contributors from `src_layer` into `(dst_layer, dst_neuron)`
+        into coherent functional attribution bundles (Cammarata: 'Understanding Compounds').
+        """
+        with self._lock:
+            return self.tracer.cluster_incoming_attribution_bundles(
+                src_layer=src_layer,
+                dst_layer=dst_layer,
+                dst_neuron=dst_neuron,
+                inputs=inputs,
+                forward_fn=forward_fn,
+                dst_pole=dst_pole,
+                top_k_upstream=top_k_upstream,
+                num_clusters=num_clusters,
+            )
+
+    def audit_residual_stream_sinks(
+        self,
+        src_layer: str,
+        neuron_indices: Optional[List[int]] = None,
+        unembed_weight: Optional[torch.Tensor] = None,
+        sink_cosine_threshold: float = 0.25,
+    ) -> ResidualSinkReport:
+        """
+        Audits neurons in `src_layer` for Residual Stream Sink behavior
+        (Cammarata: 'Finding Clean Circuits — Residual Stream Sinks & Norm Scaling').
+        """
+        with self._lock:
+            return self.tracer.audit_residual_stream_sinks(
+                src_layer=src_layer,
+                neuron_indices=neuron_indices,
+                unembed_weight=unembed_weight,
+                sink_cosine_threshold=sink_cosine_threshold,
+            )
+
     def trace_forward_ad_all_layers(
         self,
         src_layer: str,
@@ -842,9 +915,10 @@ class NeuralInjector:
         dst_layers: Optional[List[str]] = None,
         src_pole: PoleType = PoleType.POSITIVE,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        position_mode: str = "all_active",
     ) -> Dict[str, torch.Tensor]:
         """
-        Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) circuit tracer (Section 5.1):
+        Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) circuit tracer:
         Returns a dictionary mapping every downstream layer name to its exact 1D Jacobian
         sensitivity tensor `d(A_dst)/d(a_{src_layer, src_neuron})` in a single forward pass.
         """
@@ -856,6 +930,7 @@ class NeuralInjector:
                 dst_layers=dst_layers,
                 src_pole=src_pole,
                 forward_fn=forward_fn,
+                position_mode=position_mode,
             )
 
     def verify_downstream_readout(
@@ -871,8 +946,9 @@ class NeuralInjector:
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
     ) -> DownstreamReadoutReport:
         """
-        Tests Cammarata's 'Nothing Reads That Combination' hypothesis (Section 3.5)
-        across `src_neurons` in `src_layer` with respect to `dst_layer`.
+        Tests Cammarata's 'Nothing Reads That Combination' hypothesis
+        ('Where Could Superposition Hide?') across `src_neurons` in `src_layer`
+        with respect to `dst_layer`.
         """
         with self._lock:
             return self.tracer.verify_downstream_readout(
@@ -890,6 +966,11 @@ class NeuralInjector:
     # -------------------------------------------------------------------------
     # 5. Automated LLM-Agent Explanation & Crossword Ecology Solver
     # -------------------------------------------------------------------------
+    def set_explainer_llm_client(self, llm_client: LLMClientProtocol) -> None:
+        """Configures the LLM client used by `self.explainer` for agentic neuron explanation."""
+        with self._lock:
+            self.explainer.llm_client = llm_client
+
     def explain_neuron(
         self,
         layer_name: str,
@@ -934,13 +1015,16 @@ class NeuralInjector:
         src_layer: Optional[str] = None,
     ) -> LayerEcologySolveReport:
         """
-        Implements Cammarata's Crossword / Circuit Ecology propagation loop (Section 3.2:
-        'Understanding Compounds'):
-          - Pass 1 (Easy Crossword Clues): Ranks audited neurons by selectivity/impact and
-            explains + verifies the top `top_anchors` monosemantic anchor neurons, storing
-            their verified hypotheses and circuit edges in `self.ecology_map`.
+        Implements Cammarata's Crossword / Circuit Ecology propagation loop
+        ('Understanding Compounds'):
+          - Pass 1 (Easy Crossword Clues): Ranks audited neurons by selectivity and causal impact,
+            explains + verifies the top `top_anchors` anchor neurons, and stores their verified
+            hypotheses and circuit edges in `self.ecology_map`.
+          - Sibling & Reader Link Propagation: Connects Pass 2 contextual neurons in `layer_name`
+            to Pass 1 verified anchors via shared downstream `dst_layer` readers or outgoing
+            write-direction coupling (`register_same_layer_siblings`).
           - Pass 2 (Compound Understanding): Explains the next `top_contextual` structured
-            recursive mixture / harder neurons while injecting the verified neighbor motifs
+            recursive mixture / contextual neurons while injecting the verified neighbor motifs
             from `self.ecology_map` into the LLM prompt.
         """
         with self._lock:
@@ -986,8 +1070,49 @@ class NeuralInjector:
                 if hyp.verification_report is not None:
                     scores.append(hyp.verification_report.empirical_verification_score)
 
+            # Link Pass 1 anchors to Pass 2 contextual neurons via shared downstream readers
+            # or same-layer functional sibling relationships so Pass 2 receives non-empty clues!
+            for c_idx in contextual:
+                if dst_layer is not None and circuit_inputs is not None:
+                    c_graph = self.trace_circuit(
+                        src_layer=layer_name,
+                        dst_layer=dst_layer,
+                        src_neuron=c_idx,
+                        inputs=circuit_inputs,
+                        src_pole=PoleType.POSITIVE,
+                        compute_jacobian=False,
+                        top_k=8,
+                    )
+                    c_dst_set = {e.dst_neuron for e in c_graph.edges[:4]}
+                else:
+                    c_dst_set = set()
+
+                for a_idx in anchors:
+                    a_edges = self.ecology_map.edges_from.get((layer_name, a_idx), [])
+                    a_dst_set = {e.dst_neuron for e in a_edges[:4]}
+                    shared_dst = c_dst_set & a_dst_set
+                    if shared_dst:
+                        self.ecology_map.register_same_layer_siblings(
+                            layer_name=layer_name,
+                            neuron_a=a_idx,
+                            neuron_b=c_idx,
+                            role=f"shared_downstream_reader_N{sorted(shared_dst)[0]}",
+                            coupling_strength=0.75,
+                        )
+                    else:
+                        self.ecology_map.register_same_layer_siblings(
+                            layer_name=layer_name,
+                            neuron_a=a_idx,
+                            neuron_b=c_idx,
+                            role="same_layer_anchor_context",
+                            coupling_strength=0.35,
+                        )
+
             # Pass 2: Solve contextual neurons with ecology neighbor clues populated
+            clues_injected = 0
             for n_idx in contextual:
+                clues = self.ecology_map.get_neighbor_contexts(layer_name, n_idx)
+                clues_injected += len(clues)
                 hyp = self.explain_neuron(
                     layer_name=layer_name,
                     neuron_idx=n_idx,
@@ -1010,6 +1135,7 @@ class NeuralInjector:
                 contextual_neurons_explained=contextual,
                 hypotheses=solved,
                 mean_verification_score=round(mean_score, 3),
+                contextual_clues_injected_count=clues_injected,
             )
 
     # -------------------------------------------------------------------------
@@ -1042,16 +1168,26 @@ class NeuralInjector:
             verified_hypotheses=self.ecology_map.hypotheses,
         )
 
-        # Aggregate independent pole-level taxonomy counts across all 2 * num_neurons poles (Section 3.1)
+        # Aggregate independent pole-level taxonomy counts across all 2 * num_neurons poles
         pole_counts: Dict[str, int] = {
             NeuronTaxonomy.CLEAN_MONOSEMANTIC.value: 0,
             NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value: 0,
             NeuronTaxonomy.TRUE_POLYSEMANTIC.value: 0,
             NeuronTaxonomy.DEAD_OR_NOISY.value: 0,
         }
+        prior_counts: Dict[str, int] = {}
+        verified_cnt = 0
         for summary_item in summaries:
-            pole_counts[summary_item.pos_taxonomy_class.value] += 1
-            pole_counts[summary_item.neg_taxonomy_class.value] += 1
+            pole_counts[summary_item.pos_taxonomy_class.value] = (
+                pole_counts.get(summary_item.pos_taxonomy_class.value, 0) + 1
+            )
+            pole_counts[summary_item.neg_taxonomy_class.value] = (
+                pole_counts.get(summary_item.neg_taxonomy_class.value, 0) + 1
+            )
+            p_val = summary_item.sparsity_tail_prior.value
+            prior_counts[p_val] = prior_counts.get(p_val, 0) + 1
+            if summary_item.semantic_verified:
+                verified_cnt += 1
 
         total_poles = max(2 * tracker.num_neurons, 1)
         pole_pcts = {k: round((v / total_poles) * 100.0, 2) for k, v in pole_counts.items()}
@@ -1105,6 +1241,8 @@ class NeuralInjector:
             clean_poles_pct=clean_poles_pct,
             structured_poles_pct=struct_poles_pct,
             combined_clean_and_structured_poles_pct=round(clean_poles_pct + struct_poles_pct, 2),
+            prior_counts=prior_counts,
+            semantically_verified_count=verified_cnt,
         )
 
     # -------------------------------------------------------------------------
@@ -1119,7 +1257,7 @@ class NeuralInjector:
         top_k: int = 16,
     ) -> ContrastiveDiscoveryReport:
         """
-        Contrastive Pole Discovery (Section 5.3):
+        Contrastive Pole Discovery:
         Ranks all native neurons across `layer_names` by their Welch's Bipolar
         Separation t-statistic between `pos_inputs` (D+) and `neg_inputs` (D-).
         """
@@ -1137,7 +1275,7 @@ class NeuralInjector:
 
     def track_checkpoint_evolution(
         self,
-        checkpoints: List[Tuple[str, nn.Module]],
+        checkpoints: List[Tuple[str, Union[nn.Module, Callable[[], nn.Module]]]],
         layer_name: str,
         neuron_idx: int,
         batches: Iterable[Dict[str, Any]],
@@ -1145,7 +1283,7 @@ class NeuralInjector:
         top_k: int = 8,
     ) -> NeuronEvolutionReport:
         """
-        Cross-Checkpoint 'Recursive Growth' Tracker (Section 5.4):
+        Cross-Checkpoint 'Recursive Growth' Tracker:
         Measures how `(layer_name, neuron_idx)` evolves its pole selectivity, outgoing
         weight vector, and stratified quantile offshoots across `checkpoints`.
         """
@@ -1170,7 +1308,7 @@ class NeuralInjector:
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
     ) -> SynergisticAblationResult:
         """
-        Subspace / Multi-Neuron Synergistic Ablation (Section 5.5):
+        Subspace / Multi-Neuron Synergistic Ablation:
         Finds a minimal coalition of `max_subset_size` neurons in `layer_name` whose
         joint ablation overcomes backup circuits to maximize output shift.
         """
@@ -1255,11 +1393,27 @@ class NeuralInjector:
     def fold_interventions_into_weights(self) -> Dict[str, Any]:
         """
         Permanently folds unconditional ZERO_ABLATE, SCALE, ADDITIVE_STEER, and HARD_CLAMP
-        interventions directly into `down_proj` weights and biases for 0% hook latency in production.
+        interventions directly into module weights and biases for 0% hook latency in production.
+        Retains any unfoldable specs (`CONDITIONAL_GATE`, `pole != BOTH`, `WEAK_PRUNE`,
+        `POLE_RECTIFY`, `token_positions != None`) in `self._interventions`.
         """
         with self._lock:
             res = SteeringExporter.fold_interventions_into_weights(
                 self.model, self._interventions
             )
-            self.clear_interventions()
+            folded_ids = set(res.get("folded_spec_ids", []))
+            if folded_ids:
+                was_attached = len(self._active_handles) > 0
+                self.detach_hooks()
+                for lname in list(self._interventions.keys()):
+                    remaining = [
+                        s for s in self._interventions[lname] if id(s) not in folded_ids
+                    ]
+                    if remaining:
+                        self._interventions[lname] = remaining
+                    else:
+                        del self._interventions[lname]
+                self._latched_masks.clear()
+                if was_attached and self._interventions:
+                    self.attach_hooks()
             return res

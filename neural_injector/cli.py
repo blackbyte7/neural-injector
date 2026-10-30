@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import cmd
+import os
 import shlex
 from typing import List, Optional
 
+from .explainer import HeuristicSynthesisClient, OpenAICompatibleClient
 from .session import WorkbenchSession
 from .types import InterventionMode, PoleType
 
@@ -15,6 +17,16 @@ def _split_cli_args(arg: str) -> List[str]:
     Using `posix=False` prevents `shlex.split` from stripping `\\` out of Windows paths.
     """
     return [tok.strip("\"'") for tok in shlex.split(arg, posix=False) if tok.strip("\"'")]
+
+
+DEFAULT_HF_AUDIT_CORPUS: List[str] = [
+    "The quick brown fox jumps over the lazy dog while the server processes incoming requests.",
+    "SELECT user_id, created_at FROM transactions WHERE amount > 1000 ORDER BY created_at DESC;",
+    "In cryptography, TLS 1.3 negotiates an ephemeral Diffie-Hellman key exchange with AES-256-GCM.",
+    "She walked quietly through the autumn forest, listening to the wind rustle the golden leaves.",
+    "def fibonacci(n: int) -> int:\n    return n if n <= 1 else fibonacci(n - 1) + fibonacci(n - 2)",
+    "The Federal Reserve announced a quarter-point adjustment following the monthly inflation report.",
+]
 
 
 class NeuralInjectorREPL(cmd.Cmd):
@@ -37,6 +49,36 @@ class NeuralInjectorREPL(cmd.Cmd):
         super().__init__()
         self.session = session
 
+    def _get_default_audit_prompts(self) -> List[str]:
+        if self.session.last_audit_prompts:
+            return list(self.session.last_audit_prompts)
+        if "AES256" in self.session.tok_to_id:
+            return [
+                "the system negotiated AES256 TLS cipher",
+                "the system executed SELECT WHERE postgres",
+                "packet buffer TLS handshake AES256 cipher",
+                "packet buffer postgres index_scan SELECT WHERE",
+                "the server executed packet buffer latencies",
+            ]
+        return list(DEFAULT_HF_AUDIT_CORPUS)
+
+    def _ensure_layer_audited(self, layer_name: str) -> None:
+        """
+        Ensures `layer_name` has been audited before running `scan`, `profile`, `explain`,
+        or `ecology`. If the layer exists in `list_targetable_layers()` but has not been
+        audited yet (e.g., right after loading a HuggingFace model), automatically streams
+        a default calibration corpus.
+        """
+        if self.session.injector.is_layer_audited(layer_name):
+            return
+        targetable = self.session.injector.list_targetable_layers(include_all_linear=True)
+        if layer_name in targetable:
+            prompts = self._get_default_audit_prompts()
+            print(
+                f"[Auto-Audit] Layer '{layer_name}' not yet audited; streaming {len(prompts)} calibration prompts..."
+            )
+            self.session.run_audit(layer_names=[layer_name], prompts=prompts)
+
     def do_layers(self, _arg: str) -> None:
         """layers : List all discovered targetable neuron layers in the model."""
         layers = self.session.injector.list_targetable_layers()
@@ -48,6 +90,62 @@ class NeuralInjectorREPL(cmd.Cmd):
                 f"{name:<28} | {desc.module_type:<32} | {desc.num_neurons:<8} | {desc.hook_target:<6}"
             )
         print()
+
+    def do_audit(self, arg: str) -> None:
+        """audit <layer_name|all> [prompt1 | prompt2 | ...] : Stream text prompts to populate bipolar neuron statistics."""
+        if not arg.strip():
+            print("Usage: audit <layer_name|all> [prompt1 | prompt2 | ...]")
+            return
+        if "|" in arg:
+            first_segment, rest_prompts = arg.split("|", 1)
+            first_parts = _split_cli_args(first_segment)
+            if not first_parts:
+                print("Usage: audit <layer_name|all> [prompt1 | prompt2 | ...]")
+                return
+            target_spec = first_parts[0]
+            first_prompt = " ".join(first_parts[1:]).strip()
+            custom_prompts = [p.strip() for p in ([first_prompt] + rest_prompts.split("|")) if p.strip()]
+        else:
+            parts = _split_cli_args(arg)
+            target_spec = parts[0]
+            custom_prompts = [" ".join(parts[1:]).strip()] if len(parts) > 1 else []
+
+        all_layers = list(self.session.injector.list_targetable_layers().keys())
+        if target_spec.lower() == "all":
+            layer_names = all_layers
+        else:
+            layer_names = [x.strip() for x in target_spec.split(",") if x.strip()]
+
+        prompts = custom_prompts if custom_prompts else self._get_default_audit_prompts()
+        res = self.session.run_audit(layer_names=layer_names, prompts=prompts)
+        print(
+            f"Audited {len(res['layers'])} layer(s) ({', '.join(res['layers'])}) across {res['num_prompts']} prompt(s)."
+        )
+
+    def do_llm(self, arg: str) -> None:
+        """llm <heuristic | model_name> [base_url] [api_key] : Configure the LLM client for agentic neuron explanation."""
+        parts = _split_cli_args(arg)
+        if not parts:
+            print(
+                "Usage: llm <heuristic | model_name> [base_url] [api_key]\n"
+                "  e.g. llm gpt-4o-mini https://api.openai.com/v1 sk-...\n"
+                "  e.g. llm heuristic"
+            )
+            return
+        if parts[0].lower() == "heuristic":
+            self.session.injector.set_explainer_llm_client(HeuristicSynthesisClient())
+            print("Configured NeuronExplainerAgent to use offline HeuristicSynthesisClient.")
+            return
+        model_name = parts[0]
+        base_url = parts[1] if len(parts) >= 2 else os.environ.get(
+            "NEURAL_INJECTOR_LLM_BASE_URL", "https://api.openai.com/v1"
+        )
+        api_key = parts[2] if len(parts) >= 3 else os.environ.get("OPENAI_API_KEY")
+        client = OpenAICompatibleClient(model=model_name, api_key=api_key, base_url=base_url)
+        self.session.injector.set_explainer_llm_client(client)
+        print(
+            f"Configured NeuronExplainerAgent with OpenAICompatibleClient(model='{model_name}', base_url='{base_url}')."
+        )
 
     def do_scan(self, arg: str) -> None:
         """scan <layer_name> [sort_by] [top_n] : Run a batch layer-wide & pole-specific cleanliness audit."""
@@ -61,6 +159,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         sort_by = parts[1] if len(parts) >= 2 else "pole_selectivity_score"
         limit = int(parts[2]) if len(parts) >= 3 else 12
 
+        self._ensure_layer_audited(layer_name)
         kl_inputs = self.session.get_default_eval_inputs()
         report = self.session.injector.scan_layer_cleanliness(
             layer_name=layer_name,
@@ -110,6 +209,7 @@ class NeuralInjectorREPL(cmd.Cmd):
             return
         layer_name, neuron_idx = parts[0], int(parts[1])
         try:
+            self._ensure_layer_audited(layer_name)
             p = self.session.injector.get_neuron_profile(
                 layer_name=layer_name,
                 neuron_idx=neuron_idx,
@@ -124,6 +224,10 @@ class NeuralInjectorREPL(cmd.Cmd):
                 f"+Pole Selectivity: {p.pos_pole_selectivity_score:.2f} ({p.pos_taxonomy_class.value}) | "
                 f"-Pole Selectivity: {p.neg_pole_selectivity_score:.2f} ({p.neg_taxonomy_class.value}) | "
                 f"SwiGLU Double-Neg (+Pole): {p.double_negative_positive_rate * 100:.1f}%"
+            )
+            print(
+                f"Lexical R^2: {p.lexical_selectivity_r2:.3f} | Motif: {p.inferred_firing_motif} | "
+                f"Tail Prior: {p.tail_prior.value}"
             )
             print(
                 f"\n[+] POSITIVE POLE (Firing Rate: {p.positive_firing_rate * 100:.1f}%, Max: {p.max_val:+.3f}):"
@@ -353,7 +457,8 @@ class NeuralInjectorREPL(cmd.Cmd):
         print(f"\n--- DOWNSTREAM READOUT AUDIT ({src_l} {neurons} -> {dst_l}) ---")
         print(
             f"Max Downstream Act Shift : {rep.max_downstream_activation_shift:.5f} | "
-            f"Max Gate Shift: {rep.max_downstream_gate_shift:.5f}"
+            f"Max Gate Shift: {rep.max_downstream_gate_shift:.5f} | "
+            f"Output KL: {rep.output_kl_divergence:.5f}"
         )
         print(
             f"Benign Spillover ('Nothing Reads That Combination'): {rep.is_benign_spillover} | "
@@ -369,6 +474,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         layer_name, idx = parts[0], int(parts[1])
         dst_layer = parts[2] if len(parts) >= 3 and parts[2] != "-" else None
         src_layer = parts[3] if len(parts) >= 4 and parts[3] != "-" else None
+        self._ensure_layer_audited(layer_name)
         input_ids = self.session.get_default_eval_inputs()
         hyp = self.session.injector.explain_neuron(
             layer_name=layer_name,
@@ -404,6 +510,7 @@ class NeuralInjectorREPL(cmd.Cmd):
         dst_layer = parts[1] if len(parts) >= 2 else None
         top_a = int(parts[2]) if len(parts) >= 3 else 2
         top_c = int(parts[3]) if len(parts) >= 4 else 2
+        self._ensure_layer_audited(layer_name)
         input_ids = self.session.get_default_eval_inputs()
         rep = self.session.injector.solve_layer_ecology(
             layer_name=layer_name,
@@ -510,6 +617,10 @@ class NeuralInjectorREPL(cmd.Cmd):
         print(f"Folded {res['operations_applied']} interventions directly into model weights:")
         for d in res["details"]:
             print(f"  - {d['layer']} (neurons {d['neurons']}): {d['folded_op']}")
+        if res.get("unfolded_specs_retained", 0) > 0:
+            print(
+                f"Retained {res['unfolded_specs_retained']} non-foldable intervention(s) as active runtime hooks."
+            )
 
     def do_exit(self, _arg: str) -> bool:
         """exit : Exit the Neural Injector REPL."""
@@ -532,6 +643,30 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Optional HuggingFace model ID to load (e.g. 'gpt2' or 'Qwen/Qwen2.5-1.5B'). Defaults to built-in 2-layer SwiGLU model.",
     )
     parser.add_argument("--device", type=str, default="cpu", help="Device ('cpu', 'cuda', 'cuda:0', etc.)")
+    parser.add_argument(
+        "--device-map",
+        type=str,
+        default=None,
+        help="Optional HuggingFace Accelerate device_map (e.g. 'auto') for multi-GPU / sharded models.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        type=str,
+        default=os.environ.get("NEURAL_INJECTOR_LLM_MODEL"),
+        help="Optional OpenAI-compatible LLM model name for agentic neuron explanation (e.g. 'gpt-4o-mini').",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        type=str,
+        default=os.environ.get("NEURAL_INJECTOR_LLM_BASE_URL", "https://api.openai.com/v1"),
+        help="Base URL for OpenAI-compatible LLM endpoint.",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        type=str,
+        default=os.environ.get("OPENAI_API_KEY"),
+        help="API key for OpenAI-compatible LLM endpoint.",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -543,12 +678,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     serve_p.add_argument("--host", type=str, default="127.0.0.1")
     serve_p.add_argument("--port", type=int, default=8000)
 
-    # 3. Direct one-shot profile command
+    # 3. Direct one-shot audit command
+    audit_p = sub.add_parser("audit", help="Audit one or all layers on a prompt corpus")
+    audit_p.add_argument("layer_name", type=str, help="Layer name or 'all'")
+
+    # 4. Direct one-shot profile command
     prof_p = sub.add_parser("profile", help="Inspect a neuron's bipolar profile")
     prof_p.add_argument("layer_name", type=str)
     prof_p.add_argument("neuron_idx", type=int)
 
-    # 4. Direct one-shot explain command
+    # 5. Direct one-shot explain command
     exp_p = sub.add_parser(
         "explain", help="Run the agentic explainer + surgical verification on a neuron"
     )
@@ -560,10 +699,21 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     session = (
-        WorkbenchSession.from_huggingface(args.hf_model, device=args.device)
+        WorkbenchSession.from_huggingface(
+            args.hf_model, device=args.device, device_map=args.device_map
+        )
         if args.hf_model
         else WorkbenchSession.create_demo_session()
     )
+
+    if args.llm_model:
+        session.injector.set_explainer_llm_client(
+            OpenAICompatibleClient(
+                model=args.llm_model,
+                api_key=args.llm_api_key,
+                base_url=args.llm_base_url,
+            )
+        )
 
     if args.command == "serve":
         import uvicorn
@@ -572,6 +722,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         app = create_workbench_app(session)
         print(f"Launching Neural Injector Workbench at http://{args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
+
+    elif args.command == "audit":
+        repl = NeuralInjectorREPL(session)
+        repl.do_audit(args.layer_name)
 
     elif args.command == "profile":
         repl = NeuralInjectorREPL(session)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -16,10 +17,27 @@ from .types import (
     InterventionMode,
     InterventionSpec,
     PoleType,
+    ResidualSinkEntry,
+    ResidualSinkReport,
+    UpstreamAttributionBundle,
 )
 
 if TYPE_CHECKING:
     from .injector import NeuralInjector
+
+
+def _sdpa_math_context():
+    """
+    Context manager forcing PyTorch's scaled_dot_product_attention to use the math backend
+    during Forward-Mode AD (`fwAD.dual_level()`), avoiding FlashAttention / Memory-Efficient
+    fused kernel errors on dual tensors.
+    """
+    try:
+        if hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
+            return torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
+    except Exception:
+        pass
+    return nullcontext()
 
 
 class CircuitTracer:
@@ -32,8 +50,8 @@ class CircuitTracer:
 
     Uses Single-Pass Forward-Mode Automatic Differentiation (`torch.autograd.forward_ad`)
     to compute exact Jacobians d(A_dst)/d(a_src) across all downstream neurons and layers
-    simultaneously in a single forward pass (Sections 4.4 & 5.1), and reverse-mode
-    vector-Jacobian products for incoming circuit decomposition.
+    simultaneously in a single forward pass, and reverse-mode vector-Jacobian products
+    for incoming circuit decomposition and upstream attribution bundle clustering.
     """
 
     def __init__(self, injector: NeuralInjector):
@@ -50,6 +68,7 @@ class CircuitTracer:
         dst_layer: str,
         src_neuron: int,
         apply_pre_norm_scaling: bool = True,
+        expert_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Computes the direct residual-stream virtual weights from `src_neuron` in `src_layer`
@@ -66,7 +85,10 @@ class CircuitTracer:
         )
         _, _, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
 
-        device = next(self.model.parameters()).device
+        try:
+            device = next(self.model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
         zeros = torch.zeros(num_dst, dtype=torch.float32, device=device)
 
         if not hasattr(src_write_mod, "weight"):
@@ -76,23 +98,34 @@ class CircuitTracer:
         w_src = src_write_mod.weight.detach()
         if w_src.ndim == 3:
             # 3D MoE down_proj: [num_experts, d_model, d_mlp]
-            src_vec = w_src[:, :, src_neuron].mean(dim=0).to(dtype=torch.float32)
+            if expert_idx is not None and 0 <= expert_idx < w_src.shape[0]:
+                src_vec = w_src[expert_idx, :, src_neuron].to(dtype=torch.float32)
+            else:
+                src_vec = w_src[:, :, src_neuron].mean(dim=0).to(dtype=torch.float32)
         elif src_write_mod.__class__.__name__ == "Conv1D":
             src_vec = w_src[src_neuron, :].to(dtype=torch.float32)
         else:
             # Standard Linear down_proj: shape [d_model, d_mlp]
-            src_vec = w_src[:, src_neuron].to(dtype=torch.float32)
+            if src_neuron < w_src.shape[1]:
+                src_vec = w_src[:, src_neuron].to(dtype=torch.float32)
+            else:
+                src_vec = w_src[src_neuron, :].to(dtype=torch.float32)
 
         target_device = src_vec.device
         zeros = zeros.to(target_device)
 
         # Optionally apply the destination block's pre-MLP RMSNorm / LayerNorm weight scaling gamma
+        # (including Gemma's 1.0 + weight offset via LayerDiscovery.extract_norm_scale)
         if apply_pre_norm_scaling:
             pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, dst_layer)
-            if pre_norm is not None and hasattr(pre_norm, "weight"):
-                norm_w = pre_norm.weight.detach().to(device=target_device, dtype=torch.float32)
-                if norm_w.shape == src_vec.shape:
-                    src_vec = src_vec * norm_w
+            norm_w = LayerDiscovery.extract_norm_scale(
+                pre_norm,
+                d_model=src_vec.shape[0],
+                device=target_device,
+                dtype=torch.float32,
+            )
+            if norm_w is not None and norm_w.shape == src_vec.shape:
+                src_vec = src_vec * norm_w
 
         read_mod = dst_up_mod if dst_up_mod is not None else dst_write_mod
         if read_mod is None or not hasattr(read_mod, "weight"):
@@ -101,7 +134,10 @@ class CircuitTracer:
         w_up = read_mod.weight.detach().to(device=target_device, dtype=torch.float32)
         if w_up.ndim == 3:
             # 3D MoE up_proj: [num_experts, d_mlp, d_model]
-            w_up = w_up.mean(dim=0)
+            if expert_idx is not None and 0 <= expert_idx < w_up.shape[0]:
+                w_up = w_up[expert_idx]
+            else:
+                w_up = w_up.mean(dim=0)
         elif read_mod.__class__.__name__ == "Conv1D":
             # [d_model, d_mlp] -> transpose to [d_mlp, d_model]
             w_up = w_up.T
@@ -118,7 +154,10 @@ class CircuitTracer:
         if dst_gate_mod is not None and hasattr(dst_gate_mod, "weight"):
             w_gate = dst_gate_mod.weight.detach().to(device=target_device, dtype=torch.float32)
             if w_gate.ndim == 3:
-                w_gate = w_gate.mean(dim=0)
+                if expert_idx is not None and 0 <= expert_idx < w_gate.shape[0]:
+                    w_gate = w_gate[expert_idx]
+                else:
+                    w_gate = w_gate.mean(dim=0)
             elif dst_gate_mod.__class__.__name__ == "Conv1D":
                 w_gate = w_gate.T
             virtual_gate = (
@@ -136,6 +175,7 @@ class CircuitTracer:
         dst_layer: str,
         dst_neuron: int,
         apply_pre_norm_scaling: bool = True,
+        expert_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Computes incoming virtual weights from ALL neurons in `src_layer` into a single
@@ -152,7 +192,10 @@ class CircuitTracer:
         )
         _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
 
-        device = next(self.model.parameters()).device
+        try:
+            device = next(self.model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
         zeros = torch.zeros(num_src, dtype=torch.float32, device=device)
 
         if not hasattr(src_write_mod, "weight"):
@@ -161,7 +204,10 @@ class CircuitTracer:
         # Extract all src write columns: shape [d_model, num_src]
         w_src = src_write_mod.weight.detach()
         if w_src.ndim == 3:
-            w_down = w_src.mean(dim=0).to(dtype=torch.float32)
+            if expert_idx is not None and 0 <= expert_idx < w_src.shape[0]:
+                w_down = w_src[expert_idx].to(dtype=torch.float32)
+            else:
+                w_down = w_src.mean(dim=0).to(dtype=torch.float32)
         elif src_write_mod.__class__.__name__ == "Conv1D":
             w_down = w_src.T.to(dtype=torch.float32)
         else:
@@ -172,10 +218,14 @@ class CircuitTracer:
 
         if apply_pre_norm_scaling:
             pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, dst_layer)
-            if pre_norm is not None and hasattr(pre_norm, "weight"):
-                norm_w = pre_norm.weight.detach().to(device=target_device, dtype=torch.float32)
-                if norm_w.shape[0] == w_down.shape[0]:
-                    w_down = w_down * norm_w.unsqueeze(1)
+            norm_w = LayerDiscovery.extract_norm_scale(
+                pre_norm,
+                d_model=w_down.shape[0],
+                device=target_device,
+                dtype=torch.float32,
+            )
+            if norm_w is not None and norm_w.shape[0] == w_down.shape[0]:
+                w_down = w_down * norm_w.unsqueeze(1)
 
         read_mod = dst_up_mod if dst_up_mod is not None else dst_write_mod
         if read_mod is None or not hasattr(read_mod, "weight"):
@@ -183,7 +233,10 @@ class CircuitTracer:
 
         w_up = read_mod.weight.detach().to(device=target_device, dtype=torch.float32)
         if w_up.ndim == 3:
-            w_up = w_up.mean(dim=0)
+            if expert_idx is not None and 0 <= expert_idx < w_up.shape[0]:
+                w_up = w_up[expert_idx]
+            else:
+                w_up = w_up.mean(dim=0)
         elif read_mod.__class__.__name__ == "Conv1D":
             w_up = w_up.T
 
@@ -200,7 +253,10 @@ class CircuitTracer:
         if dst_gate_mod is not None and hasattr(dst_gate_mod, "weight"):
             w_gate = dst_gate_mod.weight.detach().to(device=target_device, dtype=torch.float32)
             if w_gate.ndim == 3:
-                w_gate = w_gate.mean(dim=0)
+                if expert_idx is not None and 0 <= expert_idx < w_gate.shape[0]:
+                    w_gate = w_gate[expert_idx]
+                else:
+                    w_gate = w_gate.mean(dim=0)
             elif dst_gate_mod.__class__.__name__ == "Conv1D":
                 w_gate = w_gate.T
             if w_gate.shape[1] == w_down.shape[0] and dst_neuron < w_gate.shape[0]:
@@ -213,7 +269,7 @@ class CircuitTracer:
         return virtual_up, virtual_gate, cos_sim
 
     # -------------------------------------------------------------------------
-    # 2. Single-Pass Forward-Mode AD Multi-Layer Jacobian Tracer (Section 5.1)
+    # 2. Single-Pass Forward-Mode AD Multi-Layer Jacobian Tracer
     # -------------------------------------------------------------------------
     @torch.no_grad()
     def trace_forward_ad_all_layers(
@@ -225,6 +281,7 @@ class CircuitTracer:
         src_pole: PoleType = PoleType.POSITIVE,
         active_threshold: float = 1e-5,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        position_mode: str = "all_active",
     ) -> Dict[str, torch.Tensor]:
         """
         Attaches a forward-mode autograd dual tangent `tangent = one_hot(src_neuron)`
@@ -232,6 +289,11 @@ class CircuitTracer:
         A single forward pass computes the exact Jacobian sensitivity vector
         `d(A_dst) / d(a_{src_layer, src_neuron})` across EVERY downstream layer and
         every downstream neuron simultaneously!
+          - `position_mode="all_active"` (default): seeds the tangent across all active positions
+            where `src_neuron` fires in `src_pole`.
+          - `position_mode="focal_token"`: seeds the tangent strictly at the single peak-activating
+            token position `t*`, eliminating cross-token attention JVP mixing.
+        Includes automatic SDPA math-kernel wrapping and reverse-mode autograd fallback.
         """
         run_fwd = forward_fn or (lambda m, inp: m(inp))
         all_discovered = self.injector.list_targetable_layers()
@@ -261,14 +323,24 @@ class CircuitTracer:
             else:
                 src_flat = t.reshape(-1, t.shape[-1])
             src_col = src_flat[:, src_neuron].detach()
-            if src_pole == PoleType.POSITIVE:
-                amask = src_col > active_threshold
-            elif src_pole == PoleType.NEGATIVE:
-                amask = src_col < -active_threshold
+            if position_mode == "focal_token" and src_col.numel() > 0:
+                if src_pole == PoleType.POSITIVE:
+                    focal_idx = int(src_col.argmax().item())
+                elif src_pole == PoleType.NEGATIVE:
+                    focal_idx = int(src_col.argmin().item())
+                else:
+                    focal_idx = int(src_col.abs().argmax().item())
+                amask = torch.zeros_like(src_col, dtype=torch.bool)
+                amask[focal_idx] = True
             else:
-                amask = src_col.abs() > active_threshold
-            if not amask.any():
-                amask = torch.ones_like(src_col, dtype=torch.bool)
+                if src_pole == PoleType.POSITIVE:
+                    amask = src_col > active_threshold
+                elif src_pole == PoleType.NEGATIVE:
+                    amask = src_col < -active_threshold
+                else:
+                    amask = src_col.abs() > active_threshold
+                if not amask.any():
+                    amask = torch.ones_like(src_col, dtype=torch.bool)
 
             active_mask_holder.append(amask)
             active_count_holder[0] = max(int(amask.sum().item()), 1)
@@ -357,14 +429,41 @@ class CircuitTracer:
 
         was_training = self.model.training
         self.model.eval()
+        fw_ad_ok = False
         try:
-            with self.injector.without_interventions(), fwAD.dual_level():
-                run_fwd(self.model, inputs)
+            with self.injector.without_interventions(), _sdpa_math_context(), fwAD.dual_level():
+                try:
+                    run_fwd(self.model, inputs)
+                    fw_ad_ok = True
+                except RuntimeError:
+                    captured_tangents.clear()
         finally:
             for handle in handles:
                 handle.remove()
             if was_training:
                 self.model.train()
+
+        if not fw_ad_ok:
+            for d_layer in target_dst_layers:
+                g = self.trace_circuit(
+                    src_layer=src_layer,
+                    dst_layer=d_layer,
+                    src_neuron=src_neuron,
+                    inputs=inputs,
+                    forward_fn=run_fwd,
+                    src_pole=src_pole,
+                    compute_jacobian=True,
+                    active_threshold=active_threshold,
+                    top_k=all_discovered[d_layer].num_neurons
+                    if d_layer in all_discovered
+                    else 64,
+                )
+                _, _, num_d = LayerDiscovery.resolve_module(self.model, d_layer)
+                j_vec = torch.zeros(num_d, dtype=torch.float32)
+                for e in g.edges:
+                    if 0 <= e.dst_neuron < num_d:
+                        j_vec[e.dst_neuron] = float(e.jacobian_sensitivity)
+                captured_tangents[d_layer] = j_vec
 
         return captured_tangents
 
@@ -478,7 +577,12 @@ class CircuitTracer:
         self.model.eval()
         fw_ad_succeeded = False
         try:
-            with self.injector.without_interventions(), torch.no_grad(), fwAD.dual_level():
+            with (
+                self.injector.without_interventions(),
+                torch.no_grad(),
+                _sdpa_math_context(),
+                fwAD.dual_level(),
+            ):
                 try:
                     run_fwd(self.model, inputs)
                     fw_ad_succeeded = True
@@ -853,6 +957,13 @@ class CircuitTracer:
         clean_dst_col = dst_col.detach().float()
         clean_dst_mean = float(clean_dst_col[amask].mean().item())
 
+        src_amask = (
+            amask.to(src_flat.device)
+            if amask.shape[0] == src_flat.shape[0]
+            else torch.ones(src_flat.shape[0], dtype=torch.bool, device=src_flat.device)
+        )
+        src_active_mean = src_flat[src_amask].mean(dim=0)
+
         if grad_src is not None:
             g_flat = (
                 grad_src.detach().permute(0, 2, 3, 1).reshape(-1, num_src).float()
@@ -873,10 +984,9 @@ class CircuitTracer:
         v_gate = v_gate.to(device=src_flat.device)
         cos_sim = cos_sim.to(device=src_flat.device)
 
-        src_mean_act = src_flat.mean(dim=0)
         ranking_score = (
             first_order_attrib.abs()
-            + 0.1 * (src_mean_act.abs() * (v_up.abs() + v_gate.abs()))
+            + 0.1 * (src_active_mean.abs() * (v_up.abs() + v_gate.abs()))
         )
         k_select = min(top_k, num_src)
         _, top_src_indices = torch.topk(ranking_score, k=k_select)
@@ -902,7 +1012,8 @@ class CircuitTracer:
         try:
             with torch.no_grad():
                 for s_idx in top_src_indices.tolist():
-                    s_mean = float(src_mean_act[s_idx].item())
+                    # Determine active pole of s_idx specifically over the active target positions `src_amask`
+                    s_mean = float(src_active_mean[s_idx].item())
                     s_pole = PoleType.POSITIVE if s_mean >= 0.0 else PoleType.NEGATIVE
                     spec = InterventionSpec(
                         layer_name=src_layer,
@@ -962,6 +1073,280 @@ class CircuitTracer:
         if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
             self.injector.ecology_map.register_circuit_graph(graph)
         return graph
+
+    def cluster_incoming_attribution_bundles(
+        self,
+        src_layer: str,
+        dst_layer: str,
+        dst_neuron: int,
+        inputs: Any,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        dst_pole: PoleType = PoleType.POSITIVE,
+        top_k_upstream: int = 12,
+        num_clusters: int = 3,
+    ) -> List[UpstreamAttributionBundle]:
+        """
+        Clusters incoming upstream contributors from `src_layer` into `(dst_layer, dst_neuron)`
+        into functional attribution bundles (Cammarata: 'Understanding Compounds'):
+          - Traces the top `top_k_upstream` incoming edges.
+          - Extracts each upstream contributor's outgoing write direction `W_down[:, s_idx]`
+            weighted by its signed causal attribution, and groups co-aligned upstream contributors
+            via greedy cosine-medoid clustering into `<= num_clusters` coherent functional bundles.
+        """
+        inc_graph = self.trace_incoming_circuit(
+            src_layer=src_layer,
+            dst_layer=dst_layer,
+            dst_neuron=dst_neuron,
+            inputs=inputs,
+            forward_fn=forward_fn,
+            dst_pole=dst_pole,
+            top_k=top_k_upstream,
+        )
+        if not inc_graph.edges:
+            return []
+
+        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
+        w_src = (
+            src_write_mod.weight.detach().float()
+            if hasattr(src_write_mod, "weight") and isinstance(src_write_mod.weight, torch.Tensor)
+            else None
+        )
+
+        # Build feature vectors per upstream edge: normalized outgoing write vector * sign(mean_causal_delta)
+        edge_vecs: List[torch.Tensor] = []
+        for e in inc_graph.edges:
+            sign = 1.0 if e.mean_causal_delta >= 0.0 else -1.0
+            if w_src is not None:
+                if w_src.ndim == 3:
+                    v = w_src[:, :, e.src_neuron].mean(dim=0)
+                elif src_write_mod.__class__.__name__ == "Conv1D":
+                    v = w_src[e.src_neuron, :]
+                else:
+                    v = (
+                        w_src[:, e.src_neuron]
+                        if e.src_neuron < w_src.shape[1]
+                        else w_src[e.src_neuron, :]
+                    )
+                v_norm = F.normalize(v.unsqueeze(0), dim=-1).squeeze(0) * sign
+            else:
+                v_norm = torch.tensor(
+                    [sign, float(e.virtual_weight_up), float(e.virtual_weight_gate)],
+                    dtype=torch.float32,
+                )
+                v_norm = F.normalize(v_norm.unsqueeze(0), dim=-1).squeeze(0)
+            edge_vecs.append(v_norm.cpu())
+
+        feat_mat = torch.stack(edge_vecs, dim=0)  # [M, d]
+        sim_mat = feat_mat @ feat_mat.T          # [M, M]
+
+        k_clusters = min(max(num_clusters, 1), len(inc_graph.edges))
+        # Select medoid seeds via farthest-point cosine seeding starting from the strongest edge (0)
+        medoids: List[int] = [0]
+        for _ in range(1, k_clusters):
+            max_sim_to_existing = sim_mat[:, medoids].max(dim=1).values
+            next_seed = int(max_sim_to_existing.argmin().item())
+            if next_seed not in medoids:
+                medoids.append(next_seed)
+
+        clusters: Dict[int, List[int]] = {m: [] for m in medoids}
+        for idx in range(len(inc_graph.edges)):
+            best_m = max(medoids, key=lambda m: float(sim_mat[idx, m].item()))
+            clusters[best_m].append(idx)
+
+        tracker = self.injector.get_stats_tracker(src_layer)
+        bundles: List[UpstreamAttributionBundle] = []
+        for b_id, (_, member_indices) in enumerate(clusters.items()):
+            if not member_indices:
+                continue
+            member_edges = [inc_graph.edges[i] for i in member_indices]
+            up_neurons = [e.src_neuron for e in member_edges]
+            tot_attrib = sum(e.mean_causal_delta for e in member_edges)
+            pos_votes = sum(1 for e in member_edges if e.src_pole == PoleType.POSITIVE)
+            dom_pole = (
+                PoleType.POSITIVE
+                if pos_votes >= (len(member_edges) - pos_votes)
+                else PoleType.NEGATIVE
+            )
+
+            if len(member_indices) > 1:
+                sub_sim = sim_mat[member_indices][:, member_indices]
+                n_m = len(member_indices)
+                off_diag_sum = float(sub_sim.sum().item()) - float(n_m)
+                mean_cos = off_diag_sum / max(n_m * (n_m - 1), 1)
+            else:
+                mean_cos = 1.0
+
+            shared_toks: List[str] = []
+            if tracker is not None:
+                for n_i in up_neurons:
+                    prof_i = tracker.export_profile(n_i)
+                    samples_i = (
+                        prof_i.top_positive_samples
+                        if dom_pole == PoleType.POSITIVE
+                        else prof_i.top_negative_samples
+                    )
+                    for s in samples_i[:3]:
+                        if s.token_str and s.token_str not in shared_toks:
+                            shared_toks.append(s.token_str)
+
+            bundles.append(
+                UpstreamAttributionBundle(
+                    dst_layer=dst_layer,
+                    dst_neuron=dst_neuron,
+                    dst_pole=dst_pole,
+                    src_layer=src_layer,
+                    bundle_id=b_id,
+                    upstream_neurons=up_neurons,
+                    dominant_pole=dom_pole,
+                    total_causal_attribution=round(float(tot_attrib), 5),
+                    mean_pairwise_cosine=round(float(mean_cos), 4),
+                    shared_activating_tokens=shared_toks[:8],
+                )
+            )
+
+        bundles.sort(key=lambda b: abs(b.total_causal_attribution), reverse=True)
+        for new_id, b in enumerate(bundles):
+            b.bundle_id = new_id
+        return bundles
+
+    @torch.no_grad()
+    def audit_residual_stream_sinks(
+        self,
+        src_layer: str,
+        neuron_indices: Optional[List[int]] = None,
+        unembed_weight: Optional[torch.Tensor] = None,
+        sink_cosine_threshold: float = 0.25,
+    ) -> ResidualSinkReport:
+        """
+        Audits neurons in `src_layer` for Residual Stream Sink behavior
+        (Cammarata: 'Finding Clean Circuits — Residual Stream Sinks & Norm Scaling'):
+          - Measures each neuron's outgoing write norm `||W_down[:, i]||_2`
+          - Measures its maximum absolute cosine alignment with all downstream MLP read rows
+            (`up_proj` and `gate_proj`) across subsequent layers (`max_reader_cosine`)
+          - Measures its maximum absolute cosine alignment with the vocabulary unembedding matrix
+            (`unembedding_alignment_cosine`)
+          - Identifies `is_residual_sink_candidate` neurons that write non-trivial norm into the
+            residual stream while remaining nearly orthogonal to downstream feature readers
+            and vocabulary unembedding directions (acting as LayerNorm/RMSNorm variance regulators).
+        """
+        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
+        _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
+        target_indices = (
+            list(neuron_indices) if neuron_indices is not None else list(range(num_src))
+        )
+
+        all_discovered = self.injector.list_targetable_layers()
+        layer_keys = list(all_discovered.keys())
+        if src_layer in layer_keys:
+            downstream_layers = layer_keys[layer_keys.index(src_layer) + 1:]
+        else:
+            downstream_layers = [k for k in layer_keys if k != src_layer]
+
+        if not hasattr(src_write_mod, "weight") or not isinstance(
+            src_write_mod.weight, torch.Tensor
+        ):
+            return ResidualSinkReport(src_layer=src_layer, num_neurons_audited=0)
+
+        w_src = src_write_mod.weight.detach().float()
+        if w_src.ndim == 3:
+            w_down = w_src.mean(dim=0)
+        elif src_write_mod.__class__.__name__ == "Conv1D":
+            w_down = w_src.T
+        else:
+            w_down = w_src if w_src.shape[1] == num_src else w_src.T
+
+        device = w_down.device
+        sub_down = w_down[:, target_indices]  # [d_model, K]
+        out_norms = torch.norm(sub_down, p=2, dim=0)
+        sub_down_norm = F.normalize(sub_down, dim=0)  # [d_model, K]
+
+        max_reader_cos = torch.zeros(len(target_indices), dtype=torch.float32, device=device)
+
+        for d_layer in downstream_layers:
+            d_write, d_up, d_gate = LayerDiscovery.resolve_mlp_read_write_modules(
+                self.model, d_layer
+            )
+            pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, d_layer)
+            norm_scale = LayerDiscovery.extract_norm_scale(
+                pre_norm, d_model=sub_down.shape[0], device=device, dtype=torch.float32
+            )
+            scaled_write = (
+                F.normalize(sub_down * norm_scale.unsqueeze(1), dim=0)
+                if norm_scale is not None
+                else sub_down_norm
+            )
+
+            for r_mod in (d_up if d_up is not None else d_write, d_gate):
+                if r_mod is None or not hasattr(r_mod, "weight"):
+                    continue
+                rw = r_mod.weight.detach().to(device=device, dtype=torch.float32)
+                if rw.ndim == 3:
+                    rw = rw.mean(dim=0)
+                elif r_mod.__class__.__name__ == "Conv1D":
+                    rw = rw.T
+                if rw.shape[1] == scaled_write.shape[0]:
+                    rw_norm = F.normalize(rw, dim=-1)  # [num_d, d_model]
+                    cos_mat = (rw_norm @ scaled_write).abs()  # [num_d, K]
+                    if cos_mat.numel() > 0:
+                        max_reader_cos = torch.maximum(max_reader_cos, cos_mat.max(dim=0).values)
+
+        unembed_cos = torch.zeros(len(target_indices), dtype=torch.float32, device=device)
+        if unembed_weight is not None:
+            u_w = unembed_weight.detach().to(device=device, dtype=torch.float32)
+            if u_w.shape[1] != sub_down.shape[0] and u_w.shape[0] == sub_down.shape[0]:
+                u_w = u_w.T
+            if u_w.shape[1] == sub_down.shape[0]:
+                final_norm = LayerDiscovery.resolve_final_norm(self.model)
+                f_scale = LayerDiscovery.extract_norm_scale(
+                    final_norm, d_model=sub_down.shape[0], device=device, dtype=torch.float32
+                )
+                scaled_final = (
+                    F.normalize(sub_down * f_scale.unsqueeze(1), dim=0)
+                    if f_scale is not None
+                    else sub_down_norm
+                )
+                u_norm = F.normalize(u_w, dim=-1)
+                u_mat = (u_norm @ scaled_final).abs()
+                if u_mat.numel() > 0:
+                    unembed_cos = u_mat.max(dim=0).values
+
+        entries: List[ResidualSinkEntry] = []
+        sink_indices: List[int] = []
+
+        out_norms_cpu = out_norms.cpu().tolist()
+        reader_cos_cpu = max_reader_cos.cpu().tolist()
+        unembed_cos_cpu = unembed_cos.cpu().tolist()
+
+        for local_i, n_idx in enumerate(target_indices):
+            w_n = float(out_norms_cpu[local_i])
+            r_c = float(reader_cos_cpu[local_i])
+            u_c = float(unembed_cos_cpu[local_i])
+            max_eff = max(r_c, u_c)
+            null_frac = max(0.0, 1.0 - max_eff)
+            is_sink = (
+                w_n > 1e-4
+                and r_c < sink_cosine_threshold
+                and (u_c < sink_cosine_threshold if unembed_weight is not None else True)
+            )
+            if is_sink:
+                sink_indices.append(n_idx)
+            entries.append(
+                ResidualSinkEntry(
+                    neuron_idx=n_idx,
+                    outgoing_weight_norm=round(w_n, 4),
+                    max_reader_cosine=round(r_c, 4),
+                    unembedding_alignment_cosine=round(u_c, 4),
+                    sink_null_fraction=round(null_frac, 4),
+                    is_residual_sink_candidate=is_sink,
+                )
+            )
+
+        return ResidualSinkReport(
+            src_layer=src_layer,
+            num_neurons_audited=len(target_indices),
+            sink_candidate_indices=sink_indices,
+            entries=entries,
+        )
 
     # -------------------------------------------------------------------------
     # 4. Multi-Hop Circuit Subgraph Tracing (L_0 -> L_1 -> ... -> L_n)
@@ -1032,12 +1417,15 @@ class CircuitTracer:
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
     ) -> DownstreamReadoutReport:
         """
-        Tests Cammarata's 'Nothing Reads That Combination' hypothesis (Section 3.5):
+        Tests Cammarata's 'Nothing Reads That Combination' hypothesis
+        ('Where Could Superposition Hide?'):
         Evaluates whether weak/secondary cross-activations across a group of neurons
         `src_neurons` in `src_layer` actually cross the gating/activation threshold of
-        any downstream neuron in `dst_layer`.
+        any downstream neuron in `dst_layer` or alter the model's output distribution,
+        and compares the effect against a random-neuron-set null baseline of the same size.
         """
         run_fwd = forward_fn or (lambda m, inp: m(inp))
+        _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
         dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
         _, _, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(self.model, dst_layer)
 
@@ -1090,11 +1478,18 @@ class CircuitTracer:
                 )
             )
 
+        def _extract_logits(out_obj: Any) -> Optional[torch.Tensor]:
+            t = out_obj.logits if hasattr(out_obj, "logits") else out_obj
+            if isinstance(t, tuple) and t and isinstance(t[0], torch.Tensor):
+                t = t[0]
+            return t.detach().float() if isinstance(t, torch.Tensor) and t.is_floating_point() else None
+
         was_training = self.model.training
         self.model.eval()
         try:
             with self.injector.without_interventions():
-                run_fwd(self.model, inputs)
+                clean_out = run_fwd(self.model, inputs)
+            clean_logits = _extract_logits(clean_out)
             clean_dst = captured_dst[-1].reshape(-1, num_dst)
             clean_gate = captured_gate[-1].reshape(-1, num_dst) if captured_gate else None
 
@@ -1107,13 +1502,50 @@ class CircuitTracer:
                 per_neuron_values=per_neuron_vals,
             )
             with self.injector.temporary_interventions([prune_spec]):
-                run_fwd(self.model, inputs)
+                pruned_out = run_fwd(self.model, inputs)
+            pruned_logits = _extract_logits(pruned_out)
             pruned_dst = captured_dst[-1].reshape(-1, num_dst)
             pruned_gate = (
                 captured_gate[-1].reshape(-1, num_dst)
                 if (captured_gate and len(captured_gate) >= 2)
                 else None
             )
+
+            # Random-neuron-set null baseline of the same subset size k
+            other_pool = [i for i in range(num_src) if i not in set(src_neurons)]
+            k_null = min(len(src_neurons), len(other_pool))
+            null_max_shift = 0.0
+            null_kl = 0.0
+            if k_null > 0:
+                null_indices = other_pool[:k_null]
+                if tracker is not None and weak_threshold is None:
+                    null_vals = tracker.compute_adaptive_thresholds(
+                        null_indices, std_multiplier=std_multiplier, percentile=percentile
+                    )
+                    null_scalar = null_vals[0] if null_vals else scalar_val
+                else:
+                    null_vals = [scalar_val] * k_null
+                    null_scalar = scalar_val
+                null_spec = InterventionSpec(
+                    layer_name=src_layer,
+                    neuron_indices=null_indices,
+                    mode=InterventionMode.WEAK_PRUNE,
+                    pole=PoleType.BOTH,
+                    value=null_scalar,
+                    per_neuron_values=null_vals,
+                )
+                with self.injector.temporary_interventions([null_spec]):
+                    null_out = run_fwd(self.model, inputs)
+                null_logits = _extract_logits(null_out)
+                null_dst = captured_dst[-1].reshape(-1, num_dst)
+                null_diff = (clean_dst - null_dst).abs()
+                null_max_shift = (
+                    float(null_diff.max().item()) if null_diff.numel() > 0 else 0.0
+                )
+                if clean_logits is not None and null_logits is not None and clean_logits.shape == null_logits.shape:
+                    c_lp = F.log_softmax(clean_logits, dim=-1)
+                    n_lp = F.log_softmax(null_logits, dim=-1)
+                    null_kl = float((c_lp.exp() * (c_lp - n_lp)).sum(dim=-1).mean().item())
         finally:
             h_dst.remove()
             if h_gate is not None:
@@ -1126,13 +1558,29 @@ class CircuitTracer:
         max_act_shift = float(per_dst_max_shift.max().item()) if per_dst_max_shift.numel() > 0 else 0.0
         mean_act_shift = float(dst_diff.mean().item()) if dst_diff.numel() > 0 else 0.0
 
+        dst_scale = torch.clamp(clean_dst.std(dim=0, unbiased=False), min=1e-2)
+        rel_max_shift = (
+            float((per_dst_max_shift / dst_scale).max().item())
+            if per_dst_max_shift.numel() > 0
+            else 0.0
+        )
+
         if clean_gate is not None and pruned_gate is not None:
             gate_diff = (clean_gate - pruned_gate).abs()
             max_gate_shift = float(gate_diff.max().item())
             mean_gate_shift = float(gate_diff.mean().item())
+            gate_flips = (clean_gate > 0) != (pruned_gate > 0)
+            gate_flip_rate = float(gate_flips.float().mean().item()) if gate_flips.numel() > 0 else 0.0
         else:
             max_gate_shift = 0.0
             mean_gate_shift = 0.0
+            gate_flip_rate = 0.0
+
+        out_kl = 0.0
+        if clean_logits is not None and pruned_logits is not None and clean_logits.shape == pruned_logits.shape:
+            c_lp = F.log_softmax(clean_logits, dim=-1)
+            p_lp = F.log_softmax(pruned_logits, dim=-1)
+            out_kl = float((c_lp.exp() * (c_lp - p_lp)).sum(dim=-1).mean().item())
 
         affected_dst = torch.nonzero(per_dst_max_shift > readout_tolerance, as_tuple=False).squeeze(-1)
         affected_list = (
@@ -1140,6 +1588,7 @@ class CircuitTracer:
             if affected_dst.ndim == 0 and affected_dst.numel() == 1
             else [int(i) for i in affected_dst.tolist()]
         )
+        eff_vs_null = max_act_shift / max(null_max_shift, 1e-6) if max_act_shift > 0 else 0.0
 
         return DownstreamReadoutReport(
             src_layer=src_layer,
@@ -1153,4 +1602,10 @@ class CircuitTracer:
             readout_tolerance=readout_tolerance,
             affected_downstream_neurons=affected_list,
             is_benign_spillover=(len(affected_list) == 0),
+            output_kl_divergence=round(out_kl, 6),
+            null_baseline_max_shift=round(null_max_shift, 5),
+            null_baseline_kl=round(null_kl, 6),
+            effect_vs_null_ratio=round(eff_vs_null, 4),
+            downstream_gate_flip_rate=round(gate_flip_rate, 5),
+            relative_max_activation_shift=round(rel_max_shift, 5),
         )

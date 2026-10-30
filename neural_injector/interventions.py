@@ -146,7 +146,17 @@ class InterventionKernel:
             elif out.ndim == 3:
                 # Shape: [B, S, D] -> Transformer sequence activation
                 if spec.token_positions is not None:
-                    pos_idx = torch.as_tensor(spec.token_positions, dtype=torch.long, device=device)
+                    seq_len = out.shape[1]
+                    # Normalize negative indices (e.g. -1 -> seq_len - 1) and filter out-of-bounds
+                    # positions so single-token KV-cached decode steps (seq_len == 1) never crash.
+                    valid_positions = [
+                        (seq_len + p if p < 0 else p)
+                        for p in spec.token_positions
+                        if 0 <= (seq_len + p if p < 0 else p) < seq_len
+                    ]
+                    if not valid_positions:
+                        continue
+                    pos_idx = torch.as_tensor(valid_positions, dtype=torch.long, device=device)
                     sub = out[:, pos_idx[:, None], idx]
                     pos_cond = (
                         cond_mask[:, pos_idx, :]
@@ -270,7 +280,7 @@ class InterventionKernel:
 
 class AblationMaskOptimizer:
     """
-    Subspace / Multi-Neuron Synergistic Ablation Optimizer (Section 5.5).
+    Subspace / Multi-Neuron Synergistic Ablation Optimizer (Cammarata: 'Understanding Compounds').
     Because backup circuits ('circuit ecology') often compensate when a single neuron is ablated,
     `AblationMaskOptimizer` finds the minimal coalition of `k` neurons in `layer_name` whose
     joint ablation maximizes causal divergence or flips a target token behavior.
@@ -299,219 +309,259 @@ class AblationMaskOptimizer:
         l1_lr: float = 0.25,
         l1_penalty: float = 0.01,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> SynergisticAblationResult:
-        run_fwd = forward_fn or (lambda m, inp: m(inp))
+        def _default_fwd(m: nn.Module, inp: Any) -> Any:
+            if isinstance(inp, dict):
+                return m(inp["input_ids"]) if "input_ids" in inp else m(**inp)
+            return m(inp)
+
+        run_fwd = forward_fn or _default_fwd
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
+
         mod, hook_target, num_neurons = LayerDiscovery.resolve_module(self.model, layer_name)
         k_max = min(max_subset_size, num_neurons)
         pool_k = min(max(candidate_pool_size, k_max * 2), num_neurons)
 
-        # Step 1: Clean baseline forward pass to capture clean logits & active neuron magnitudes
-        captured_acts: List[torch.Tensor] = []
-        h_cap = (
-            mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    captured_acts.append(inp[0].detach())
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if hook_target == "input"
-            else mod.register_forward_hook(
-                lambda _m, _inp, out: captured_acts.append(
-                    (out[0] if isinstance(out, tuple) else out).detach()
-                )
-            )
-        )
-
+        was_training = self.model.training
         self.model.eval()
         try:
-            with torch.no_grad(), self.injector.without_interventions():
-                clean_out = run_fwd(self.model, inputs)
-                clean_logits = (
-                    clean_out.logits if hasattr(clean_out, "logits") else clean_out
-                ).detach().float()
-                clean_log_probs = F.log_softmax(clean_logits, dim=-1)
-                clean_probs = clean_log_probs.exp()
-        finally:
-            h_cap.remove()
+            # Step 1: Clean baseline forward pass to capture clean logits & active neuron magnitudes
+            captured_acts: List[torch.Tensor] = []
+            h_cap = (
+                mod.register_forward_pre_hook(
+                    lambda _m, inp: (
+                        captured_acts.append(inp[0].detach())
+                        if inp and isinstance(inp[0], torch.Tensor)
+                        else None
+                    )
+                )
+                if hook_target == "input"
+                else mod.register_forward_hook(
+                    lambda _m, _inp, out: captured_acts.append(
+                        (out[0] if isinstance(out, tuple) else out).detach()
+                    )
+                )
+            )
 
-        act_flat = captured_acts[-1].reshape(-1, num_neurons).float()
-        mean_abs_act = act_flat.abs().mean(dim=0)
+            try:
+                with torch.no_grad(), self.injector.without_interventions():
+                    clean_out = run_fwd(self.model, inputs)
+                    clean_logits = (
+                        clean_out.logits if hasattr(clean_out, "logits") else clean_out
+                    ).detach().float()
+                    clean_log_probs = F.log_softmax(clean_logits, dim=-1)
+                    clean_probs = clean_log_probs.exp()
+            finally:
+                h_cap.remove()
 
-        # Weight by outgoing L2 norm if available
-        if hasattr(mod, "weight") and isinstance(mod.weight, torch.Tensor):
-            w = mod.weight.detach().float()
-            if w.ndim == 3 and w.shape[-1] == num_neurons:
-                wnorm = torch.norm(w, p=2, dim=1).mean(dim=0)
-            elif mod.__class__.__name__ == "Conv1D" and w.shape[0] == num_neurons:
-                wnorm = torch.norm(w, p=2, dim=1)
-            elif w.ndim == 2 and w.shape[1] == num_neurons:
-                wnorm = torch.norm(w, p=2, dim=0)
+            act_flat = captured_acts[-1].reshape(-1, num_neurons).float()
+            if attention_mask is not None:
+                mask_flat = attention_mask.reshape(-1).to(
+                    device=act_flat.device, dtype=torch.bool
+                )
+                if mask_flat.numel() == act_flat.shape[0] and mask_flat.any():
+                    act_flat = act_flat[mask_flat]
+            mean_abs_act = act_flat.abs().mean(dim=0)
+
+            # Weight by outgoing L2 norm if available
+            if hasattr(mod, "weight") and isinstance(mod.weight, torch.Tensor):
+                w = mod.weight.detach().float()
+                if w.ndim == 3 and w.shape[-1] == num_neurons:
+                    wnorm = torch.norm(w, p=2, dim=1).mean(dim=0)
+                elif mod.__class__.__name__ == "Conv1D" and w.shape[0] == num_neurons:
+                    wnorm = torch.norm(w, p=2, dim=1)
+                elif w.ndim == 2 and w.shape[1] == num_neurons:
+                    wnorm = torch.norm(w, p=2, dim=0)
+                elif w.ndim == 2 and w.shape[0] == num_neurons:
+                    wnorm = torch.norm(w, p=2, dim=1)
+                else:
+                    wnorm = torch.ones_like(mean_abs_act)
             else:
                 wnorm = torch.ones_like(mean_abs_act)
-        else:
-            wnorm = torch.ones_like(mean_abs_act)
 
-        importance = mean_abs_act * wnorm.to(mean_abs_act.device)
-        _, top_cand_tensor = torch.topk(importance, k=pool_k)
-        candidate_indices = [int(i) for i in top_cand_tensor.tolist()]
+            importance = mean_abs_act * wnorm.to(mean_abs_act.device)
+            _, top_cand_tensor = torch.topk(importance, k=pool_k)
+            candidate_indices = [int(i) for i in top_cand_tensor.tolist()]
 
-        def _score_logits(mod_logits: torch.Tensor) -> float:
-            mod_log_probs = F.log_softmax(mod_logits.float(), dim=-1)
-            kl = float((clean_probs * (clean_log_probs - mod_log_probs)).sum(dim=-1).mean().item())
-            if target_token_ids:
-                drop = float(
-                    (
-                        clean_logits[..., target_token_ids].mean()
-                        - mod_logits.float()[..., target_token_ids].mean()
-                    ).item()
-                )
-                return kl + max(drop, 0.0)
-            return kl
+            def _masked_kl(mod_log_probs: torch.Tensor) -> torch.Tensor:
+                token_kl = (clean_probs * (clean_log_probs - mod_log_probs)).sum(dim=-1)
+                if attention_mask is not None and token_kl.shape == attention_mask.shape:
+                    m_bool = attention_mask.to(device=token_kl.device, dtype=torch.bool)
+                    if m_bool.any():
+                        return token_kl[m_bool].mean()
+                return token_kl.mean()
 
-        selected: List[int] = []
-        stepwise_scores: List[float] = []
-
-        if method == "l1_optim":
-            # Differentiable continuous mask optimization over `candidate_indices`
-            device = clean_logits.device
-            logits_alpha = nn.Parameter(torch.full((len(candidate_indices),), 2.0, device=device))
-            optimizer = torch.optim.Adam([logits_alpha], lr=l1_lr)
-            cand_idx_t = torch.as_tensor(candidate_indices, dtype=torch.long, device=device)
-
-            def _mask_pre(_m: nn.Module, inp: Any):
-                if not inp or not isinstance(inp[0], torch.Tensor):
-                    return inp
-                x = inp[0].clone()
-                gate_vals = torch.sigmoid(logits_alpha).to(dtype=x.dtype, device=x.device)
-                view_shape = [1] * (x.ndim - 1) + [-1]
-                x[..., cand_idx_t] = x[..., cand_idx_t] * gate_vals.view(*view_shape)
-                return (x,) + inp[1:]
-
-            def _mask_fwd(_m: nn.Module, _inp: Any, out: Any):
-                t0 = out[0] if isinstance(out, tuple) else out
-                if not isinstance(t0, torch.Tensor):
-                    return out
-                x = t0.clone()
-                gate_vals = torch.sigmoid(logits_alpha).to(dtype=x.dtype, device=x.device)
-                view_shape = [1] * (x.ndim - 1) + [-1]
-                x[..., cand_idx_t] = x[..., cand_idx_t] * gate_vals.view(*view_shape)
-                return (x,) + out[1:] if isinstance(out, tuple) else x
-
-            h_opt = (
-                mod.register_forward_pre_hook(_mask_pre)
-                if hook_target == "input"
-                else mod.register_forward_hook(_mask_fwd)
-            )
-            try:
-                with self.injector.without_interventions(), torch.enable_grad():
-                    for _ in range(l1_steps):
-                        optimizer.zero_grad()
-                        out_step = run_fwd(self.model, inputs)
-                        step_logits = (
-                            out_step.logits if hasattr(out_step, "logits") else out_step
-                        ).float()
-                        step_log_probs = F.log_softmax(step_logits, dim=-1)
-                        kl_term = (clean_probs * (clean_log_probs - step_log_probs)).sum(dim=-1).mean()
-                        if target_token_ids:
-                            t_drop = (
-                                clean_logits[..., target_token_ids].mean()
-                                - step_logits[..., target_token_ids].mean()
-                            )
-                            objective = kl_term + t_drop
-                        else:
-                            objective = kl_term
-                        # Maximize objective while minimizing number of ablated neurons (1 - gate)
-                        gates = torch.sigmoid(logits_alpha)
-                        ablation_mass = (1.0 - gates).sum()
-                        loss = -objective + l1_penalty * ablation_mass
-                        loss.backward()
-                        optimizer.step()
-            finally:
-                h_opt.remove()
-
-            with torch.no_grad():
-                ablation_strength = (1.0 - torch.sigmoid(logits_alpha)).detach()
-                _, best_local = torch.topk(ablation_strength, k=min(k_max, len(candidate_indices)))
-                selected = [candidate_indices[int(i)] for i in best_local.tolist()]
-                for step_i in range(1, len(selected) + 1):
-                    spec = InterventionSpec(
-                        layer_name=layer_name,
-                        neuron_indices=selected[:step_i],
-                        mode=InterventionMode.ZERO_ABLATE,
-                        pole=pole,
+            def _score_logits(mod_logits: torch.Tensor) -> float:
+                mod_log_probs = F.log_softmax(mod_logits.float(), dim=-1)
+                kl = float(_masked_kl(mod_log_probs).item())
+                if target_token_ids:
+                    drop = float(
+                        (
+                            clean_logits[..., target_token_ids].mean()
+                            - mod_logits.float()[..., target_token_ids].mean()
+                        ).item()
                     )
-                    with self.injector.temporary_interventions([spec]):
-                        m_out = run_fwd(self.model, inputs)
-                        m_logits = m_out.logits if hasattr(m_out, "logits") else m_out
-                        stepwise_scores.append(round(_score_logits(m_logits), 5))
-        else:
-            # Greedy forward subset selection
-            remaining = list(candidate_indices)
-            with torch.no_grad():
-                for _ in range(k_max):
-                    best_n: Optional[int] = None
-                    best_score = -1.0
-                    for cand in remaining:
-                        trial_set = selected + [cand]
+                    return kl + max(drop, 0.0)
+                return kl
+
+            selected: List[int] = []
+            stepwise_scores: List[float] = []
+
+            if method == "l1_optim":
+                # Differentiable continuous mask optimization over `candidate_indices`
+                device = clean_logits.device
+                logits_alpha = nn.Parameter(
+                    torch.full((len(candidate_indices),), 2.0, device=device)
+                )
+                optimizer = torch.optim.Adam([logits_alpha], lr=l1_lr)
+                cand_idx_t = torch.as_tensor(candidate_indices, dtype=torch.long, device=device)
+
+                def _apply_soft_gate(x_in: torch.Tensor) -> torch.Tensor:
+                    x = x_in.clone()
+                    sub = x[..., cand_idx_t]
+                    gate_vals = torch.sigmoid(logits_alpha).to(dtype=x.dtype, device=x.device)
+                    view_shape = [1] * (sub.ndim - 1) + [-1]
+                    g_broad = gate_vals.view(*view_shape).expand_as(sub)
+                    if pole == PoleType.POSITIVE:
+                        gated = torch.where(sub > 0, sub * g_broad, sub)
+                    elif pole == PoleType.NEGATIVE:
+                        gated = torch.where(sub < 0, sub * g_broad, sub)
+                    else:
+                        gated = sub * g_broad
+                    x[..., cand_idx_t] = gated
+                    return x
+
+                def _mask_pre(_m: nn.Module, inp: Any):
+                    if not inp or not isinstance(inp[0], torch.Tensor):
+                        return inp
+                    return (_apply_soft_gate(inp[0]),) + inp[1:]
+
+                def _mask_fwd(_m: nn.Module, _inp: Any, out: Any):
+                    t0 = out[0] if isinstance(out, tuple) else out
+                    if not isinstance(t0, torch.Tensor):
+                        return out
+                    x = _apply_soft_gate(t0)
+                    return (x,) + out[1:] if isinstance(out, tuple) else x
+
+                h_opt = (
+                    mod.register_forward_pre_hook(_mask_pre)
+                    if hook_target == "input"
+                    else mod.register_forward_hook(_mask_fwd)
+                )
+                try:
+                    with self.injector.without_interventions(), torch.enable_grad():
+                        for _ in range(l1_steps):
+                            optimizer.zero_grad()
+                            out_step = run_fwd(self.model, inputs)
+                            step_logits = (
+                                out_step.logits if hasattr(out_step, "logits") else out_step
+                            ).float()
+                            step_log_probs = F.log_softmax(step_logits, dim=-1)
+                            kl_term = _masked_kl(step_log_probs)
+                            if target_token_ids:
+                                t_drop = (
+                                    clean_logits[..., target_token_ids].mean()
+                                    - step_logits[..., target_token_ids].mean()
+                                )
+                                objective = kl_term + t_drop
+                            else:
+                                objective = kl_term
+                            # Maximize objective while minimizing number of ablated neurons (1 - gate)
+                            gates = torch.sigmoid(logits_alpha)
+                            ablation_mass = (1.0 - gates).sum()
+                            loss = -objective + l1_penalty * ablation_mass
+                            loss.backward()
+                            optimizer.step()
+                finally:
+                    h_opt.remove()
+
+                with torch.no_grad():
+                    ablation_strength = (1.0 - torch.sigmoid(logits_alpha)).detach()
+                    _, best_local = torch.topk(
+                        ablation_strength, k=min(k_max, len(candidate_indices))
+                    )
+                    selected = [candidate_indices[int(i)] for i in best_local.tolist()]
+                    for step_i in range(1, len(selected) + 1):
                         spec = InterventionSpec(
                             layer_name=layer_name,
-                            neuron_indices=trial_set,
+                            neuron_indices=selected[:step_i],
                             mode=InterventionMode.ZERO_ABLATE,
                             pole=pole,
                         )
                         with self.injector.temporary_interventions([spec]):
                             m_out = run_fwd(self.model, inputs)
                             m_logits = m_out.logits if hasattr(m_out, "logits") else m_out
-                            sc = _score_logits(m_logits)
-                        if sc > best_score:
-                            best_score = sc
-                            best_n = cand
-                    if best_n is not None:
-                        selected.append(best_n)
-                        remaining.remove(best_n)
-                        stepwise_scores.append(round(best_score, 5))
+                            stepwise_scores.append(round(_score_logits(m_logits), 5))
+            else:
+                # Greedy forward subset selection
+                remaining = list(candidate_indices)
+                with torch.no_grad():
+                    for _ in range(k_max):
+                        best_n: Optional[int] = None
+                        best_score = -1.0
+                        for cand in remaining:
+                            trial_set = selected + [cand]
+                            spec = InterventionSpec(
+                                layer_name=layer_name,
+                                neuron_indices=trial_set,
+                                mode=InterventionMode.ZERO_ABLATE,
+                                pole=pole,
+                            )
+                            with self.injector.temporary_interventions([spec]):
+                                m_out = run_fwd(self.model, inputs)
+                                m_logits = m_out.logits if hasattr(m_out, "logits") else m_out
+                                sc = _score_logits(m_logits)
+                            if sc > best_score:
+                                best_score = sc
+                                best_n = cand
+                        if best_n is not None:
+                            selected.append(best_n)
+                            remaining.remove(best_n)
+                            stepwise_scores.append(round(best_score, 5))
 
-        # Measure joint KL vs sum of individual KLs to quantify backup-circuit synergy
-        with torch.no_grad():
-            joint_spec = InterventionSpec(
-                layer_name=layer_name,
-                neuron_indices=selected,
-                mode=InterventionMode.ZERO_ABLATE,
-                pole=pole,
-            )
-            with self.injector.temporary_interventions([joint_spec]):
-                j_out = run_fwd(self.model, inputs)
-                j_logits = (j_out.logits if hasattr(j_out, "logits") else j_out).float()
-                j_log_probs = F.log_softmax(j_logits, dim=-1)
-                joint_kl = float(
-                    (clean_probs * (clean_log_probs - j_log_probs)).sum(dim=-1).mean().item()
+            # Measure joint KL vs sum of individual KLs to quantify backup-circuit synergy
+            with torch.no_grad():
+                joint_spec = InterventionSpec(
+                    layer_name=layer_name,
+                    neuron_indices=selected,
+                    mode=InterventionMode.ZERO_ABLATE,
+                    pole=pole,
                 )
-                target_shift = (
-                    float(
-                        (
-                            clean_logits[..., target_token_ids].mean()
-                            - j_logits[..., target_token_ids].mean()
-                        ).item()
+                with self.injector.temporary_interventions([joint_spec]):
+                    j_out = run_fwd(self.model, inputs)
+                    j_logits = (j_out.logits if hasattr(j_out, "logits") else j_out).float()
+                    j_log_probs = F.log_softmax(j_logits, dim=-1)
+                    joint_kl = float(_masked_kl(j_log_probs).item())
+                    target_shift = (
+                        float(
+                            (
+                                clean_logits[..., target_token_ids].mean()
+                                - j_logits[..., target_token_ids].mean()
+                            ).item()
+                        )
+                        if target_token_ids
+                        else 0.0
                     )
-                    if target_token_ids
-                    else 0.0
-                )
 
-            indiv_kl_sum = 0.0
-            for n_idx in selected:
-                indiv_kl_sum += self.injector.measure_ablation_kl_divergence(
-                    layer_name, n_idx, inputs=inputs, pole=pole
-                )
+                indiv_kl_sum = 0.0
+                for n_idx in selected:
+                    indiv_kl_sum += self.injector.measure_ablation_kl_divergence(
+                        layer_name, n_idx, inputs=inputs, pole=pole, forward_fn=run_fwd
+                    )
 
-        synergy_ratio = joint_kl / max(indiv_kl_sum, 1e-9) if selected else 1.0
-        return SynergisticAblationResult(
-            layer_name=layer_name,
-            method=method,
-            selected_neurons=selected,
-            stepwise_scores=stepwise_scores,
-            joint_ablation_kl=round(joint_kl, 5),
-            sum_of_individual_kls=round(indiv_kl_sum, 5),
-            synergy_ratio=round(synergy_ratio, 4),
-            target_logit_shift=round(target_shift, 5),
-        )
+            synergy_ratio = joint_kl / max(indiv_kl_sum, 1e-9) if selected else 1.0
+            return SynergisticAblationResult(
+                layer_name=layer_name,
+                method=method,
+                selected_neurons=selected,
+                stepwise_scores=stepwise_scores,
+                joint_ablation_kl=round(joint_kl, 5),
+                sum_of_individual_kls=round(indiv_kl_sum, 5),
+                synergy_ratio=round(synergy_ratio, 4),
+                target_logit_shift=round(target_shift, 5),
+            )
+        finally:
+            if was_training:
+                self.model.train()

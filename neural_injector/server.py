@@ -21,6 +21,7 @@ class AuditRequest(BaseModel):
     prompts: List[str] = Field(..., min_length=1, description="Corpus of text prompts to stream")
     top_k: int = Field(default=8, ge=1, le=50)
     tracked_neurons: Optional[List[int]] = Field(default=None)
+    batch_size: int = Field(default=1, ge=1, le=128)
 
 
 class InterventionRequest(BaseModel):
@@ -110,21 +111,22 @@ def create_workbench_app(
 
     @app.get("/api/layers")
     async def list_layers(include_all_linear: bool = False) -> Dict[str, Any]:
-        layers = wb_session.injector.list_targetable_layers(include_all_linear=include_all_linear)
-        return {
-            "model_name": wb_session.model_name,
-            "vocab_size": len(wb_session.tok_to_id),
-            "layers": [
-                {
-                    "name": desc.name,
-                    "module_type": desc.module_type,
-                    "num_neurons": desc.num_neurons,
-                    "hook_target": desc.hook_target,
-                    "audited": wb_session.injector.is_layer_audited(desc.name),
-                }
-                for desc in layers.values()
-            ],
-        }
+        async with session_lock:
+            layers = wb_session.injector.list_targetable_layers(include_all_linear=include_all_linear)
+            return {
+                "model_name": wb_session.model_name,
+                "vocab_size": len(wb_session.tok_to_id),
+                "layers": [
+                    {
+                        "name": desc.name,
+                        "module_type": desc.module_type,
+                        "num_neurons": desc.num_neurons,
+                        "hook_target": desc.hook_target,
+                        "audited": wb_session.injector.is_layer_audited(desc.name),
+                    }
+                    for desc in layers.values()
+                ],
+            }
 
     @app.post("/api/audit")
     async def audit_layers(req: AuditRequest) -> Dict[str, Any]:
@@ -136,6 +138,7 @@ def create_workbench_app(
                     prompts=req.prompts,
                     top_k=req.top_k,
                     tracked_neurons=req.tracked_neurons,
+                    batch_size=req.batch_size,
                 )
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -171,25 +174,26 @@ def create_workbench_app(
 
     @app.get("/api/layers/{layer_name}/neurons/{neuron_idx}")
     async def get_neuron_profile(layer_name: str, neuron_idx: int) -> Dict[str, Any]:
-        try:
-            def _get_prof() -> Dict[str, Any]:
-                profile = wb_session.injector.get_neuron_profile(
-                    layer_name=layer_name,
-                    neuron_idx=neuron_idx,
-                    unembed_weight=wb_session.unembed_weight,
-                    idx_to_token=wb_session.id_to_tok,
-                )
-                data = asdict(profile)
-                data["is_clean_candidate"] = profile.is_clean_candidate
-                return data
+        async with session_lock:
+            try:
+                def _get_prof() -> Dict[str, Any]:
+                    profile = wb_session.injector.get_neuron_profile(
+                        layer_name=layer_name,
+                        neuron_idx=neuron_idx,
+                        unembed_weight=wb_session.unembed_weight,
+                        idx_to_token=wb_session.id_to_tok,
+                    )
+                    data = asdict(profile)
+                    data["is_clean_candidate"] = profile.is_clean_candidate
+                    return data
 
-            return await asyncio.to_thread(_get_prof)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except IndexError as exc:
-            raise HTTPException(
-                status_code=400, detail=f"Neuron index {neuron_idx} out of range."
-            ) from exc
+                return await asyncio.to_thread(_get_prof)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except IndexError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Neuron index {neuron_idx} out of range."
+                ) from exc
 
     @app.post("/api/interventions")
     async def add_intervention(req: InterventionRequest) -> Dict[str, Any]:
@@ -335,7 +339,10 @@ def create_workbench_app(
     @app.post("/api/export/fold-weights")
     async def fold_weights() -> Dict[str, Any]:
         async with session_lock:
-            return await asyncio.to_thread(wb_session.injector.fold_interventions_into_weights)
+            try:
+                return await asyncio.to_thread(wb_session.injector.fold_interventions_into_weights)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/", response_class=HTMLResponse)
     async def workbench_ui() -> HTMLResponse:

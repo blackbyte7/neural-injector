@@ -155,21 +155,43 @@ class WorkbenchSession:
         device: str = "cpu",
         torch_dtype: Union[str, torch.dtype] = "auto",
         low_cpu_mem_usage: bool = True,
+        device_map: Optional[str] = None,
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
+        trust_remote_code: bool = False,
     ) -> WorkbenchSession:
         """
         Loads any HuggingFace AutoModelForCausalLM and AutoTokenizer into the Workbench
         using `torch_dtype="auto"` and `low_cpu_mem_usage=True` to avoid FP32 RAM spikes.
+        Supports `device_map="auto"` (Accelerate multi-GPU/CPU offload) and 8-bit/4-bit
+        quantized loading without calling `.to(device)` on dispatched models.
         """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id, trust_remote_code=trust_remote_code
+        )
         load_kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
         if low_cpu_mem_usage:
             load_kwargs["low_cpu_mem_usage"] = True
+        if device_map is not None:
+            load_kwargs["device_map"] = device_map
+        if load_in_8bit:
+            load_kwargs["load_in_8bit"] = True
+        if load_in_4bit:
+            load_kwargs["load_in_4bit"] = True
+        if trust_remote_code:
+            load_kwargs["trust_remote_code"] = True
+
+        use_auto_dispatch = bool(device_map is not None or load_in_8bit or load_in_4bit)
         try:
-            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
+            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+            if not use_auto_dispatch:
+                model = model.to(device)
         except Exception:
-            model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
+            model = AutoModelForCausalLM.from_pretrained(model_id)
+            if not use_auto_dispatch:
+                model = model.to(device)
         model.eval()
 
         vocab = tokenizer.get_vocab()
@@ -188,6 +210,28 @@ class WorkbenchSession:
             tokenizer=tokenizer,
             model_name=model_id,
         )
+
+    def _get_input_device(self) -> torch.device:
+        """Resolves the input device safely for both single-device and `device_map` models."""
+        model_dev = getattr(self.model, "device", None)
+        if isinstance(model_dev, torch.device) and model_dev.type != "meta":
+            return model_dev
+        for p in self.model.parameters():
+            if p.device.type != "meta":
+                return p.device
+        return torch.device("cpu")
+
+    def _supports_attention_mask(self) -> bool:
+        """Checks whether `self.model.forward` accepts `attention_mask` or `**kwargs`."""
+        try:
+            sig = inspect.signature(self.model.forward)
+            if "attention_mask" in sig.parameters:
+                return True
+            return any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            return False
 
     def get_default_eval_prompt(self) -> str:
         """
@@ -216,7 +260,7 @@ class WorkbenchSession:
         Tokenizes a text string into `(input_ids, token_strings, attention_mask)`,
         automatically marking `<pad>` tokens as False/0 in `attention_mask`.
         """
-        device = next(self.model.parameters()).device
+        device = self._get_input_device()
         if self.tokenizer is not None:
             enc = self.tokenizer(text, return_tensors="pt")
             input_ids = enc["input_ids"].to(device)
@@ -393,24 +437,86 @@ class WorkbenchSession:
         prompts: List[str],
         top_k: int = 8,
         tracked_neurons: Optional[List[int]] = None,
+        batch_size: int = 1,
     ) -> Dict[str, Any]:
-        """Streams a list of text prompts through the model to populate bipolar neuron stats."""
+        """
+        Streams a list of text prompts through the model to populate bipolar neuron stats.
+        Supports batched execution (`batch_size > 1`) with right-padding and boolean
+        `attention_mask` propagation so padded positions never contaminate neuron statistics.
+        """
         self.last_audit_prompts = list(prompts)
-        batches = []
+        encoded_items = []
         for idx, text in enumerate(prompts):
             input_ids, tok_strs, attn_mask = self.encode_prompt_with_mask(text)
-            batches.append({
-                "input_ids": input_ids,
-                "attention_mask": attn_mask,
-                "sample_ids": [idx],
-                "tokens_per_sample": [tok_strs],
-                "contexts_per_sample": [text],
-            })
+            encoded_items.append((idx, text, input_ids[0], tok_strs, attn_mask[0]))
+
+        device = self._get_input_device()
+        pad_id = (
+            getattr(self.tokenizer, "pad_token_id", None)
+            if self.tokenizer is not None
+            else None
+        )
+        if pad_id is None:
+            pad_id = (
+                getattr(self.tokenizer, "eos_token_id", None)
+                if self.tokenizer is not None
+                else None
+            )
+        if pad_id is None:
+            pad_id = self.tok_to_id.get("<pad>", 0)
+        pad_str = self.id_to_tok.get(int(pad_id), "<pad>")
+
+        batches: List[Dict[str, Any]] = []
+        eff_bs = max(1, int(batch_size))
+        for start in range(0, len(encoded_items), eff_bs):
+            chunk = encoded_items[start: start + eff_bs]
+            if len(chunk) == 1:
+                idx, text, ids_1d, tok_strs, mask_1d = chunk[0]
+                batches.append({
+                    "input_ids": ids_1d.unsqueeze(0),
+                    "attention_mask": mask_1d.unsqueeze(0),
+                    "sample_ids": [idx],
+                    "tokens_per_sample": [tok_strs],
+                    "contexts_per_sample": [text],
+                })
+            else:
+                max_len = max(item[2].numel() for item in chunk)
+                batch_ids = torch.full(
+                    (len(chunk), max_len), int(pad_id), dtype=torch.long, device=device
+                )
+                batch_mask = torch.zeros(
+                    (len(chunk), max_len), dtype=torch.bool, device=device
+                )
+                sample_ids: List[int] = []
+                tokens_per_sample: List[List[str]] = []
+                contexts_per_sample: List[str] = []
+                for b_i, (idx, text, ids_1d, tok_strs, mask_1d) in enumerate(chunk):
+                    slen = ids_1d.numel()
+                    batch_ids[b_i, :slen] = ids_1d
+                    batch_mask[b_i, :slen] = mask_1d
+                    sample_ids.append(idx)
+                    padded_toks = list(tok_strs) + [pad_str] * (max_len - len(tok_strs))
+                    tokens_per_sample.append(padded_toks)
+                    contexts_per_sample.append(text)
+                batches.append({
+                    "input_ids": batch_ids,
+                    "attention_mask": batch_mask,
+                    "sample_ids": sample_ids,
+                    "tokens_per_sample": tokens_per_sample,
+                    "contexts_per_sample": contexts_per_sample,
+                })
+
+        supports_mask = self._supports_attention_mask()
+
+        def _forward_batch(m: nn.Module, b: Dict[str, Any]) -> Any:
+            if supports_mask and b.get("attention_mask") is not None and b["input_ids"].shape[0] > 1:
+                return m(b["input_ids"], attention_mask=b["attention_mask"].to(dtype=torch.long))
+            return m(b["input_ids"])
 
         self.injector.audit_layers(
             layer_names=layer_names,
             dataloader_or_batches=batches,
-            forward_fn=lambda m, b: m(b["input_ids"]),
+            forward_fn=_forward_batch,
             top_k=top_k,
             tracked_neurons=tracked_neurons,
         )
@@ -418,6 +524,7 @@ class WorkbenchSession:
             "status": "audited",
             "layers": layer_names,
             "num_prompts": len(prompts),
+            "batch_size": eff_bs,
         }
 
     def evaluate_prompt_comparison(self, prompt: str, top_k_logits: int = 6) -> Dict[str, Any]:

@@ -5,7 +5,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,7 @@ class SteeringExporter:
     def is_spec_compilable_to_residual_vector(spec: InterventionSpec) -> bool:
         """
         Returns True if and only if `spec` is an unconditional, position-independent
-        ADDITIVE_STEER or HARD_CLAMP operation without dynamic gating.
+        ADDITIVE_STEER, HARD_CLAMP, or ZERO_ABLATE operation without dynamic gating.
         """
         return (
             spec.enabled
@@ -71,6 +71,28 @@ class SteeringExporter:
             and spec.token_positions is None
             and spec.gate_condition is None
             and spec.custom_fn is None
+        )
+
+    @staticmethod
+    def is_spec_weight_foldable(spec: InterventionSpec) -> bool:
+        """
+        Returns True if and only if `spec` is an unconditional (`PoleType.BOTH`),
+        position-independent affine neuron operation (`ZERO_ABLATE`, `SCALE`,
+        `ADDITIVE_STEER`, or `HARD_CLAMP`) without dynamic gating or custom callables.
+        """
+        return (
+            spec.enabled
+            and spec.pole == PoleType.BOTH
+            and spec.token_positions is None
+            and spec.gate_condition is None
+            and spec.custom_fn is None
+            and spec.mode
+            in (
+                InterventionMode.ZERO_ABLATE,
+                InterventionMode.SCALE,
+                InterventionMode.ADDITIVE_STEER,
+                InterventionMode.HARD_CLAMP,
+            )
         )
 
     @staticmethod
@@ -89,13 +111,7 @@ class SteeringExporter:
         composed: Dict[int, Tuple[float, float]] = {}
 
         for spec in specs:
-            if (
-                not spec.enabled
-                or spec.pole != PoleType.BOTH
-                or spec.token_positions is not None
-                or spec.gate_condition is not None
-                or spec.custom_fn is not None
-            ):
+            if not SteeringExporter.is_spec_weight_foldable(spec):
                 continue
 
             per_vals = (
@@ -131,12 +147,16 @@ class SteeringExporter:
         interventions_by_layer: Dict[str, List[InterventionSpec]],
     ) -> List[CompiledSteeringVector]:
         """
-        For any layer where all enabled interventions are unconditional ADDITIVE_STEER
-        or HARD_CLAMP operations, resolves the exact composed per-neuron affine state
-        `(scale_i, shift_i)` and compiles the linear shift in the residual stream:
-            v_steer = sum_{i} shift_i * W_down[:, i]  (shape: [d_model])
-        For neurons whose composed `scale_i == 0.0` (i.e. HARD_CLAMPed), records their
-        indices in `clamped_neurons` so dynamic activations are zeroed prior to `down_proj`.
+        For any non-MoE, non-quantized layer where all enabled interventions are unconditional
+        ADDITIVE_STEER, HARD_CLAMP, or ZERO_ABLATE operations, resolves the exact composed
+        per-neuron affine state `(scale_i, shift_i)` and compiles the linear shift:
+          - When `hook_target == "input"` (`down_proj`):
+                v_steer = sum_{i} shift_i * W_down[:, i]  (shape: [d_model])
+          - When `hook_target == "output"` (output-hooked Linear/Conv1D):
+                v_steer[i] = shift_i  (shape: [out_features])
+        For neurons whose composed `scale_i == 0.0` (i.e. HARD_CLAMPed or ZERO_ABLATEd),
+        records their indices in `clamped_neurons` so dynamic activations are zeroed prior to
+        adding `v_steer`.
         """
         compiled_list: List[CompiledSteeringVector] = []
 
@@ -147,18 +167,23 @@ class SteeringExporter:
             if not all(cls.is_spec_compilable_to_residual_vector(s) for s in enabled_specs):
                 continue
 
-            module, _, _ = LayerDiscovery.resolve_module(model, layer_name)
-            if not hasattr(module, "weight"):
+            module, hook_target, num_neurons = LayerDiscovery.resolve_module(model, layer_name)
+            if not hasattr(module, "weight") or LayerDiscovery.is_quantized_or_offloaded(module):
                 continue
 
             w = module.weight.detach()
+            # 3D MoE experts only apply to routed token subsets, so static all-token residual
+            # vectors cannot be compiled without a router mask; use standard hooks instead.
+            if w.ndim == 3 or isinstance(module, nn.Conv2d):
+                continue
+
             is_conv1d = module.__class__.__name__ == "Conv1D"
-            if w.ndim == 3:
-                # 3D MoE down_proj: [num_experts, d_model, d_mlp]
-                d_model, d_mlp = w.shape[1], w.shape[2]
-            else:
+            if hook_target == "input":
                 d_model = w.shape[1] if is_conv1d else w.shape[0]
                 d_mlp = w.shape[0] if is_conv1d else w.shape[1]
+            else:
+                d_model = num_neurons
+                d_mlp = num_neurons
 
             composed = cls._resolve_composed_neuron_affine_ops(enabled_specs, d_mlp)
             if not composed:
@@ -170,17 +195,18 @@ class SteeringExporter:
             clamped_neurons: List[int] = []
 
             for n_idx, (scale_i, shift_i) in composed.items():
-                if w.ndim == 3:
-                    col_vec = w[:, :, n_idx].float().mean(dim=0)
-                elif is_conv1d:
-                    col_vec = w[n_idx, :].float()
-                else:
-                    col_vec = w[:, n_idx].float()
-
                 if abs(scale_i) < 1e-12:
                     clamped_neurons.append(int(n_idx))
 
-                v_steer = v_steer + float(shift_i) * col_vec
+                if hook_target == "input":
+                    if is_conv1d:
+                        col_vec = w[n_idx, :].float()
+                    else:
+                        col_vec = w[:, n_idx].float()
+                    v_steer = v_steer + float(shift_i) * col_vec
+                else:
+                    v_steer[n_idx] += float(shift_i)
+
                 src_neurons.append(int(n_idx))
                 src_deltas.append(float(shift_i))
 
@@ -345,89 +371,154 @@ class SteeringExporter:
     ) -> Dict[str, Any]:
         """
         Folds unconditional (`PoleType.BOTH`, all token positions) surgical interventions
-        directly into `down_proj` weights and biases for ZERO runtime hook overhead.
-        By resolving the composed per-neuron affine state `(scale_i, shift_i)` across all
-        specs in `layer_name` first:
-          1. Adds `sum_i shift_i * W_down_original[:, i]` to `down_proj.bias`
-          2. Multiplies `W_down[:, i] *= scale_i` (which sets `W_down[:, i] = 0.0` for
-             `ZERO_ABLATE` and `HARD_CLAMP`).
-        This ensures sequential interventions on the same neuron never corrupt one another.
+        directly into module weights and biases for ZERO runtime hook overhead.
+
+        Supports BOTH:
+          - `hook_target == "input"` (e.g. `down_proj` where neuron `i` is an input column):
+              1. Adds `sum_i shift_i * W_down_original[:, i]` to `module.bias`
+              2. Multiplies `W_down[:, i] *= scale_i`
+          - `hook_target == "output"` (e.g. `fc_in`, `Conv2d`, or fallback `Linear` where neuron `i`
+            is an output row/channel `y[i] = W[i, :] @ x + b[i]`):
+              1. Multiplies `W[i, :] *= scale_i`
+              2. Updates `b[i] = b[i] * scale_i + shift_i`
+
+        Never silently drops unfoldable specs (`CONDITIONAL_GATE`, `pole != BOTH`, `WEAK_PRUNE`,
+        `POLE_RECTIFY`, or `token_positions != None`): returns `"folded_spec_ids"` so callers
+        retain all unfoldable specs in active hooks.
+        Raises `ValueError` if called on quantized/offloaded or 3D parameter-container MoE layers.
         """
         folded_summary: List[Dict[str, Any]] = []
+        folded_spec_ids: Set[int] = set()
+        retained_unfoldable_count = 0
 
         for layer_name, specs in interventions_by_layer.items():
-            module, _, _ = LayerDiscovery.resolve_module(model, layer_name)
-            is_conv1d = module.__class__.__name__ == "Conv1D" and hasattr(module, "nf")
-            if not isinstance(module, nn.Linear) and not is_conv1d:
+            enabled_specs = [s for s in specs if s.enabled]
+            if not enabled_specs:
                 continue
 
-            d_mlp = module.weight.shape[0] if is_conv1d else module.weight.shape[1]
-            out_features = module.nf if is_conv1d else module.out_features
+            module, hook_target, num_neurons = LayerDiscovery.resolve_module(model, layer_name)
+            if LayerDiscovery.is_quantized_or_offloaded(module):
+                raise ValueError(
+                    f"Cannot fold interventions into quantized or offloaded layer '{layer_name}'. "
+                    "Use active_injection() or ProductionSteeringRuntime instead."
+                )
+            if hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and module.weight.ndim == 3:
+                raise ValueError(
+                    f"Cannot fold interventions into 3D MoE parameter container '{layer_name}'. "
+                    "Use active_injection() or ProductionSteeringRuntime instead."
+                )
+
+            is_conv1d = module.__class__.__name__ == "Conv1D" and hasattr(module, "nf")
+            is_conv2d = isinstance(module, nn.Conv2d)
+            if not isinstance(module, nn.Linear) and not is_conv1d and not is_conv2d:
+                retained_unfoldable_count += len(enabled_specs)
+                continue
+
+            # Identify neurons touched by any unfoldable spec so we do not partially fold
+            # a neuron that also has a conditional or pole-specific hook on the same layer.
+            unfoldable_neurons: Set[int] = set()
+            for s in enabled_specs:
+                if not cls.is_spec_weight_foldable(s):
+                    retained_unfoldable_count += 1
+                    unfoldable_neurons.update(int(i) for i in s.neuron_indices)
 
             foldable_specs = [
                 s
-                for s in specs
-                if s.enabled
-                and s.pole == PoleType.BOTH
-                and s.token_positions is None
-                and s.gate_condition is None
-                and s.custom_fn is None
-                and s.mode
-                in (
-                    InterventionMode.ZERO_ABLATE,
-                    InterventionMode.SCALE,
-                    InterventionMode.ADDITIVE_STEER,
-                    InterventionMode.HARD_CLAMP,
-                )
+                for s in enabled_specs
+                if cls.is_spec_weight_foldable(s)
+                and not any(int(i) in unfoldable_neurons for i in s.neuron_indices)
             ]
+            for s in enabled_specs:
+                if cls.is_spec_weight_foldable(s) and s not in foldable_specs:
+                    retained_unfoldable_count += 1
+
             if not foldable_specs:
                 continue
 
-            composed = cls._resolve_composed_neuron_affine_ops(foldable_specs, d_mlp)
+            composed = cls._resolve_composed_neuron_affine_ops(foldable_specs, num_neurons)
             if not composed:
                 continue
 
             device = module.weight.device
             dtype = module.weight.dtype
-            v_shift_total = torch.zeros(out_features, dtype=dtype, device=device)
-            has_bias_shift = False
 
-            for n_idx, (scale_i, shift_i) in composed.items():
-                if abs(shift_i) > 0.0:
-                    has_bias_shift = True
+            if hook_target == "input":
+                out_features = (
+                    module.nf
+                    if is_conv1d
+                    else (module.out_channels if is_conv2d else module.out_features)
+                )
+                v_shift_total = torch.zeros(out_features, dtype=dtype, device=device)
+                has_bias_shift = False
+
+                for n_idx, (scale_i, shift_i) in composed.items():
+                    if abs(shift_i) > 0.0:
+                        has_bias_shift = True
+                        if is_conv1d:
+                            v_shift_total.add_(module.weight[n_idx, :] * float(shift_i))
+                        elif is_conv2d:
+                            v_shift_total.add_(
+                                module.weight[:, n_idx, :, :].sum(dim=(1, 2)) * float(shift_i)
+                            )
+                        else:
+                            v_shift_total.add_(module.weight[:, n_idx] * float(shift_i))
+
                     if is_conv1d:
-                        v_shift_total.add_(module.weight[n_idx, :] * float(shift_i))
+                        module.weight[n_idx, :] *= float(scale_i)
+                    elif is_conv2d:
+                        module.weight[:, n_idx, :, :] *= float(scale_i)
                     else:
-                        v_shift_total.add_(module.weight[:, n_idx] * float(shift_i))
+                        module.weight[:, n_idx] *= float(scale_i)
 
-                if is_conv1d:
-                    module.weight[n_idx, :] *= float(scale_i)
-                else:
-                    module.weight[:, n_idx] *= float(scale_i)
-
-            if has_bias_shift:
-                if module.bias is None:
+                if has_bias_shift:
+                    if module.bias is None:
+                        module.bias = nn.Parameter(
+                            torch.zeros(out_features, dtype=dtype, device=device)
+                        )
+                    module.bias.add_(v_shift_total)
+            else:
+                # hook_target == "output": y'[n_idx] = scale_i * (W[n_idx] @ x + b[n_idx]) + shift_i
+                out_features = num_neurons
+                need_bias = any(abs(shift_i) > 0.0 for _, shift_i in composed.values())
+                if need_bias and module.bias is None:
                     module.bias = nn.Parameter(
                         torch.zeros(out_features, dtype=dtype, device=device)
                     )
-                module.bias.add_(v_shift_total)
 
+                for n_idx, (scale_i, shift_i) in composed.items():
+                    if is_conv1d:
+                        module.weight[:, n_idx] *= float(scale_i)
+                    elif is_conv2d:
+                        module.weight[n_idx, :, :, :] *= float(scale_i)
+                    else:
+                        module.weight[n_idx, :] *= float(scale_i)
+
+                    if module.bias is not None:
+                        module.bias[n_idx] = (
+                            module.bias[n_idx] * float(scale_i) + float(shift_i)
+                        )
+
+            axis_word = "columns" if hook_target == "input" else "rows"
             for s in foldable_specs:
+                folded_spec_ids.add(id(s))
                 if s.mode == InterventionMode.ZERO_ABLATE:
-                    op_label = "zero_weight_columns"
+                    op_label = f"zero_weight_{axis_word}"
                 elif s.mode == InterventionMode.SCALE:
-                    op_label = f"scale_weight_columns({s.value})"
+                    op_label = f"scale_weight_{axis_word}({s.value})"
                 else:
-                    op_label = f"folded_{s.mode.value}_into_bias"
+                    op_label = f"folded_{s.mode.value}_into_{axis_word}_and_bias"
                 folded_summary.append({
                     "layer": layer_name,
                     "neurons": list(s.neuron_indices),
+                    "hook_target": hook_target,
                     "folded_op": op_label,
                 })
 
         return {
             "status": "folded_into_weights",
             "operations_applied": len(folded_summary),
+            "unfolded_specs_retained": retained_unfoldable_count,
+            "folded_spec_ids": list(folded_spec_ids),
             "details": folded_summary,
         }
 
@@ -476,11 +567,12 @@ class ProductionSteeringRuntime:
                 module, hook_target, _ = LayerDiscovery.resolve_module(self.model, cv.layer_name)
                 steer_tensor = torch.tensor(cv.vector_values, dtype=dtype, device=device)
                 compiled_layers.add(cv.layer_name)
+                clamp_idx = list(cv.clamped_neurons) if cv.clamped_neurons else []
 
                 # If any neurons in this compiled vector were HARD_CLAMPed, zero their dynamic
-                # activations before `down_proj` so adding `v_steer` gives exact clamp output.
-                if cv.clamped_neurons and hook_target == "input":
-                    clamp_idx = list(cv.clamped_neurons)
+                # activations before `down_proj` (when hook_target == "input") so adding `v_steer`
+                # gives exact clamp output.
+                if clamp_idx and hook_target == "input":
 
                     def _make_clamp_zero_pre(c_indices: List[int]):
                         def _pre_zero(_mod: nn.Module, inputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
@@ -499,18 +591,29 @@ class ProductionSteeringRuntime:
                         module.register_forward_pre_hook(_make_clamp_zero_pre(clamp_idx))
                     )
 
-                def _make_res_hook(vec: torch.Tensor):
+                def _make_res_hook(
+                    vec: torch.Tensor, c_indices: List[int], h_target: str
+                ):
                     def _fwd_hook(_mod: nn.Module, _inp: Tuple[Any, ...], out: Any) -> Any:
-                        if isinstance(out, torch.Tensor):
-                            return out + vec.to(device=out.device, dtype=out.dtype)
-                        elif isinstance(out, tuple) and isinstance(out[0], torch.Tensor):
-                            t0 = out[0]
-                            return (t0 + vec.to(device=t0.device, dtype=t0.dtype),) + out[1:]
-                        return out
+                        t0 = out[0] if isinstance(out, tuple) else out
+                        if not isinstance(t0, torch.Tensor):
+                            return out
+                        modified = t0.clone() if (c_indices and h_target == "output") else t0
+                        if c_indices and h_target == "output":
+                            idx_t = torch.as_tensor(
+                                c_indices, dtype=torch.long, device=modified.device
+                            )
+                            modified[..., idx_t] = 0.0
+                        modified = modified + vec.to(device=modified.device, dtype=modified.dtype)
+                        return (modified,) + out[1:] if isinstance(out, tuple) else modified
 
                     return _fwd_hook
 
-                self._handles.append(module.register_forward_hook(_make_res_hook(steer_tensor)))
+                self._handles.append(
+                    module.register_forward_hook(
+                        _make_res_hook(steer_tensor, clamp_idx, hook_target)
+                    )
+                )
 
         # Standard surgical neuron-basis hooks grouped by layer (for any layer not already handled by a compiled vector)
         by_layer: Dict[str, List[InterventionSpec]] = {}
@@ -635,6 +738,8 @@ class ProductionSteeringRuntime:
         self.attach(use_compiled_residual_vectors=use_compiled_residual_vectors)
         try:
             yield self
+        except Exception:
+            raise
         finally:
             self.detach()
             self.reset_latched_gates()

@@ -1547,3 +1547,392 @@ class TestReviewFixesAndEssayCompleteness:
             _ = demo_session.model(sample_prompt_ids)
             rt_latched_out = demo_session.model(neutral_single_token)
             assert torch.allclose(latched_out, rt_latched_out, atol=1e-4)
+
+
+# =============================================================================
+# 13. Statistical Calibration, Weight Folding, Falsification & Model-Agnosticism
+# =============================================================================
+class TestStatisticalCalibrationAndModelAgnosticism:
+    def test_random_init_swiglu_null_calibration(self):
+        """
+        Verifies that a randomly initialized SwiGLU model audited on random token IDs
+        is calibrated against the SwiGLU product-distribution null and does not
+        false-positive as `CLEAN_MONOSEMANTIC`.
+        """
+        torch.manual_seed(42)
+
+        class RandSwiGLUModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(500, 64)
+                self.gate_proj = nn.Linear(64, 256, bias=False)
+                self.up_proj = nn.Linear(64, 256, bias=False)
+                self.down_proj = nn.Linear(256, 64, bias=False)
+                self.head = nn.Linear(64, 500, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                e = self.embed(x)
+                h = torch.nn.functional.silu(self.gate_proj(e)) * self.up_proj(e)
+                return self.head(self.down_proj(h))
+
+        m = RandSwiGLUModel()
+        inj = NeuralInjector(m)
+        batches = [{"input_ids": torch.randint(0, 500, (4, 16))} for _ in range(5)]
+        inj.audit_layers(
+            ["down_proj"], batches, forward_fn=lambda mod, b: mod(b["input_ids"])
+        )
+        rep = inj.scan_layer_cleanliness("down_proj", compute_kl_for_top_n=0, limit=256)
+        assert rep.clean_monosemantic_pct < 5.0
+        assert rep.clean_poles_pct < 5.0
+        assert rep.taxonomy_percentages[NeuronTaxonomy.TRUE_POLYSEMANTIC.value] >= 65.0
+
+    def test_unfoldable_interventions_retained_on_weight_fold(
+        self, demo_session: WorkbenchSession
+    ):
+        """
+        Verifies that folding weights only removes intervention specs that were actually
+        folded into model parameters (`folded_spec_ids`), retaining non-foldable
+        `WEAK_PRUNE`, pole-conditional, or position-selective interventions.
+        """
+        model_copy = copy.deepcopy(demo_session.model)
+        inj = NeuralInjector(model_copy)
+        layer = "mlp_block_0.down_proj"
+
+        inj.prune_weak_activations(layer, [0, 1, 2], threshold=0.5)
+        inj.zero_ablate(layer, [7], pole=PoleType.POSITIVE)
+        inj.steer_neurons(layer, [12], delta=3.5, pole=PoleType.BOTH)
+        assert inj.active_intervention_count == 3
+
+        res = inj.fold_interventions_into_weights()
+        assert res["operations_applied"] == 1
+        assert res["unfolded_specs_retained"] == 2
+        assert inj.active_intervention_count == 2
+
+    def test_output_hook_target_exact_weight_folding_and_compiled_vector(
+        self, tmp_path: Path
+    ):
+        """
+        Verifies that custom architectures with `fc_out` (`hook_target="input"`) and
+        fallback `Linear_Output` layers (`hook_target="output"`) fold weights and
+        compile steering vectors with exact numerical equivalence.
+        """
+        torch.manual_seed(11)
+
+        class CustomFcOutMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc_in = nn.Linear(16, 32)
+                self.fc_out = nn.Linear(32, 16)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.fc_out(torch.relu(self.fc_in(x)))
+
+        m_fc = CustomFcOutMLP()
+        disc_fc = LayerDiscovery.discover_neuron_layers(m_fc)
+        assert "fc_out" in disc_fc
+        assert disc_fc["fc_out"].hook_target == "input"
+        assert disc_fc["fc_out"].num_neurons == 32
+
+        class OutputHookedLinearNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block1 = nn.Linear(16, 32)
+                self.block2 = nn.Linear(32, 8)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.block2(torch.relu(self.block1(x)))
+
+        for mode, val in [
+            (InterventionMode.ADDITIVE_STEER, 2.5),
+            (InterventionMode.HARD_CLAMP, -3.0),
+            (InterventionMode.SCALE, 0.5),
+            (InterventionMode.ZERO_ABLATE, 0.0),
+        ]:
+            net = OutputHookedLinearNet()
+            inj = NeuralInjector(net)
+            inj.add_intervention(
+                InterventionSpec(
+                    layer_name="block1",
+                    neuron_indices=[3, 7],
+                    mode=mode,
+                    pole=PoleType.BOTH,
+                    value=val,
+                )
+            )
+            x = torch.randn(4, 16)
+            with torch.no_grad(), inj.active_injection():
+                y_hook = net(x)
+
+            if mode in (InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP):
+                preset_path = tmp_path / f"out_{mode.value}.json"
+                inj.export_production_preset(save_json_path=str(preset_path))
+                rt = ProductionSteeringRuntime(net, preset_path)
+                with torch.no_grad(), rt.active(use_compiled_residual_vectors=True):
+                    y_vec = net(x)
+                assert torch.allclose(y_hook, y_vec, atol=1e-5)
+
+            fold_res = inj.fold_interventions_into_weights()
+            assert fold_res["operations_applied"] == 1
+            with torch.no_grad():
+                y_fold = net(x)
+            assert torch.allclose(y_hook, y_fold, atol=1e-5)
+
+    def test_background_neuron_verification_demotion_and_falsification_protocol(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies that low-signal background neurons in `demo_session` are demoted during
+        empirical verification rather than classified as `CLEAN_MONOSEMANTIC`, whereas
+        primary router Neuron #7 passes the falsification protocol (`falsification_outcome == 'won'`).
+        """
+        inj = demo_session.injector
+        for bg_idx in (0, 1, 2):
+            h_bg = inj.explain_neuron(
+                layer_name="mlp_block_0.down_proj",
+                neuron_idx=bg_idx,
+                tok_to_id=demo_session.tok_to_id,
+                idx_to_token=demo_session.id_to_tok,
+                unembed_weight=demo_session.unembed_weight,
+            )
+            assert h_bg.verification_report is not None
+            assert h_bg.verification_report.empirical_verification_score < 0.60
+            assert h_bg.taxonomy_class in (
+                NeuronTaxonomy.DEAD_OR_NOISY,
+                NeuronTaxonomy.TRUE_POLYSEMANTIC,
+                NeuronTaxonomy.UNVERIFIED,
+            )
+
+        h_router = inj.explain_neuron(
+            layer_name="mlp_block_0.down_proj",
+            neuron_idx=7,
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=demo_session.unembed_weight,
+            dst_layer="mlp_block_1.down_proj",
+            circuit_inputs=sample_prompt_ids,
+        )
+        rep = h_router.verification_report
+        assert rep is not None
+        assert rep.empirical_verification_score >= 0.80
+        assert rep.standardized_pole_separation_d >= 0.75
+        assert rep.positive_share_of_corpus_max >= 0.30
+        assert rep.falsification_outcome == "won"
+        assert rep.causal_kl_vs_random_ratio > 2.0
+
+    def test_kv_cache_single_token_decode_with_out_of_bounds_and_negative_positions(self):
+        """
+        Verifies that on a single-token KV-cached decode step (`seq_len == 1`),
+        out-of-bounds positive `token_positions=[4]` are safely skipped without `IndexError`,
+        while `token_positions=[-1]` normalizes to position 0 and applies the intervention.
+        """
+        x_decode = torch.ones((1, 1, 8))
+        spec_oob = InterventionSpec(
+            layer_name="dummy",
+            neuron_indices=[2],
+            mode=InterventionMode.HARD_CLAMP,
+            value=-5.0,
+            token_positions=[4],
+        )
+        out_oob = InterventionKernel.apply(x_decode, [spec_oob])
+        assert torch.allclose(out_oob, x_decode)
+
+        spec_neg = InterventionSpec(
+            layer_name="dummy",
+            neuron_indices=[2],
+            mode=InterventionMode.HARD_CLAMP,
+            value=-5.0,
+            token_positions=[-1],
+        )
+        out_neg = InterventionKernel.apply(x_decode, [spec_neg])
+        assert out_neg[0, 0, 2].item() == -5.0
+
+    def test_wide_layer_streaming_performance_and_checkpoint_persistence(
+        self, tmp_path: Path
+    ):
+        """
+        Verifies that wide MLP layers (`num_neurons=2048`) stream and update all neurons
+        efficiently via vectorized `torch.topk` and strided reservoirs, and that
+        `save_state` / `load_state` round-trips all moments, heaps, and reservoirs.
+        """
+        import time
+
+        torch.manual_seed(77)
+        tracker = StreamingLayerStats("wide_layer", num_neurons=2048, top_k=5)
+        acts = torch.randn(4, 64, 2048)
+        gates = torch.randn(4, 64, 2048)
+        ups = torch.randn(4, 64, 2048)
+
+        t0 = time.perf_counter()
+        tracker.update(acts, gate_activations=gates, up_activations=ups)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 3.5
+
+        prof_before = tracker.export_profile(1024)
+        ckpt_file = tmp_path / "stats_state.pt"
+        tracker.save_state(ckpt_file)
+        assert ckpt_file.exists()
+
+        restored = StreamingLayerStats.load_state(ckpt_file)
+        prof_after = restored.export_profile(1024)
+        assert prof_before.mean == pytest.approx(prof_after.mean, rel=1e-6)
+        assert prof_before.std == pytest.approx(prof_after.std, rel=1e-6)
+        assert prof_before.swiglu_sign_regime_rates == prof_after.swiglu_sign_regime_rates
+
+    def test_mixtral_w1_w3_and_gemma_rmsnorm_unit_offset_discovery(self):
+        """
+        Verifies Mixtral/Fairseq (`w1`=gate, `w3`=up, `w2`=down) sibling resolution
+        and Google Gemma (`pre_feedforward_layernorm` with `1.0 + weight` unit offset)
+        norm scaling.
+        """
+        class MixtralExpertMLP(nn.Module):
+            def __init__(self, d_model: int = 16, d_mlp: int = 32):
+                super().__init__()
+                self.w1 = nn.Linear(d_model, d_mlp, bias=False)
+                self.w3 = nn.Linear(d_model, d_mlp, bias=False)
+                self.w2 = nn.Linear(d_mlp, d_model, bias=False)
+
+        mix = MixtralExpertMLP()
+        w_mod, up_mod, gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(mix, "w2")
+        assert w_mod is mix.w2
+        assert up_mod is mix.w3
+        assert gate_mod is mix.w1
+
+        class GemmaRMSNorm(nn.Module):
+            def __init__(self, dim: int):
+                super().__init__()
+                self.weight = nn.Parameter(torch.full((dim,), 0.5))
+
+        class GemmaDecoderBlock(nn.Module):
+            def __init__(self, d_model: int = 16):
+                super().__init__()
+                self.input_layernorm = GemmaRMSNorm(d_model)
+                self.pre_feedforward_layernorm = GemmaRMSNorm(d_model)
+                self.mlp = MixtralExpertMLP(d_model, 32)
+                self.post_feedforward_layernorm = GemmaRMSNorm(d_model)
+
+        gemma_block = GemmaDecoderBlock()
+        resolved_norm = LayerDiscovery.resolve_pre_mlp_norm(gemma_block, "mlp.w2")
+        assert resolved_norm is gemma_block.pre_feedforward_layernorm
+        scale = LayerDiscovery.extract_norm_scale(resolved_norm)
+        assert scale is not None
+        assert torch.allclose(scale, torch.full((16,), 1.5))
+
+    def test_swiglu_four_quadrant_sign_regimes_and_firing_motifs(self):
+        """
+        Verifies 4-quadrant SwiGLU sign regime rates (`pos_gate_pos_up`, `neg_gate_neg_up`,
+        `pos_gate_neg_up`, `neg_gate_pos_up`), per-band double-negative rates, and
+        punctuation consolidation motif inference.
+        """
+        tracker = StreamingLayerStats("motif_layer", num_neurons=1, top_k=6)
+        acts = torch.tensor([[[8.0], [1.5], [-3.0], [-2.0]]])
+        gates = torch.tensor([[[2.0], [-1.0], [2.0], [-1.5]]])
+        ups = torch.tensor([[[4.0], [-3.0], [-1.5], [2.0]]])
+        tokens = [[".", ",", ";", "."]]
+
+        tracker.update(
+            acts,
+            sample_ids=[0],
+            tokens_per_sample=tokens,
+            contexts_per_sample=[". , ; ."],
+            gate_activations=gates,
+            up_activations=ups,
+        )
+        prof = tracker.export_profile(0)
+        assert prof.swiglu_sign_regime_rates["pos_gate_pos_up"] == 0.25
+        assert prof.swiglu_sign_regime_rates["neg_gate_neg_up"] == 0.25
+        assert prof.swiglu_sign_regime_rates["pos_gate_neg_up"] == 0.25
+        assert prof.swiglu_sign_regime_rates["neg_gate_pos_up"] == 0.25
+        assert prof.double_negative_band_rates["tertiary_offshoot"] == 1.0
+        assert prof.punctuation_firing_rate >= 0.75
+        assert prof.inferred_firing_motif == "punctuation_consolidation"
+
+    def test_upstream_attribution_bundles_and_residual_stream_sink_auditor(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies `cluster_incoming_attribution_bundles` and `audit_residual_stream_sinks`.
+        """
+        bundles = demo_session.injector.cluster_incoming_attribution_bundles(
+            src_layer="mlp_block_0.down_proj",
+            dst_layer="mlp_block_1.down_proj",
+            dst_neuron=12,
+            inputs=sample_prompt_ids,
+            dst_pole=PoleType.POSITIVE,
+            num_clusters=2,
+        )
+        assert len(bundles) >= 1
+        all_bundled_neurons = [n for b in bundles for n in b.upstream_neurons]
+        assert 7 in all_bundled_neurons
+
+        sink_rep = demo_session.injector.audit_residual_stream_sinks(
+            src_layer="mlp_block_0.down_proj",
+            neuron_indices=[0, 7, 12],
+            unembed_weight=demo_session.unembed_weight,
+        )
+        assert sink_rep.num_neurons_audited == 3
+        by_idx = {e.neuron_idx: e for e in sink_rep.entries}
+        # Primary router Neuron #7 strongly aligns with Layer 1 readers and unembedding
+        assert by_idx[7].max_reader_cosine > 0.5
+        assert by_idx[7].is_residual_sink_candidate is False
+
+    def test_crossword_pass_2_same_layer_sibling_clues_and_batched_audit_masking(
+        self, demo_session: WorkbenchSession
+    ):
+        """
+        Verifies that `solve_layer_ecology` with `dst_layer=None` still propagates
+        same-layer sibling anchor clues into Pass 2 contextual neurons
+        (`contextual_clues_injected_count > 0`), and tests batched `run_audit(batch_size=2)`.
+        """
+        batch_res = demo_session.run_audit(
+            layer_names=["mlp_block_0.down_proj"],
+            prompts=[
+                "the system negotiated AES256 TLS cipher",
+                "SELECT WHERE postgres",
+                "packet buffer TLS handshake",
+            ],
+            batch_size=2,
+        )
+        assert batch_res["batch_size"] == 2
+
+        demo_session.injector.ecology_map.clear()
+        ecology_rep = demo_session.injector.solve_layer_ecology(
+            layer_name="mlp_block_0.down_proj",
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=demo_session.unembed_weight,
+            dst_layer=None,
+            top_anchors=2,
+            top_contextual=2,
+        )
+        assert len(ecology_rep.anchor_neurons_explained) == 2
+        assert len(ecology_rep.contextual_neurons_explained) == 2
+        assert ecology_rep.contextual_clues_injected_count > 0
+
+    def test_cli_audit_and_llm_commands_and_quantized_weight_fold_guard(
+        self, demo_session: WorkbenchSession, capsys: pytest.CaptureFixture
+    ):
+        """
+        Verifies the `audit` and `llm` CLI/REPL commands and ensures `fold_interventions_into_weights`
+        raises a clear ValueError on quantized layers.
+        """
+        repl = NeuralInjectorREPL(demo_session)
+        repl.do_audit(
+            "mlp_block_0.down_proj the system negotiated AES256 | the system executed SELECT postgres"
+        )
+        repl.do_llm("gpt-4o-mini https://api.openai.com/v1 sk-test")
+        repl.do_llm("heuristic")
+        out = capsys.readouterr().out
+        assert "Audited 1 layer(s)" in out
+        assert "OpenAICompatibleClient" in out
+        assert "HeuristicSynthesisClient" in out
+
+        cli_main(["audit", "mlp_block_0.down_proj"])
+        assert "Audited 1 layer(s)" in capsys.readouterr().out
+
+        # Simulate a quantized module and verify weight folding is safely refused
+        model_copy = copy.deepcopy(demo_session.model)
+        setattr(model_copy.mlp_block_0.down_proj, "quant_state", object())
+        inj = NeuralInjector(model_copy)
+        inj.steer_neurons("mlp_block_0.down_proj", [7], delta=5.0)
+        with pytest.raises(ValueError, match="Cannot fold interventions"):
+            inj.fold_interventions_into_weights()
