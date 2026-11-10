@@ -1936,3 +1936,402 @@ class TestStatisticalCalibrationAndModelAgnosticism:
         inj.steer_neurons("mlp_block_0.down_proj", [7], delta=5.0)
         with pytest.raises(ValueError, match="Cannot fold interventions"):
             inj.fold_interventions_into_weights()
+
+    def test_random_init_with_token_strings_and_demo_background_noise_not_clean(
+        self, demo_session: WorkbenchSession
+    ):
+        """
+        Verifies that when `tokens_per_sample` and `contexts_per_sample` are provided
+        (as in real `run_audit` usage), small-sample lexical R^2 does not falsely boost
+        random-init neurons into `CLEAN_MONOSEMANTIC` or `STRUCTURED_RECURSIVE_MIXTURE`,
+        and that in `demo_session` the 127 random background neurons do not produce ~100%
+        clean/structured rates or outrank true router Neuron #7.
+        """
+        torch.manual_seed(42)
+
+        class RandSwiGLUModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(200, 64)
+                self.gate_proj = nn.Linear(64, 256, bias=False)
+                self.up_proj = nn.Linear(64, 256, bias=False)
+                self.down_proj = nn.Linear(256, 64, bias=False)
+                self.head = nn.Linear(64, 200, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                e = self.embed(x)
+                h = torch.nn.functional.silu(self.gate_proj(e)) * self.up_proj(e)
+                return self.head(self.down_proj(h))
+
+        m = RandSwiGLUModel()
+        inj = NeuralInjector(m)
+        batches = []
+        for b_i in range(6):
+            ids = torch.randint(0, 200, (2, 16))
+            toks = [[f"tok_{int(t)}" for t in row] for row in ids]
+            ctxs = [" ".join(r) for r in toks]
+            batches.append({
+                "input_ids": ids,
+                "sample_ids": [b_i * 2, b_i * 2 + 1],
+                "tokens_per_sample": toks,
+                "contexts_per_sample": ctxs,
+            })
+        inj.audit_layers(
+            ["down_proj"], batches, forward_fn=lambda mod, b: mod(b["input_ids"])
+        )
+        rep = inj.scan_layer_cleanliness("down_proj", compute_kl_for_top_n=0, limit=256)
+        assert rep.clean_monosemantic_pct < 5.0
+        assert rep.combined_clean_and_structured_pct < 12.0
+
+        # In demo_session, only Neuron #7 is planted in mlp_block_0.down_proj; the other 127 are random
+        demo_rep = demo_session.injector.scan_layer_cleanliness(
+            "mlp_block_0.down_proj", compute_kl_for_top_n=0, limit=128
+        )
+        assert demo_rep.combined_clean_and_structured_pct < 20.0
+        by_idx = {n.neuron_idx: n for n in demo_rep.neurons}
+        assert by_idx[7].taxonomy_class in (
+            NeuronTaxonomy.CLEAN_MONOSEMANTIC,
+            NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE,
+        )
+        assert by_idx[7].pole_selectivity_score > by_idx[101].pole_selectivity_score
+        assert by_idx[7].pole_selectivity_score > by_idx[69].pole_selectivity_score
+
+    def test_sparse_thresholded_gaussian_noise_null_calibration(self):
+        """
+        Verifies that pure i.i.d. thresholded Gaussian noise (`relu(randn - 1.8) * 3.0`,
+        ~3.6% firing rate, zero semantic structure) is calibrated against the truncated-Gaussian
+        sparse null and does not false-positive as `CLEAN_MONOSEMANTIC`.
+        """
+        torch.manual_seed(1)
+        tr = StreamingLayerStats("synthetic_sparse_noise", num_neurons=200, top_k=4)
+        x = torch.randn(8, 256, 200)
+        sparse_noise = torch.relu(x - 1.8) * 3.0
+        tr.update(sparse_noise)
+        _, pcts, _ = tr.scan_layer_cleanliness()
+        assert pcts[NeuronTaxonomy.CLEAN_MONOSEMANTIC.value] < 5.0
+        assert (
+            pcts[NeuronTaxonomy.CLEAN_MONOSEMANTIC.value]
+            + pcts[NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value]
+        ) < 15.0
+
+    def test_two_step_blind_verification_rejects_random_init_neurons_and_scale_invariance(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies that:
+          1. Hypothesis verification uses a genuinely blind 2-step protocol where the test
+             generator sees ONLY the prose hypothesis (never the neuron's audit activating tokens),
+             so random neurons in an untrained `RandLM` model do not win falsification or get
+             promoted to `semantic_verified`.
+          2. Verification scores and falsification outcomes are scale-invariant (scaling neuron
+             activations and output logits by 0.01x or 100x produces identical results).
+        """
+        torch.manual_seed(42)
+
+        class RandLM(nn.Module):
+            def __init__(self, vocab: int = 200, d: int = 32, dm: int = 64):
+                super().__init__()
+                self.embed = nn.Embedding(vocab, d)
+                self.norm0 = nn.LayerNorm(d)
+                self.gate_proj = nn.Linear(d, dm, bias=False)
+                self.up_proj = nn.Linear(d, dm, bias=False)
+                self.down_proj = nn.Linear(dm, d, bias=False)
+                self.head = nn.Linear(d, vocab, bias=False)
+
+            def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+                e = self.norm0(self.embed(input_ids))
+                h = torch.nn.functional.silu(self.gate_proj(e)) * self.up_proj(e)
+                return self.head(e + self.down_proj(h))
+
+        rm = RandLM()
+        inj = NeuralInjector(rm)
+        tok_to_id = {f"w{i}": i for i in range(200)}
+        id_to_tok = {i: f"w{i}" for i in range(200)}
+        batches = []
+        for b in range(6):
+            ids = torch.randint(0, 200, (1, 16))
+            toks = [[id_to_tok[int(t)] for t in ids[0]]]
+            batches.append({
+                "input_ids": ids,
+                "sample_ids": [b],
+                "tokens_per_sample": toks,
+                "contexts_per_sample": [" ".join(toks[0])],
+            })
+        inj.audit_layers(["down_proj"], batches, forward_fn=lambda mod, b: mod(b["input_ids"]))
+
+        wins = 0
+        verified_count = 0
+        for n_idx in range(16):
+            h = inj.explain_neuron(
+                "down_proj",
+                n_idx,
+                tok_to_id=tok_to_id,
+                idx_to_token=id_to_tok,
+                unembed_weight=rm.head.weight,
+            )
+            assert h.verification_report is not None
+            if h.verification_report.falsification_outcome == "won":
+                wins += 1
+            if h.verification_report.empirical_verification_score >= 0.60:
+                verified_count += 1
+        assert wins <= 2
+        assert verified_count <= 2
+
+        # Scale-invariance check on demo_session Neuron #7: rescale lm_head by 0.005x (tiny logits)
+        small_model = copy.deepcopy(demo_session.model)
+        with torch.no_grad():
+            small_model.lm_head.weight.mul_(0.005)
+        small_inj = NeuralInjector(small_model)
+        small_inj._stats_trackers = copy.deepcopy(demo_session.injector._stats_trackers)
+        h_small = small_inj.explain_neuron(
+            layer_name="mlp_block_0.down_proj",
+            neuron_idx=7,
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=small_model.lm_head.weight,
+            dst_layer="mlp_block_1.down_proj",
+            circuit_inputs=sample_prompt_ids,
+        )
+        assert h_small.verification_report is not None
+        assert h_small.verification_report.falsification_outcome == "won"
+        assert h_small.verification_report.empirical_verification_score >= 0.80
+
+    def test_transformers_5x_moe_parameter_container_audit_steer_and_expert_basis(self):
+        """
+        Verifies that HuggingFace `transformers 5.x` MoE architectures (`MixtralConfig`,
+        `Qwen2MoeConfig`) where experts are stored as 3D `nn.Parameter` tensors inside
+        `mlp.experts` hook the true `d_mlp` intermediate neuron basis (not the `[N, d_model]`
+        container output), succeed on `audit_layers` and `scan_layer_cleanliness`, and
+        steer specific expert neurons accurately.
+        """
+        transformers = pytest.importorskip("transformers")
+        torch.manual_seed(0)
+        for cfg_cls, extra_kw in [
+            (
+                transformers.MixtralConfig,
+                {"num_local_experts": 4, "num_experts_per_tok": 2},
+            ),
+            (
+                transformers.Qwen2MoeConfig,
+                {
+                    "num_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "moe_intermediate_size": 64,
+                    "shared_expert_intermediate_size": 64,
+                },
+            ),
+        ]:
+            cfg = cfg_cls(
+                vocab_size=128,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                max_position_embeddings=64,
+                **extra_kw,
+            )
+            m = transformers.AutoModelForCausalLM.from_config(cfg).eval()
+            inj = NeuralInjector(m)
+            layers = inj.list_targetable_layers()
+            assert len(layers) >= 2
+
+            # Pick the MoE expert layer and verify its neuron count matches d_mlp (64), not d_model (32)
+            moe_layers = [k for k in layers if "experts" in k]
+            assert len(moe_layers) >= 2
+            lname = moe_layers[0]
+            assert layers[lname].num_neurons == 64
+
+            batches = [{"input_ids": torch.randint(3, 128, (2, 12))} for _ in range(3)]
+            inj.audit_layers(
+                [lname], batches, forward_fn=lambda mod, b: mod(input_ids=b["input_ids"])
+            )
+            rep = inj.scan_layer_cleanliness(lname, compute_kl_for_top_n=0, limit=64)
+            assert rep.num_neurons == 64
+            assert rep.tokens_scanned > 0
+
+            x = torch.randint(3, 128, (1, 10))
+            with torch.no_grad():
+                base_logits = m(input_ids=x).logits
+            inj.steer_neurons(lname, [5], delta=4.0)
+            with torch.no_grad(), inj.active_injection():
+                steered_logits = m(input_ids=x).logits
+            assert not torch.allclose(base_logits, steered_logits)
+
+    def test_attention_mask_propagation_across_kl_tracing_readout_synergy_and_contrastive(
+        self, demo_session: WorkbenchSession
+    ):
+        """
+        Verifies that `attention_mask` is respected across `measure_ablation_kl_divergence`,
+        `trace_circuit` (including `position_mode="focal_token"`), `trace_incoming_circuit`,
+        `verify_downstream_readout`, `find_synergistic_ablation_set`, and
+        `discover_contrastive_neurons`, so right-padded tokens never contaminate results.
+        """
+        inj = demo_session.injector
+        # Valid sequence: 5 neutral tokens; padded suffix: 5 strong Crypto tokens with mask=0
+        valid_ids = torch.tensor([[1, 2, 13, 14, 15]], dtype=torch.long)
+        padded_ids = torch.tensor([[1, 2, 13, 14, 15, 5, 6, 7, 8, 5]], dtype=torch.long)
+        attn_mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.bool)
+
+        kl_valid = inj.measure_ablation_kl_divergence(
+            "mlp_block_0.down_proj", [7], valid_ids
+        )
+        kl_padded_masked = inj.measure_ablation_kl_divergence(
+            "mlp_block_0.down_proj", [7], padded_ids, attention_mask=attn_mask
+        )
+        assert kl_valid == pytest.approx(kl_padded_masked, abs=1e-5)
+
+        g_valid = inj.trace_circuit(
+            "mlp_block_0.down_proj",
+            "mlp_block_1.down_proj",
+            7,
+            valid_ids,
+            position_mode="focal_token",
+        )
+        g_padded = inj.trace_circuit(
+            "mlp_block_0.down_proj",
+            "mlp_block_1.down_proj",
+            7,
+            padded_ids,
+            attention_mask=attn_mask,
+            position_mode="focal_token",
+        )
+        d_valid = {e.dst_neuron: e.mean_causal_delta for e in g_valid.edges}
+        d_padded = {e.dst_neuron: e.mean_causal_delta for e in g_padded.edges}
+        assert d_valid[12] == pytest.approx(d_padded[12], abs=1e-4)
+
+        inc_valid = inj.trace_incoming_circuit(
+            "mlp_block_0.down_proj", "mlp_block_1.down_proj", 12, valid_ids
+        )
+        inc_padded = inj.trace_incoming_circuit(
+            "mlp_block_0.down_proj",
+            "mlp_block_1.down_proj",
+            12,
+            padded_ids,
+            attention_mask=attn_mask,
+        )
+        inc_d_v = {e.src_neuron: e.mean_causal_delta for e in inc_valid.edges}
+        inc_d_p = {e.src_neuron: e.mean_causal_delta for e in inc_padded.edges}
+        assert inc_d_v[7] == pytest.approx(inc_d_p[7], abs=1e-4)
+
+        ro_valid = inj.verify_downstream_readout(
+            "mlp_block_0.down_proj", "mlp_block_1.down_proj", [7], valid_ids, weak_threshold=100.0
+        )
+        ro_padded = inj.verify_downstream_readout(
+            "mlp_block_0.down_proj",
+            "mlp_block_1.down_proj",
+            [7],
+            padded_ids,
+            weak_threshold=100.0,
+            attention_mask=attn_mask,
+        )
+        assert ro_valid.max_downstream_activation_shift == pytest.approx(
+            ro_padded.max_downstream_activation_shift, abs=1e-4
+        )
+
+        syn_valid = inj.find_synergistic_ablation_set(
+            "mlp_block_0.down_proj", valid_ids, max_subset_size=2, candidate_neurons=[0, 1, 7]
+        )
+        syn_padded = inj.find_synergistic_ablation_set(
+            "mlp_block_0.down_proj",
+            padded_ids,
+            max_subset_size=2,
+            candidate_neurons=[0, 1, 7],
+            attention_mask=attn_mask,
+        )
+        assert syn_valid.joint_ablation_kl == pytest.approx(
+            syn_padded.joint_ablation_kl, abs=1e-4
+        )
+
+    def test_attention_readers_in_residual_sinks_and_direct_vs_indirect_effect(
+        self, demo_session: WorkbenchSession, sample_prompt_ids: torch.Tensor
+    ):
+        """
+        Verifies that:
+          1. `audit_residual_stream_sinks` checks downstream Attention `q_proj`/`k_proj`/`v_proj`
+             readers in addition to MLP readers so a neuron that writes exclusively into an
+             attention head's query/key/value subspace is not misclassified as an unread sink.
+          2. `decompose_direct_vs_indirect_effect` separates a neuron's direct logit contribution
+             at the output from its indirect mediated contribution through downstream layers
+             (Cammarata's Poe 'dreary' experiment).
+        """
+        transformers = pytest.importorskip("transformers")
+        torch.manual_seed(7)
+        cfg = transformers.LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+        m = transformers.AutoModelForCausalLM.from_config(cfg).eval()
+        with torch.no_grad():
+            # Make L0 neuron 3 orthogonal to L1 MLP and lm_head, but aligned with L1 self_attn.q_proj
+            attn_dir = torch.nn.functional.normalize(torch.randn(32), dim=0)
+            m.model.layers[0].mlp.down_proj.weight[:, 3] = attn_dir * 2.0
+            m.model.layers[1].mlp.up_proj.weight.sub_(
+                (m.model.layers[1].mlp.up_proj.weight @ attn_dir).unsqueeze(1)
+                * attn_dir.unsqueeze(0)
+            )
+            m.model.layers[1].mlp.gate_proj.weight.sub_(
+                (m.model.layers[1].mlp.gate_proj.weight @ attn_dir).unsqueeze(1)
+                * attn_dir.unsqueeze(0)
+            )
+            m.lm_head.weight.sub_(
+                (m.lm_head.weight @ attn_dir).unsqueeze(1) * attn_dir.unsqueeze(0)
+            )
+            m.model.layers[1].self_attn.q_proj.weight[0, :] = attn_dir * 3.0
+            m.model.layers[1].input_layernorm.weight.fill_(1.0)
+
+        inj = NeuralInjector(m)
+        sink_rep = inj.audit_residual_stream_sinks(
+            "model.layers.0.mlp.down_proj",
+            neuron_indices=[3],
+            unembed_weight=m.lm_head.weight,
+        )
+        assert sink_rep.entries[0].max_reader_cosine > 0.80
+        assert sink_rep.entries[0].is_residual_sink_candidate is False
+
+        # Direct vs Indirect effect decomposition on demo_session Neuron #7 -> token 'AES256' (id 5)
+        decomp = demo_session.injector.decompose_direct_vs_indirect_effect(
+            layer_name="mlp_block_0.down_proj",
+            neuron_idx=7,
+            inputs=sample_prompt_ids,
+            target_token_id=demo_session.tok_to_id["AES256"],
+            downstream_layer="mlp_block_1.down_proj",
+            rescue_downstream_neurons=[12],
+        )
+        assert decomp["total_ablation_prob_drop"] > 0.0
+        assert decomp["indirect_mediated_share"] > 0.25
+        assert decomp["rescued_target_prob"] > decomp["total_ablated_target_prob"]
+
+    def test_real_world_safeguards_preset_validation_and_hf_error_surfacing(
+        self, demo_session: WorkbenchSession, tmp_path: Path
+    ):
+        """
+        Verifies that `ProductionSteeringRuntime` rejects presets whose neuron indices or
+        compiled vector dimensions do not match the target model, and that
+        `WorkbenchSession.from_huggingface` surfaces configuration errors instead of
+        silently falling back to full FP32 CPU loading when explicit quantization/dispatch
+        arguments are passed.
+        """
+        demo_session.injector.clear_interventions()
+        demo_session.injector.steer_neurons("mlp_block_0.down_proj", [120], delta=2.0)
+        preset_file = tmp_path / "preset.json"
+        demo_session.injector.export_production_preset(save_json_path=str(preset_file))
+        demo_session.injector.clear_interventions()
+
+        class TinyIncompatibleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp_block_0 = nn.Module()
+                self.mlp_block_0.down_proj = nn.Linear(16, 16)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.mlp_block_0.down_proj(x)
+
+        tiny = TinyIncompatibleModel()
+        with pytest.raises(ValueError, match="out of range|dimension mismatch"):
+            rt = ProductionSteeringRuntime(tiny, preset_file)
+            rt.attach(use_compiled_residual_vectors=True)

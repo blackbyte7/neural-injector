@@ -936,22 +936,32 @@ class StreamingLayerStats:
         """
         n_total = float(max(self.count, 1))
 
+        overall_std = torch.sqrt(torch.clamp(self.m2 / n_total, min=1e-12))
+
         pos_n = torch.clamp(self.pos_count.to(torch.float64), min=1.0)
         pos_rate = pos_n / n_total
         pos_var = self.pos_m2 / pos_n
         pos_std = torch.sqrt(torch.clamp(pos_var, min=1e-12))
         pos_kurt = (self.pos_m4 / pos_n) / (pos_var.pow(2) + 1e-12)
-        pos_eff_kurt = torch.where(
-            pos_rate > 0.25,
-            torch.clamp(pos_kurt - 13.5, min=1.0),
-            torch.clamp(pos_kurt, min=1.0),
+        pos_null_kurt = torch.where(pos_rate > 0.25, 22.0, 12.5)
+        pos_eff_kurt = torch.clamp(pos_kurt - pos_null_kurt, min=1.0)
+        pos_snr = torch.where(
+            self.pos_count == 1,
+            torch.full_like(self.pos_mean, 6.0),
+            self.pos_mean.abs() / torch.clamp(pos_std, min=1e-6),
         )
-        pos_ref = torch.where(
-            pos_rate > 0.25,
-            torch.full_like(pos_rate, 0.20),
-            torch.full_like(pos_rate, 0.25),
+        pos_focal_kurt = torch.where(
+            (pos_rate <= 0.15) & (self.pos_mean.abs() >= overall_std),
+            torch.clamp((pos_snr - 2.0) * 6.0, min=1.0, max=64.0),
+            torch.ones_like(pos_snr),
         )
-        pos_sparsity_factor = (pos_ref / torch.clamp(pos_rate, min=1e-4)).pow(0.25)
+        pos_eff_kurt = torch.maximum(pos_eff_kurt, pos_focal_kurt)
+        pos_raw_sparsity = (0.20 / torch.clamp(pos_rate, min=1e-4)).pow(0.25)
+        pos_sparsity_factor = torch.where(
+            pos_eff_kurt > 1.05,
+            pos_raw_sparsity,
+            torch.clamp(pos_raw_sparsity, max=1.0),
+        )
         pos_sel = torch.where(
             self.pos_count > 0,
             torch.clamp(pos_eff_kurt.pow(0.25) * pos_sparsity_factor, min=0.0, max=100.0),
@@ -963,17 +973,25 @@ class StreamingLayerStats:
         neg_var = self.neg_m2 / neg_n
         neg_std = torch.sqrt(torch.clamp(neg_var, min=1e-12))
         neg_kurt = (self.neg_m4 / neg_n) / (neg_var.pow(2) + 1e-12)
-        neg_eff_kurt = torch.where(
-            neg_rate > 0.25,
-            torch.clamp(neg_kurt - 13.5, min=1.0),
-            torch.clamp(neg_kurt, min=1.0),
+        neg_null_kurt = torch.where(neg_rate > 0.25, 22.0, 12.5)
+        neg_eff_kurt = torch.clamp(neg_kurt - neg_null_kurt, min=1.0)
+        neg_snr = torch.where(
+            self.neg_count == 1,
+            torch.full_like(self.neg_mean, 6.0),
+            self.neg_mean.abs() / torch.clamp(neg_std, min=1e-6),
         )
-        neg_ref = torch.where(
-            neg_rate > 0.25,
-            torch.full_like(neg_rate, 0.20),
-            torch.full_like(neg_rate, 0.25),
+        neg_focal_kurt = torch.where(
+            (neg_rate <= 0.15) & (self.neg_mean.abs() >= overall_std),
+            torch.clamp((neg_snr - 2.0) * 6.0, min=1.0, max=64.0),
+            torch.ones_like(neg_snr),
         )
-        neg_sparsity_factor = (neg_ref / torch.clamp(neg_rate, min=1e-4)).pow(0.25)
+        neg_eff_kurt = torch.maximum(neg_eff_kurt, neg_focal_kurt)
+        neg_raw_sparsity = (0.20 / torch.clamp(neg_rate, min=1e-4)).pow(0.25)
+        neg_sparsity_factor = torch.where(
+            neg_eff_kurt > 1.05,
+            neg_raw_sparsity,
+            torch.clamp(neg_raw_sparsity, max=1.0),
+        )
         neg_sel = torch.where(
             self.neg_count > 0,
             torch.clamp(neg_eff_kurt.pow(0.25) * neg_sparsity_factor, min=0.0, max=100.0),
@@ -1047,6 +1065,7 @@ class StreamingLayerStats:
         punct_rate = float(punct_hits / max(n_tok, 1))
 
         # Between-token vs total activation variance ratio R^2 = SS_between / SS_total
+        # restricted to repeated tokens (len(g) >= 2) to prevent singleton degrees-of-freedom inflation
         vals = [float(s.activation_value) for s in tok_samples]
         grand_mean = sum(vals) / n_tok
         ss_total = sum((v - grand_mean) ** 2 for v in vals)
@@ -1055,12 +1074,22 @@ class StreamingLayerStats:
             for s in tok_samples:
                 if s.token_str is not None:
                     by_tok[s.token_str].append(float(s.activation_value))
-            ss_between = sum(
-                len(g) * ((sum(g) / len(g)) - grand_mean) ** 2 for g in by_tok.values()
-            )
-            r2 = float(min(max(ss_between / ss_total, 0.0), 1.0))
+            repeated_groups = [g for g in by_tok.values() if len(g) >= 2]
+            if repeated_groups:
+                ss_between = sum(
+                    len(g) * ((sum(g) / len(g)) - grand_mean) ** 2 for g in repeated_groups
+                )
+                raw_r2 = float(min(max(ss_between / ss_total, 0.0), 1.0))
+                k_rep = len(repeated_groups)
+                if n_tok > k_rep + 2:
+                    adj_r2 = 1.0 - (1.0 - raw_r2) * (n_tok - 1.0) / float(n_tok - k_rep - 1)
+                    r2 = float(min(max(adj_r2, 0.0), 1.0))
+                else:
+                    r2 = raw_r2 * float(sum(len(g) for g in repeated_groups) / max(n_tok, 1))
+            else:
+                r2 = 0.0
         else:
-            r2 = curr_conc if n_tok >= 4 else 0.0
+            r2 = 0.0
 
         if punct_rate >= 0.40:
             motif = "punctuation_consolidation"
@@ -1147,10 +1176,13 @@ class StreamingLayerStats:
         tot_rate = pos_rate + neg_rate
 
         raw_kurtosis = float((self.m4[neuron_idx] / n).item()) / ((var_val ** 2) + 1e-12)
-        eff_kurtosis = (
-            max(raw_kurtosis - 15.5, 1.0) if (pos_rate > 0.25 and neg_rate > 0.25) else max(raw_kurtosis, 1.0)
-        )
-        sparsity_factor = (0.20 / max(tot_rate, 1e-4)) ** 0.25 if tot_rate > 0 else 0.0
+        if pos_rate > 0.25 and neg_rate > 0.25:
+            eff_kurtosis = max(raw_kurtosis - 20.0, 1.0)
+        else:
+            active_kurt = raw_kurtosis * max(tot_rate, 1e-4)
+            eff_kurtosis = max(active_kurt - 12.5, 1.0)
+        raw_sparsity = (0.20 / max(tot_rate, 1e-4)) ** 0.25 if tot_rate > 0 else 0.0
+        sparsity_factor = raw_sparsity if eff_kurtosis > 1.05 else min(raw_sparsity, 1.0)
         selectivity = float(min(max((eff_kurtosis ** 0.25) * sparsity_factor, 0.0), 100.0))
 
         pos_std_vec, pos_sel_vec, neg_std_vec, neg_sel_vec = (
@@ -1161,11 +1193,26 @@ class StreamingLayerStats:
         pos_std = float(pos_std_vec[neuron_idx].item())
         neg_std = float(neg_std_vec[neuron_idx].item())
 
+        all_stds = torch.sqrt(torch.clamp(self.m2 / n, min=1e-12))
+        active_stds = all_stds[all_stds > 1e-6]
+        median_std = float(torch.median(active_stds).item()) if active_stds.numel() >= 4 else std_val
+        scale_salience = std_val / max(median_std, 1e-6) if self.num_neurons >= 8 else 1.0
+
         r2, curr_conc, next_conc, punct_rate, motif = self._compute_token_selectivity_and_motifs(
             neuron_idx, pos_rate, neg_rate, pos_std, neg_std
         )
-        if r2 >= 0.35:
-            lex_bonus = 0.85 * r2
+        salient_for_lex = (
+            scale_salience >= 4.0
+            if self.num_neurons >= 8
+            else max(selectivity, pos_sel, neg_sel) >= 1.50
+        )
+        if r2 >= 0.35 and salient_for_lex:
+            scale_boost = (
+                min(max(0.45 * math.log1p(max(scale_salience - 3.5, 0.0)), 0.0), 2.5)
+                if scale_salience >= 4.0
+                else 0.0
+            )
+            lex_bonus = 0.85 * r2 + scale_boost
             selectivity = round(selectivity + lex_bonus, 3)
             if pos_rate > 0:
                 pos_sel = round(pos_sel + lex_bonus, 3)
@@ -1281,15 +1328,21 @@ class StreamingLayerStats:
         total_rate_vec = pos_rate_vec + neg_rate_vec
 
         kurt_vec = (self.m4 / n) / (var_vec.pow(2) + 1e-12)
+        active_kurt_vec = kurt_vec * torch.clamp(total_rate_vec, min=1e-4)
         eff_kurt_vec = torch.where(
             (pos_rate_vec > 0.25) & (neg_rate_vec > 0.25),
-            torch.clamp(kurt_vec - 15.5, min=1.0),
-            torch.clamp(kurt_vec, min=1.0),
+            torch.clamp(kurt_vec - 20.0, min=1.0),
+            torch.clamp(active_kurt_vec - 12.5, min=1.0),
         )
-        sparsity_factor_vec = torch.where(
+        raw_sparsity_vec = torch.where(
             total_rate_vec > 0,
             (0.20 / torch.clamp(total_rate_vec, min=1e-4)).pow(0.25),
             torch.zeros_like(total_rate_vec),
+        )
+        sparsity_factor_vec = torch.where(
+            eff_kurt_vec > 1.05,
+            raw_sparsity_vec,
+            torch.clamp(raw_sparsity_vec, max=1.0),
         )
         selectivity_vec = torch.clamp(
             eff_kurt_vec.pow(0.25) * sparsity_factor_vec, min=0.0, max=100.0
@@ -1303,6 +1356,7 @@ class StreamingLayerStats:
         pos_std_vec, pos_sel_vec, neg_std_vec, neg_sel_vec = (
             self._compute_pole_selectivities_and_stds()
         )
+        selectivity_vec = torch.maximum(selectivity_vec, torch.maximum(pos_sel_vec, neg_sel_vec))
 
         weight_norms = torch.ones(self.num_neurons, dtype=torch.float64, device=self.device)
         if down_proj_module is not None and hasattr(down_proj_module, "weight"):
@@ -1320,8 +1374,24 @@ class StreamingLayerStats:
                     weight_norms = torch.norm(w, p=2, dim=0)
                 elif w.shape[0] == self.num_neurons:
                     weight_norms = torch.norm(w, p=2, dim=1)
+        elif (
+            down_proj_module is not None
+            and hasattr(down_proj_module, "down_proj")
+            and isinstance(getattr(down_proj_module, "down_proj"), torch.Tensor)
+        ):
+            w = getattr(down_proj_module, "down_proj").detach().to(self.device, dtype=torch.float64)
+            if w.ndim == 3 and w.shape[-1] == self.num_neurons:
+                weight_norms = torch.norm(w, p=2, dim=1).mean(dim=0)
 
         impact_vec = std_vec * weight_norms
+        active_stds = std_vec[std_vec > 1e-6]
+        median_std = (
+            float(torch.median(active_stds).item()) if active_stds.numel() >= 4 else 1.0
+        )
+        active_impacts = impact_vec[impact_vec > 1e-6]
+        median_impact = (
+            float(torch.median(active_impacts).item()) if active_impacts.numel() >= 4 else 1.0
+        )
 
         sel_cpu = selectivity_vec.cpu().tolist()
         bip_cpu = bipolar_vec.cpu().tolist()
@@ -1366,14 +1436,29 @@ class StreamingLayerStats:
             pos_heap = self.pos_heaps.get(idx, [])
             neg_heap = self.neg_heaps.get(idx, [])
             r2_i = 0.0
+            scale_salience = (
+                max(std_v / max(median_std, 1e-6), float(imp_cpu[idx]) / max(median_impact, 1e-6))
+                if self.num_neurons >= 8
+                else 1.0
+            )
             if (pos_heap and pos_heap[0][2].token_str is not None) or (
                 neg_heap and neg_heap[0][2].token_str is not None
             ):
                 r2_i, _, _, _, _ = self._compute_token_selectivity_and_motifs(
                     idx, pos_r, neg_r, pos_std_i, neg_std_i
                 )
-                if r2_i >= 0.35:
-                    lex_bonus = 0.85 * r2_i
+                salient_for_lex = (
+                    scale_salience >= 4.0
+                    if self.num_neurons >= 8
+                    else max(sel, pos_sel_i, neg_sel_i) >= 1.50
+                )
+                if r2_i >= 0.35 and salient_for_lex:
+                    scale_boost = (
+                        min(max(0.45 * math.log1p(max(scale_salience - 3.5, 0.0)), 0.0), 2.5)
+                        if scale_salience >= 4.0
+                        else 0.0
+                    )
+                    lex_bonus = 0.85 * r2_i + scale_boost
                     sel += lex_bonus
                     if pos_r > 0:
                         pos_sel_i += lex_bonus
@@ -1571,7 +1656,12 @@ class LogitLensAttributor:
         - `final_norm_module`: optional pre-unembedding LayerNorm / RMSNorm module
           (automatically handles Gemma's `1 + weight` RMSNorm parameterization).
         """
-        weight = down_proj_module.weight.detach()
+        if hasattr(down_proj_module, "weight") and isinstance(down_proj_module.weight, torch.Tensor):
+            weight = down_proj_module.weight.detach()
+        elif hasattr(down_proj_module, "down_proj") and isinstance(getattr(down_proj_module, "down_proj"), torch.Tensor):
+            weight = getattr(down_proj_module, "down_proj").detach()
+        else:
+            return [], []
         if weight.ndim == 3:
             # 3D MoE down_proj: [num_experts, d_model, d_mlp] -> average write direction across experts
             neuron_out_vec = weight[:, :, neuron_idx].mean(dim=0).to(dtype=torch.float32)

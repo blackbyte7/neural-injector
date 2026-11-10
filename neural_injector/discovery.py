@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -180,6 +180,101 @@ class LayerDiscovery:
         return int(match.group(1)) if match else None
 
     @staticmethod
+    def is_moe_param_container(module: nn.Module) -> bool:
+        """
+        Returns True if `module` is a HuggingFace transformers 5.x MoE expert container
+        (e.g. `MixtralExperts`, `Qwen2MoeExperts`, `Qwen3MoeExperts`) that stores `down_proj`
+        and `gate_up_proj` as 3D `nn.Parameter` tensors rather than child `nn.Linear` modules.
+        """
+        return (
+            hasattr(module, "down_proj")
+            and isinstance(getattr(module, "down_proj"), nn.Parameter)
+            and getattr(module, "down_proj").ndim == 3
+        )
+
+    @classmethod
+    def get_moe_param_container_d_mlp(cls, module: nn.Module) -> int:
+        """Extracts the intermediate neuron count `d_mlp` from a 3D MoE parameter container."""
+        if hasattr(module, "intermediate_dim") and isinstance(getattr(module, "intermediate_dim"), int):
+            return int(getattr(module, "intermediate_dim"))
+        if (
+            hasattr(module, "gate_up_proj")
+            and isinstance(getattr(module, "gate_up_proj"), nn.Parameter)
+            and getattr(module, "gate_up_proj").ndim == 3
+        ):
+            return int(getattr(module, "gate_up_proj").shape[1] // 2)
+        w_dp = getattr(module, "down_proj")
+        return int(w_dp.shape[-1])
+
+    @classmethod
+    def forward_moe_param_container(
+        cls,
+        module: nn.Module,
+        inputs: Tuple[torch.Tensor, ...],
+        intervention_fn: Optional[Any] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Computes the intermediate `d_mlp` SwiGLU activations `(agg_act, agg_gate, agg_up)`
+        inside a 3D MoE parameter container (`MixtralExperts`, `Qwen2MoeExperts`, `Qwen3MoeExperts`)
+        from its forward inputs `(hidden_states, top_k_index, top_k_weights)`.
+        When `intervention_fn` is provided, applies `intervention_fn` to each expert's intermediate
+        `d_mlp` activations before projecting through `down_proj[expert_idx]` and returns the
+        modified `[num_tokens, d_model]` output tensor.
+        """
+        if len(inputs) < 3 or not isinstance(inputs[0], torch.Tensor):
+            return None, None, None, None
+        hidden_states, top_k_index, top_k_weights = inputs[0], inputs[1], inputs[2]
+        if not isinstance(top_k_index, torch.Tensor) or not isinstance(top_k_weights, torch.Tensor):
+            return None, None, None, None
+
+        d_mlp = cls.get_moe_param_container_d_mlp(module)
+        num_experts = int(getattr(module, "num_experts", module.down_proj.shape[0]))
+        act_fn = getattr(module, "act_fn", torch.nn.functional.silu)
+
+        agg_act = torch.zeros(
+            (hidden_states.shape[0], d_mlp), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        agg_gate = torch.zeros_like(agg_act)
+        agg_up = torch.zeros_like(agg_act)
+        final_hidden_states = (
+            torch.zeros_like(hidden_states) if intervention_fn is not None else None
+        )
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index.long(), num_classes=num_experts + 1
+            )
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx_tensor in expert_hit:
+            expert_idx = int(expert_idx_tensor[0].item())
+            if expert_idx >= num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = torch.nn.functional.linear(
+                current_state, module.gate_up_proj[expert_idx]
+            ).chunk(2, dim=-1)
+            current_act = act_fn(gate) * up
+            w = top_k_weights[token_idx, top_k_pos, None].to(current_act.dtype)
+            agg_act.index_add_(0, token_idx, current_act * w)
+            agg_gate.index_add_(0, token_idx, gate * w)
+            agg_up.index_add_(0, token_idx, up * w)
+
+            if intervention_fn is not None and final_hidden_states is not None:
+                mod_act = intervention_fn(current_act)
+                current_out = (
+                    torch.nn.functional.linear(mod_act, module.down_proj[expert_idx])
+                    * top_k_weights[token_idx, top_k_pos, None]
+                )
+                final_hidden_states.index_add_(
+                    0, token_idx, current_out.to(final_hidden_states.dtype)
+                )
+
+        return agg_act, agg_gate, agg_up, final_hidden_states
+
+    @staticmethod
     def is_quantized_or_offloaded(module: nn.Module) -> bool:
         """
         Returns True if `module` uses quantized integer/4-bit/8-bit weights (e.g., bitsandbytes,
@@ -261,6 +356,23 @@ class LayerDiscovery:
         and 3D MoE expert tensors.
         """
         write_mod, _, num_neurons = cls.resolve_module(model, layer_name)
+
+        if cls.is_moe_param_container(write_mod):
+            w_dp = getattr(write_mod, "down_proj").detach()
+            write_view = _SlicedLinearView(w_dp)
+            up_view: Optional[nn.Module] = None
+            gate_view: Optional[nn.Module] = None
+            if (
+                hasattr(write_mod, "gate_up_proj")
+                and isinstance(getattr(write_mod, "gate_up_proj"), torch.Tensor)
+                and getattr(write_mod, "gate_up_proj").ndim == 3
+            ):
+                w_gu = getattr(write_mod, "gate_up_proj").detach()
+                if w_gu.shape[-2] == 2 * num_neurons:
+                    g_w, u_w = w_gu.chunk(2, dim=-2)
+                    gate_view = _SlicedLinearView(g_w)
+                    up_view = _SlicedLinearView(u_w)
+            return write_view, up_view, gate_view
 
         # Handle BERT / RoBERTa / ViT `...output.dense` paired with `...intermediate.dense`
         if cls._is_mlp_output_dense(model, layer_name):
@@ -525,14 +637,9 @@ class LayerDiscovery:
                         expert_idx=expert_idx,
                         is_quantized=quant_flag,
                     )
-            elif (
-                hasattr(module, "down_proj")
-                and isinstance(getattr(module, "down_proj"), nn.Parameter)
-                and getattr(module, "down_proj").ndim == 3
-            ):
+            elif cls.is_moe_param_container(module):
                 # Newer HuggingFace MoE expert container where `down_proj` is a 3D nn.Parameter
-                w_dp = getattr(module, "down_proj")
-                d_mlp = w_dp.shape[-1] if w_dp.shape[-1] >= w_dp.shape[-2] else w_dp.shape[-2]
+                d_mlp = cls.get_moe_param_container_d_mlp(module)
                 descriptors[name] = LayerDescriptor(
                     name=name,
                     module=module,

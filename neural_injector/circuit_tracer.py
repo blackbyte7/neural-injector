@@ -484,6 +484,8 @@ class CircuitTracer:
         compute_jacobian: bool = True,
         active_threshold: float = 1e-5,
         top_k: int = 16,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_mode: str = "all_active",
     ) -> CircuitGraph:
         """
         Traces the causal circuit from `(src_layer, src_neuron, src_pole)` to all neurons in `dst_layer`.
@@ -492,6 +494,8 @@ class CircuitTracer:
         automatic fallback to reverse-mode autograd if a custom op does not support dual tensors.
         """
         run_fwd = forward_fn or (lambda m, inp: m(inp))
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
         src_mod, src_target, _ = LayerDiscovery.resolve_module(self.model, src_layer)
         dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
         is_src_conv = isinstance(src_mod, nn.Conv2d)
@@ -501,6 +505,48 @@ class CircuitTracer:
         captured_dst_primal: List[torch.Tensor] = []
         captured_dst_tangent: List[Optional[torch.Tensor]] = []
         active_mask_holder: List[torch.Tensor] = []
+
+        def _compute_src_active_mask(s_col: torch.Tensor) -> torch.Tensor:
+            if attention_mask is not None and attention_mask.numel() == s_col.numel():
+                valid_mask = attention_mask.reshape(-1).to(
+                    device=s_col.device, dtype=torch.bool
+                )
+            else:
+                valid_mask = torch.ones_like(s_col, dtype=torch.bool)
+
+            if position_mode == "focal_token" and s_col.numel() > 0:
+                if src_pole == PoleType.POSITIVE:
+                    masked_col = torch.where(
+                        valid_mask, s_col, torch.full_like(s_col, float("-inf"))
+                    )
+                    focal_idx = int(masked_col.argmax().item())
+                elif src_pole == PoleType.NEGATIVE:
+                    masked_col = torch.where(
+                        valid_mask, s_col, torch.full_like(s_col, float("inf"))
+                    )
+                    focal_idx = int(masked_col.argmin().item())
+                else:
+                    masked_col = torch.where(
+                        valid_mask, s_col.abs(), torch.full_like(s_col, float("-inf"))
+                    )
+                    focal_idx = int(masked_col.argmax().item())
+                amask = torch.zeros_like(s_col, dtype=torch.bool)
+                amask[focal_idx] = True
+                return amask
+
+            if src_pole == PoleType.POSITIVE:
+                amask = (s_col > active_threshold) & valid_mask
+            elif src_pole == PoleType.NEGATIVE:
+                amask = (s_col < -active_threshold) & valid_mask
+            else:
+                amask = (s_col.abs() > active_threshold) & valid_mask
+            if not amask.any():
+                amask = (
+                    valid_mask
+                    if valid_mask.any()
+                    else torch.ones_like(s_col, dtype=torch.bool)
+                )
+            return amask
 
         def _attach_dual_src(t: torch.Tensor) -> torch.Tensor:
             primal = t.detach()
@@ -512,14 +558,7 @@ class CircuitTracer:
             else:
                 s_flat = primal.reshape(-1, primal.shape[-1])
             s_col = s_flat[:, src_neuron]
-            if src_pole == PoleType.POSITIVE:
-                amask = s_col > active_threshold
-            elif src_pole == PoleType.NEGATIVE:
-                amask = s_col < -active_threshold
-            else:
-                amask = s_col.abs() > active_threshold
-            if not amask.any():
-                amask = torch.ones_like(s_col, dtype=torch.bool)
+            amask = _compute_src_active_mask(s_col)
             active_mask_holder.append(amask)
 
             src_tangent_flat = torch.zeros_like(s_flat)
@@ -615,17 +654,7 @@ class CircuitTracer:
                 active_mask = active_mask_holder[-1]
             else:
                 src_col = src_flat[:, src_neuron]
-                active_mask = (
-                    (src_col > active_threshold)
-                    if src_pole == PoleType.POSITIVE
-                    else (
-                        (src_col < -active_threshold)
-                        if src_pole == PoleType.NEGATIVE
-                        else (src_col.abs() > active_threshold)
-                    )
-                )
-                if not active_mask.any():
-                    active_mask = torch.ones_like(src_col, dtype=torch.bool)
+                active_mask = _compute_src_active_mask(src_col)
 
             if active_mask.shape[0] != dst_flat.shape[0]:
                 dst_active_mask = torch.ones(
@@ -707,17 +736,7 @@ class CircuitTracer:
                 else dst_act.reshape(-1, dst_act.shape[-1])
             )
             src_col = src_flat[:, src_neuron].detach()
-            active_mask = (
-                (src_col > active_threshold)
-                if src_pole == PoleType.POSITIVE
-                else (
-                    (src_col < -active_threshold)
-                    if src_pole == PoleType.NEGATIVE
-                    else (src_col.abs() > active_threshold)
-                )
-            )
-            if not active_mask.any():
-                active_mask = torch.ones_like(src_col, dtype=torch.bool)
+            active_mask = _compute_src_active_mask(src_col)
             dst_active_mask = (
                 torch.ones(dst_flat.shape[0], dtype=torch.bool, device=dst_flat.device)
                 if active_mask.shape[0] != dst_flat.shape[0]
@@ -859,6 +878,7 @@ class CircuitTracer:
         dst_pole: PoleType = PoleType.POSITIVE,
         active_threshold: float = 1e-5,
         top_k: int = 8,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> CircuitGraph:
         """
         Traces the incoming upstream circuit from ALL neurons in `src_layer` into a single
@@ -871,6 +891,8 @@ class CircuitTracer:
              `mean_causal_delta` and registers all discovered edges into `self.injector.ecology_map`.
         """
         run_fwd = forward_fn or (lambda m, inp: m(inp))
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
         src_mod, src_target, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
         dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
         is_src_conv = isinstance(src_mod, nn.Conv2d)
@@ -929,14 +951,24 @@ class CircuitTracer:
                     else dst_act.reshape(-1, num_dst)
                 )
                 dst_col = dst_flat[:, dst_neuron]
-                if dst_pole == PoleType.POSITIVE:
-                    amask = dst_col.detach() > active_threshold
-                elif dst_pole == PoleType.NEGATIVE:
-                    amask = dst_col.detach() < -active_threshold
+                if attention_mask is not None and attention_mask.numel() == dst_col.numel():
+                    valid_dst_mask = attention_mask.reshape(-1).to(
+                        device=dst_col.device, dtype=torch.bool
+                    )
                 else:
-                    amask = dst_col.detach().abs() > active_threshold
+                    valid_dst_mask = torch.ones_like(dst_col, dtype=torch.bool)
+                if dst_pole == PoleType.POSITIVE:
+                    amask = (dst_col.detach() > active_threshold) & valid_dst_mask
+                elif dst_pole == PoleType.NEGATIVE:
+                    amask = (dst_col.detach() < -active_threshold) & valid_dst_mask
+                else:
+                    amask = (dst_col.detach().abs() > active_threshold) & valid_dst_mask
                 if not amask.any():
-                    amask = torch.ones_like(dst_col, dtype=torch.bool)
+                    amask = (
+                        valid_dst_mask
+                        if valid_dst_mask.any()
+                        else torch.ones_like(dst_col, dtype=torch.bool)
+                    )
 
                 target_scalar = dst_col[amask].float().mean()
                 grad_src = torch.autograd.grad(
@@ -1290,6 +1322,57 @@ class CircuitTracer:
                     if cos_mat.numel() > 0:
                         max_reader_cos = torch.maximum(max_reader_cos, cos_mat.max(dim=0).values)
 
+            # Also check downstream Attention Q/K/V readers in the same transformer block
+            block_prefix = (
+                d_layer.split(".mlp")[0]
+                if ".mlp" in d_layer
+                else (d_layer.rsplit(".", 1)[0] if "." in d_layer else "")
+            )
+            if block_prefix:
+                try:
+                    block_mod = self.model.get_submodule(block_prefix)
+                except Exception:
+                    block_mod = None
+                if block_mod is not None:
+                    attn_norm = (
+                        getattr(block_mod, "input_layernorm", None)
+                        or getattr(block_mod, "ln_1", None)
+                        or getattr(block_mod, "pre_attention_layernorm", None)
+                    )
+                    attn_scale = LayerDiscovery.extract_norm_scale(
+                        attn_norm, d_model=sub_down.shape[0], device=device, dtype=torch.float32
+                    )
+                    scaled_attn_write = (
+                        F.normalize(sub_down * attn_scale.unsqueeze(1), dim=0)
+                        if attn_scale is not None
+                        else sub_down_norm
+                    )
+                    attn_proj_names = {
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "qkv_proj",
+                        "c_attn",
+                        "query",
+                        "key",
+                        "value",
+                    }
+                    for sub_name, sub_m in block_mod.named_modules():
+                        leaf = sub_name.split(".")[-1]
+                        if leaf in attn_proj_names and hasattr(sub_m, "weight"):
+                            aw = sub_m.weight.detach().to(device=device, dtype=torch.float32)
+                            if sub_m.__class__.__name__ == "Conv1D":
+                                aw = aw.T
+                            elif aw.shape[1] != scaled_attn_write.shape[0] and aw.shape[0] == scaled_attn_write.shape[0]:
+                                aw = aw.T
+                            if aw.ndim == 2 and aw.shape[1] == scaled_attn_write.shape[0]:
+                                aw_norm = F.normalize(aw, dim=-1)
+                                acos_mat = (aw_norm @ scaled_attn_write).abs()
+                                if acos_mat.numel() > 0:
+                                    max_reader_cos = torch.maximum(
+                                        max_reader_cos, acos_mat.max(dim=0).values
+                                    )
+
         unembed_cos = torch.zeros(len(target_indices), dtype=torch.float32, device=device)
         if unembed_weight is not None:
             u_w = unembed_weight.detach().to(device=device, dtype=torch.float32)
@@ -1415,6 +1498,7 @@ class CircuitTracer:
         percentile: Optional[float] = None,
         readout_tolerance: float = 0.05,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> DownstreamReadoutReport:
         """
         Tests Cammarata's 'Nothing Reads That Combination' hypothesis
@@ -1425,6 +1509,8 @@ class CircuitTracer:
         and compares the effect against a random-neuron-set null baseline of the same size.
         """
         run_fwd = forward_fn or (lambda m, inp: m(inp))
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
         _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
         dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
         _, _, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(self.model, dst_layer)
@@ -1493,6 +1579,17 @@ class CircuitTracer:
             clean_dst = captured_dst[-1].reshape(-1, num_dst)
             clean_gate = captured_gate[-1].reshape(-1, num_dst) if captured_gate else None
 
+            valid_pos_mask: Optional[torch.Tensor] = None
+            if attention_mask is not None and attention_mask.numel() == clean_dst.shape[0]:
+                m_flat = attention_mask.reshape(-1).to(
+                    device=clean_dst.device, dtype=torch.bool
+                )
+                if m_flat.any():
+                    valid_pos_mask = m_flat
+                    clean_dst = clean_dst[valid_pos_mask]
+                    if clean_gate is not None and clean_gate.shape[0] == m_flat.numel():
+                        clean_gate = clean_gate[valid_pos_mask]
+
             prune_spec = InterventionSpec(
                 layer_name=src_layer,
                 neuron_indices=list(src_neurons),
@@ -1505,11 +1602,19 @@ class CircuitTracer:
                 pruned_out = run_fwd(self.model, inputs)
             pruned_logits = _extract_logits(pruned_out)
             pruned_dst = captured_dst[-1].reshape(-1, num_dst)
+            if valid_pos_mask is not None and pruned_dst.shape[0] == valid_pos_mask.numel():
+                pruned_dst = pruned_dst[valid_pos_mask]
             pruned_gate = (
                 captured_gate[-1].reshape(-1, num_dst)
                 if (captured_gate and len(captured_gate) >= 2)
                 else None
             )
+            if (
+                pruned_gate is not None
+                and valid_pos_mask is not None
+                and pruned_gate.shape[0] == valid_pos_mask.numel()
+            ):
+                pruned_gate = pruned_gate[valid_pos_mask]
 
             # Random-neuron-set null baseline of the same subset size k
             other_pool = [i for i in range(num_src) if i not in set(src_neurons)]
@@ -1538,6 +1643,8 @@ class CircuitTracer:
                     null_out = run_fwd(self.model, inputs)
                 null_logits = _extract_logits(null_out)
                 null_dst = captured_dst[-1].reshape(-1, num_dst)
+                if valid_pos_mask is not None and null_dst.shape[0] == valid_pos_mask.numel():
+                    null_dst = null_dst[valid_pos_mask]
                 null_diff = (clean_dst - null_dst).abs()
                 null_max_shift = (
                     float(null_diff.max().item()) if null_diff.numel() > 0 else 0.0
@@ -1545,7 +1652,11 @@ class CircuitTracer:
                 if clean_logits is not None and null_logits is not None and clean_logits.shape == null_logits.shape:
                     c_lp = F.log_softmax(clean_logits, dim=-1)
                     n_lp = F.log_softmax(null_logits, dim=-1)
-                    null_kl = float((c_lp.exp() * (c_lp - n_lp)).sum(dim=-1).mean().item())
+                    tok_kl = (c_lp.exp() * (c_lp - n_lp)).sum(dim=-1)
+                    if valid_pos_mask is not None and tok_kl.numel() == valid_pos_mask.numel():
+                        null_kl = float(tok_kl.reshape(-1)[valid_pos_mask].mean().item())
+                    else:
+                        null_kl = float(tok_kl.mean().item())
         finally:
             h_dst.remove()
             if h_gate is not None:
@@ -1580,7 +1691,11 @@ class CircuitTracer:
         if clean_logits is not None and pruned_logits is not None and clean_logits.shape == pruned_logits.shape:
             c_lp = F.log_softmax(clean_logits, dim=-1)
             p_lp = F.log_softmax(pruned_logits, dim=-1)
-            out_kl = float((c_lp.exp() * (c_lp - p_lp)).sum(dim=-1).mean().item())
+            tok_kl = (c_lp.exp() * (c_lp - p_lp)).sum(dim=-1)
+            if valid_pos_mask is not None and tok_kl.numel() == valid_pos_mask.numel():
+                out_kl = float(tok_kl.reshape(-1)[valid_pos_mask].mean().item())
+            else:
+                out_kl = float(tok_kl.mean().item())
 
         affected_dst = torch.nonzero(per_dst_max_shift > readout_tolerance, as_tuple=False).squeeze(-1)
         affected_list = (
@@ -1609,3 +1724,143 @@ class CircuitTracer:
             downstream_gate_flip_rate=round(gate_flip_rate, 5),
             relative_max_activation_shift=round(rel_max_shift, 5),
         )
+
+    @torch.no_grad()
+    def decompose_direct_vs_indirect_effect(
+        self,
+        layer_name: str,
+        neuron_idx: int,
+        inputs: Any,
+        target_token_id: int,
+        downstream_layer: str,
+        rescue_downstream_neurons: List[int],
+        pole: PoleType = PoleType.BOTH,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
+        """
+        Decomposes a neuron's total causal effect on `target_token_id` into:
+          1. Direct (unmediated) effect at the unembedding, and
+          2. Indirect effect mediated through `rescue_downstream_neurons` in `downstream_layer`
+        (Cammarata's Poe 'dreary' direct-vs-indirect mediation experiment).
+        """
+        run_fwd = forward_fn or (lambda m, inp: m(inp))
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
+        dst_mod, dst_target, _ = LayerDiscovery.resolve_module(self.model, downstream_layer)
+
+        captured_clean_dst: List[torch.Tensor] = []
+
+        h_cap = (
+            dst_mod.register_forward_pre_hook(
+                lambda _m, inp: (
+                    captured_clean_dst.append(inp[0].detach().clone())
+                    if inp and isinstance(inp[0], torch.Tensor)
+                    else None
+                )
+            )
+            if dst_target == "input"
+            else dst_mod.register_forward_hook(
+                lambda _m, _inp, out: captured_clean_dst.append(
+                    (out[0] if isinstance(out, tuple) else out).detach().clone()
+                )
+            )
+        )
+
+        def _extract_logits(out_obj: Any) -> torch.Tensor:
+            t = out_obj.logits if hasattr(out_obj, "logits") else out_obj
+            if isinstance(t, tuple) and t and isinstance(t[0], torch.Tensor):
+                t = t[0]
+            return t.detach().float()
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with self.injector.without_interventions():
+                clean_out = run_fwd(self.model, inputs)
+            clean_logits = _extract_logits(clean_out)
+            clean_dst_tensor = captured_clean_dst[-1]
+        finally:
+            h_cap.remove()
+
+        ablate_spec = InterventionSpec(
+            layer_name=layer_name,
+            neuron_indices=[neuron_idx],
+            mode=InterventionMode.ZERO_ABLATE,
+            pole=pole,
+            value=0.0,
+        )
+
+        try:
+            with self.injector.temporary_interventions([ablate_spec]):
+                ablated_out = run_fwd(self.model, inputs)
+            ablated_logits = _extract_logits(ablated_out)
+
+            rescue_idx_t = torch.as_tensor(
+                rescue_downstream_neurons, dtype=torch.long, device=clean_dst_tensor.device
+            )
+
+            def _patch_pre(_m: nn.Module, inp: Tuple[Any, ...]) -> Tuple[Any, ...]:
+                if inp and isinstance(inp[0], torch.Tensor):
+                    patched = inp[0].clone()
+                    patched[..., rescue_idx_t] = clean_dst_tensor[..., rescue_idx_t].to(
+                        device=patched.device, dtype=patched.dtype
+                    )
+                    return (patched,) + inp[1:]
+                return inp
+
+            def _patch_post(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> Any:
+                t0 = out[0] if isinstance(out, tuple) else out
+                if isinstance(t0, torch.Tensor):
+                    patched = t0.clone()
+                    patched[..., rescue_idx_t] = clean_dst_tensor[..., rescue_idx_t].to(
+                        device=patched.device, dtype=patched.dtype
+                    )
+                    return (patched,) + out[1:] if isinstance(out, tuple) else patched
+                return out
+
+            h_rescue = (
+                dst_mod.register_forward_pre_hook(_patch_pre)
+                if dst_target == "input"
+                else dst_mod.register_forward_hook(_patch_post)
+            )
+            try:
+                with self.injector.temporary_interventions([ablate_spec]):
+                    rescued_out = run_fwd(self.model, inputs)
+                rescued_logits = _extract_logits(rescued_out)
+            finally:
+                h_rescue.remove()
+        finally:
+            if was_training:
+                self.model.train()
+
+        clean_probs = F.softmax(clean_logits, dim=-1)[..., target_token_id]
+        ablated_probs = F.softmax(ablated_logits, dim=-1)[..., target_token_id]
+        rescued_probs = F.softmax(rescued_logits, dim=-1)[..., target_token_id]
+
+        if attention_mask is not None and attention_mask.numel() == clean_probs.numel():
+            m_flat = attention_mask.reshape(-1).to(device=clean_probs.device, dtype=torch.bool)
+            if m_flat.any():
+                clean_probs = clean_probs.reshape(-1)[m_flat]
+                ablated_probs = ablated_probs.reshape(-1)[m_flat]
+                rescued_probs = rescued_probs.reshape(-1)[m_flat]
+
+        c_p = float(clean_probs.mean().item())
+        a_p = float(ablated_probs.mean().item())
+        r_p = float(rescued_probs.mean().item())
+
+        total_drop = max(0.0, c_p - a_p)
+        indirect_recovered = max(0.0, r_p - a_p)
+        direct_remaining = max(0.0, c_p - r_p)
+        denom = max(total_drop, 1e-8)
+
+        return {
+            "clean_target_prob": round(c_p, 6),
+            "total_ablated_target_prob": round(a_p, 6),
+            "rescued_target_prob": round(r_p, 6),
+            "total_ablation_prob_drop": round(total_drop, 6),
+            "indirect_mediated_prob_effect": round(indirect_recovered, 6),
+            "direct_unmediated_prob_effect": round(direct_remaining, 6),
+            "indirect_mediated_share": round(min(1.0, indirect_recovered / denom), 4),
+            "direct_unmediated_share": round(min(1.0, direct_remaining / denom), 4),
+        }

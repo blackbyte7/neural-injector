@@ -399,7 +399,10 @@ class NeuralInjector:
 
                     def _make_det_fwd(s_obj: InterventionSpec, conv_f: bool):
                         def _det_fwd(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
-                            act = output[0] if isinstance(output, tuple) else output
+                            if LayerDiscovery.is_moe_param_container(_mod):
+                                act, _, _, _ = LayerDiscovery.forward_moe_param_container(_mod, _inputs)
+                            else:
+                                act = output[0] if isinstance(output, tuple) else output
                             if isinstance(act, torch.Tensor) and s_obj.gate_condition:
                                 conditional_masks[id(s_obj)] = (
                                     InterventionKernel.compute_detector_mask(
@@ -451,6 +454,19 @@ class NeuralInjector:
 
                     def _make_fwd_hook(layer_specs: List[InterventionSpec], conv_flag: bool):
                         def _fwd_hook(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> Any:
+                            if LayerDiscovery.is_moe_param_container(_mod):
+                                _, _, _, mod_out = LayerDiscovery.forward_moe_param_container(
+                                    _mod,
+                                    _inputs,
+                                    intervention_fn=lambda act: InterventionKernel.apply(
+                                        act,
+                                        layer_specs,
+                                        is_conv2d=False,
+                                        conditional_masks=conditional_masks,
+                                        latched_masks=latched_masks,
+                                    ),
+                                )
+                                return mod_out if mod_out is not None else output
                             if isinstance(output, torch.Tensor):
                                 return InterventionKernel.apply(
                                     output,
@@ -668,6 +684,27 @@ class NeuralInjector:
 
                     def _make_audit_fwd_hook(t: StreamingLayerStats):
                         def _hook(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
+                            if LayerDiscovery.is_moe_param_container(_mod):
+                                act, g_act, u_act, _ = LayerDiscovery.forward_moe_param_container(
+                                    _mod, _inputs
+                                )
+                                if isinstance(act, torch.Tensor):
+                                    t.update(
+                                        act.detach(),
+                                        sample_ids=current_batch_meta.get("sample_ids"),
+                                        tokens_per_sample=current_batch_meta.get("tokens_per_sample"),
+                                        contexts_per_sample=current_batch_meta.get(
+                                            "contexts_per_sample"
+                                        ),
+                                        tracked_neurons=tracked_neurons,
+                                        attention_mask=current_batch_meta.get("attention_mask"),
+                                        routed_token_indices=current_batch_meta.get(
+                                            "routed_token_indices"
+                                        ),
+                                        gate_activations=g_act.detach() if isinstance(g_act, torch.Tensor) else None,
+                                        up_activations=u_act.detach() if isinstance(u_act, torch.Tensor) else None,
+                                    )
+                                return
                             act = output[0] if isinstance(output, tuple) else output
                             if isinstance(act, torch.Tensor):
                                 t.update(
@@ -734,7 +771,7 @@ class NeuralInjector:
 
         if unembed_weight is not None:
             module, _, _ = LayerDiscovery.resolve_module(self.model, layer_name)
-            if hasattr(module, "weight"):
+            if hasattr(module, "weight") or LayerDiscovery.is_moe_param_container(module):
                 final_norm = LayerDiscovery.resolve_final_norm(self.model)
                 promoted, suppressed = LogitLensAttributor.attribute_neuron_to_vocab(
                     down_proj_module=module,
@@ -752,14 +789,16 @@ class NeuralInjector:
     def measure_ablation_kl_divergence(
         self,
         layer_name: str,
-        neuron_idx: int,
+        neuron_idx: Union[int, List[int]],
         inputs: Any,
         pole: PoleType = PoleType.BOTH,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> float:
         """
-        Measures the exact causal impact of zero-ablating a single neuron (or one of its poles)
-        by computing the KL-Divergence D_KL(P_clean || P_ablated) on the model's output logits.
+        Measures the exact causal impact of zero-ablating a single neuron or list of neurons
+        (or one of its poles) by computing the KL-Divergence D_KL(P_clean || P_ablated) on
+        the model's output logits.
         """
         def _default_fwd(m: nn.Module, inp: Any) -> Any:
             if isinstance(inp, dict):
@@ -767,6 +806,9 @@ class NeuralInjector:
             return m(inp)
 
         run_fwd = forward_fn or _default_fwd
+        target_indices = [neuron_idx] if isinstance(neuron_idx, int) else list(neuron_idx)
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
         with self._lock:
             was_training = self.model.training
             self.model.eval()
@@ -781,7 +823,7 @@ class NeuralInjector:
 
                 ablate_spec = InterventionSpec(
                     layer_name=layer_name,
-                    neuron_indices=[neuron_idx],
+                    neuron_indices=target_indices,
                     mode=InterventionMode.ZERO_ABLATE,
                     pole=pole,
                     value=0.0,
@@ -794,12 +836,14 @@ class NeuralInjector:
                     ablated_log_probs = torch.log_softmax(ablated_logits.float(), dim=-1)
 
                 token_kl = (clean_probs * (clean_log_probs - ablated_log_probs)).sum(dim=-1)
-                if isinstance(inputs, dict) and inputs.get("attention_mask") is not None:
-                    mask = inputs["attention_mask"].to(
+                if attention_mask is not None:
+                    mask = attention_mask.to(
                         device=token_kl.device, dtype=torch.bool
                     )
                     if mask.shape == token_kl.shape and mask.any():
                         return float(token_kl[mask].mean().item())
+                    if mask.numel() == token_kl.numel() and mask.any():
+                        return float(token_kl.reshape(-1)[mask.reshape(-1)].mean().item())
                 return float(token_kl.mean().item())
             finally:
                 if was_training:
@@ -818,6 +862,8 @@ class NeuralInjector:
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
         compute_jacobian: bool = True,
         top_k: int = 10,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_mode: str = "all_active",
     ) -> CircuitGraph:
         """
         Traces how `(src_layer, src_neuron, src_pole)` excites, inhibits, or gates
@@ -833,6 +879,8 @@ class NeuralInjector:
                 src_pole=src_pole,
                 compute_jacobian=compute_jacobian,
                 top_k=top_k,
+                attention_mask=attention_mask,
+                position_mode=position_mode,
             )
 
     def trace_incoming_circuit(
@@ -844,6 +892,7 @@ class NeuralInjector:
         dst_pole: PoleType = PoleType.POSITIVE,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
         top_k: int = 8,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> CircuitGraph:
         """
         Traces incoming upstream connections from ALL neurons in `src_layer` into a single
@@ -859,6 +908,7 @@ class NeuralInjector:
                 forward_fn=forward_fn,
                 dst_pole=dst_pole,
                 top_k=top_k,
+                attention_mask=attention_mask,
             )
 
     def cluster_incoming_attribution_bundles(
@@ -944,6 +994,7 @@ class NeuralInjector:
         percentile: Optional[float] = None,
         readout_tolerance: float = 0.05,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> DownstreamReadoutReport:
         """
         Tests Cammarata's 'Nothing Reads That Combination' hypothesis
@@ -961,6 +1012,36 @@ class NeuralInjector:
                 percentile=percentile,
                 readout_tolerance=readout_tolerance,
                 forward_fn=forward_fn,
+                attention_mask=attention_mask,
+            )
+
+    def decompose_direct_vs_indirect_effect(
+        self,
+        layer_name: str,
+        neuron_idx: int,
+        inputs: Any,
+        target_token_id: int,
+        downstream_layer: str,
+        rescue_downstream_neurons: List[int],
+        pole: PoleType = PoleType.BOTH,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
+        """
+        Decomposes a neuron's total causal effect on `target_token_id` into its direct
+        (unmediated) logit effect and its indirect effect mediated through `rescue_downstream_neurons`.
+        """
+        with self._lock:
+            return self.tracer.decompose_direct_vs_indirect_effect(
+                layer_name=layer_name,
+                neuron_idx=neuron_idx,
+                inputs=inputs,
+                target_token_id=target_token_id,
+                downstream_layer=downstream_layer,
+                rescue_downstream_neurons=rescue_downstream_neurons,
+                pole=pole,
+                forward_fn=forward_fn,
+                attention_mask=attention_mask,
             )
 
     # -------------------------------------------------------------------------
@@ -1306,6 +1387,8 @@ class NeuralInjector:
         target_token_ids: Optional[List[int]] = None,
         pole: PoleType = PoleType.BOTH,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+        candidate_neurons: Optional[List[int]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> SynergisticAblationResult:
         """
         Subspace / Multi-Neuron Synergistic Ablation:
@@ -1322,6 +1405,8 @@ class NeuralInjector:
                 target_token_ids=target_token_ids,
                 pole=pole,
                 forward_fn=forward_fn,
+                candidate_neurons=candidate_neurons,
+                attention_mask=attention_mask,
             )
 
     # -------------------------------------------------------------------------

@@ -310,6 +310,7 @@ class AblationMaskOptimizer:
         l1_penalty: float = 0.01,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        candidate_neurons: Optional[List[int]] = None,
     ) -> SynergisticAblationResult:
         def _default_fwd(m: nn.Module, inp: Any) -> Any:
             if isinstance(inp, dict):
@@ -382,8 +383,13 @@ class AblationMaskOptimizer:
                 wnorm = torch.ones_like(mean_abs_act)
 
             importance = mean_abs_act * wnorm.to(mean_abs_act.device)
-            _, top_cand_tensor = torch.topk(importance, k=pool_k)
-            candidate_indices = [int(i) for i in top_cand_tensor.tolist()]
+            if candidate_neurons is not None:
+                candidate_indices = [
+                    int(i) for i in candidate_neurons if 0 <= int(i) < num_neurons
+                ]
+            else:
+                _, top_cand_tensor = torch.topk(importance, k=pool_k)
+                candidate_indices = [int(i) for i in top_cand_tensor.tolist()]
 
             def _masked_kl(mod_log_probs: torch.Tensor) -> torch.Tensor:
                 token_kl = (clean_probs * (clean_log_probs - mod_log_probs)).sum(dim=-1)

@@ -189,9 +189,10 @@ class WorkbenchSession:
             if not use_auto_dispatch:
                 model = model.to(device)
         except Exception:
+            if use_auto_dispatch:
+                raise
             model = AutoModelForCausalLM.from_pretrained(model_id)
-            if not use_auto_dispatch:
-                model = model.to(device)
+            model = model.to(device)
         model.eval()
 
         vocab = tokenizer.get_vocab()

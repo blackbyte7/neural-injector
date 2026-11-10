@@ -549,8 +549,61 @@ class ProductionSteeringRuntime:
         """Clears any latched KV-cache masks accumulated by `sticky_on_decode` conditional gates."""
         self._latched_masks.clear()
 
+    def _validate_against_model(self, use_compiled_residual_vectors: bool = False) -> None:
+        """
+        Validates that all layer names, neuron indices, and compiled vector dimensions
+        in the loaded preset match `self.model` before attaching hooks.
+        """
+        for s in self.specs:
+            _, _, num_neurons = LayerDiscovery.resolve_module(self.model, s.layer_name)
+            for idx in s.neuron_indices:
+                if idx < 0 or idx >= num_neurons:
+                    raise ValueError(
+                        f"Neuron index {idx} in preset spec for layer '{s.layer_name}' "
+                        f"is out of range for model layer with {num_neurons} neurons."
+                    )
+            if s.gate_condition is not None:
+                _, _, det_num = LayerDiscovery.resolve_module(
+                    self.model, s.gate_condition.detector_layer
+                )
+                d_idx = s.gate_condition.detector_neuron
+                if d_idx < 0 or d_idx >= det_num:
+                    raise ValueError(
+                        f"Detector neuron index {d_idx} for layer "
+                        f"'{s.gate_condition.detector_layer}' is out of range ({det_num})."
+                    )
+
+        if use_compiled_residual_vectors and self.bundle.compiled_vectors:
+            for cv in self.bundle.compiled_vectors:
+                module, hook_target, num_neurons = LayerDiscovery.resolve_module(
+                    self.model, cv.layer_name
+                )
+                for c_idx in cv.clamped_neurons or []:
+                    if c_idx < 0 or c_idx >= num_neurons:
+                        raise ValueError(
+                            f"Clamped neuron index {c_idx} in compiled vector for layer "
+                            f"'{cv.layer_name}' is out of range for {num_neurons} neurons."
+                        )
+                expected_dim: Optional[int] = None
+                if isinstance(module, nn.Linear):
+                    expected_dim = module.out_features
+                elif hasattr(module, "weight") and isinstance(module.weight, torch.Tensor):
+                    if module.__class__.__name__ == "Conv1D":
+                        expected_dim = int(module.weight.shape[1])
+                    elif module.weight.ndim == 2:
+                        expected_dim = int(module.weight.shape[0])
+                if expected_dim is not None and len(cv.vector_values) != expected_dim:
+                    raise ValueError(
+                        f"Compiled steering vector dimension mismatch for layer '{cv.layer_name}': "
+                        f"preset vector has length {len(cv.vector_values)}, but model module has "
+                        f"output dimension {expected_dim}."
+                    )
+
     def attach(self, use_compiled_residual_vectors: bool = False) -> None:
         self.detach()
+        self._validate_against_model(
+            use_compiled_residual_vectors=use_compiled_residual_vectors
+        )
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         conditional_masks: Dict[int, torch.Tensor] = {}

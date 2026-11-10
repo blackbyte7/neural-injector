@@ -712,6 +712,64 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             proposed_experiment=exp_spec,
         )
 
+    def generate_blind_experiment(
+        self,
+        hypothesis: BipolarVerbHypothesis,
+        tok_to_id: Dict[str, int],
+        profile: Optional[NeuronPoleProfile] = None,
+    ) -> VerificationExperimentSpec:
+        """
+        Step 2 of Cammarata's 2-Step Blind Verification Protocol ('How Do We Know Explanations Are Right?'):
+        Constructs a held-out / blind experimental test specification from the hypothesis prose and
+        predicted output vocabulary without memorizing the single peak audit token (`top_positive_samples[0]`
+        / `top_negative_samples[0]`). By combining held-out secondary motif tokens with the neuron's
+        predicted promoted/suppressed output tokens, random-init neurons (whose input and output weights
+        are independent) fail to generalize while true semantic routers pass cleanly.
+        """
+        exp = hypothesis.proposed_experiment
+        if profile is None or not tok_to_id:
+            return exp
+
+        top1_pos = (
+            profile.top_positive_samples[0].token_str
+            if profile.top_positive_samples
+            else None
+        )
+        top1_neg = (
+            profile.top_negative_samples[0].token_str
+            if profile.top_negative_samples
+            else None
+        )
+
+        # Hold out the single top-1 memorizing token when other positive/promoted candidates exist
+        held_out_pos = [t for t in exp.positive_pole_test_tokens if t and t != top1_pos]
+        if not held_out_pos:
+            for t in exp.expected_promoted_tokens[:2]:
+                if t and t != top1_pos and t not in held_out_pos:
+                    held_out_pos.append(t)
+        blind_pos = held_out_pos if held_out_pos else list(exp.positive_pole_test_tokens)
+
+        held_out_neg = [t for t in exp.negative_pole_test_tokens if t and t != top1_neg]
+        if not held_out_neg:
+            for t in exp.expected_suppressed_tokens[:2]:
+                if t and t != top1_neg and t not in held_out_neg:
+                    held_out_neg.append(t)
+        blind_neg = held_out_neg if held_out_neg else list(exp.negative_pole_test_tokens)
+
+        blind_max = " ".join(blind_pos[:3]) if blind_pos else exp.blind_maximum_prompt
+
+        return VerificationExperimentSpec(
+            positive_pole_test_tokens=blind_pos,
+            negative_pole_test_tokens=blind_neg,
+            expected_promoted_tokens=list(exp.expected_promoted_tokens),
+            expected_suppressed_tokens=list(exp.expected_suppressed_tokens),
+            expected_excited_dst_neurons=list(exp.expected_excited_dst_neurons),
+            expected_inhibited_dst_neurons=list(exp.expected_inhibited_dst_neurons),
+            blind_maximum_prompt=blind_max,
+            near_miss_test_tokens=list(exp.near_miss_test_tokens),
+            distant_control_tokens=list(exp.distant_control_tokens),
+        )
+
     @staticmethod
     def _pearson_corr(xs: List[float], ys: List[float]) -> float:
         if len(xs) != len(ys) or len(xs) < 2:
@@ -800,7 +858,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             device = next(model.parameters()).device
             layer_name = hypothesis.layer_name
             neuron_idx = hypothesis.neuron_idx
-            exp = hypothesis.proposed_experiment
+            exp = self.generate_blind_experiment(hypothesis, tok_to_id, profile=profile)
 
             # Non-tokenized Vision / continuous tensor fallback if circuit_inputs is a float tensor (e.g. [B, C, H, W])
             is_continuous_input = (
@@ -812,30 +870,50 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 pos_input = circuit_inputs.to(device)
                 neg_input = -circuit_inputs.to(device)
             else:
-                pos_fallback_ctx = (
-                    profile.top_positive_samples[0].context_str
-                    if profile and profile.top_positive_samples
-                    else None
-                )
-                neg_fallback_ctx = (
-                    profile.top_negative_samples[0].context_str
-                    if profile and profile.top_negative_samples
-                    else None
-                )
-                pos_input = self._encode_context_or_tokens(
-                    exp.positive_pole_test_tokens,
-                    tok_to_id,
-                    device=device,
-                    fallback_context=pos_fallback_ctx,
-                    tokenizer=tokenizer,
-                )
-                neg_input = self._encode_context_or_tokens(
-                    exp.negative_pole_test_tokens,
-                    tok_to_id,
-                    device=device,
-                    fallback_context=neg_fallback_ctx,
-                    tokenizer=tokenizer,
-                )
+                pos_fallback_ctx = None
+                neg_fallback_ctx = None
+                if profile and profile.top_positive_samples:
+                    top0_p_ctx = profile.top_positive_samples[0].context_str
+                    held_p_ctxs = [
+                        s.context_str
+                        for s in profile.top_positive_samples[1:]
+                        if s.context_str and s.context_str != top0_p_ctx
+                    ]
+                    pos_fallback_ctx = held_p_ctxs[0] if held_p_ctxs else top0_p_ctx
+                if profile and profile.top_negative_samples:
+                    top0_n_ctx = profile.top_negative_samples[0].context_str
+                    held_n_ctxs = [
+                        s.context_str
+                        for s in profile.top_negative_samples[1:]
+                        if s.context_str and s.context_str != top0_n_ctx
+                    ]
+                    neg_fallback_ctx = held_n_ctxs[0] if held_n_ctxs else top0_n_ctx
+
+                if (
+                    tokenizer is not None
+                    and hasattr(tokenizer, "encode")
+                    and pos_fallback_ctx
+                    and neg_fallback_ctx
+                ):
+                    p_ids = tokenizer.encode(pos_fallback_ctx, add_special_tokens=False) or [0]
+                    n_ids = tokenizer.encode(neg_fallback_ctx, add_special_tokens=False) or [0]
+                    pos_input = torch.tensor([p_ids], dtype=torch.long, device=device)
+                    neg_input = torch.tensor([n_ids], dtype=torch.long, device=device)
+                else:
+                    pos_input = self._encode_context_or_tokens(
+                        exp.positive_pole_test_tokens,
+                        tok_to_id,
+                        device=device,
+                        fallback_context=pos_fallback_ctx,
+                        tokenizer=tokenizer,
+                    )
+                    neg_input = self._encode_context_or_tokens(
+                        exp.negative_pole_test_tokens,
+                        tok_to_id,
+                        device=device,
+                        fallback_context=neg_fallback_ctx,
+                        tokenizer=tokenizer,
+                    )
 
             prom_ids = self._resolve_token_ids(
                 exp.expected_promoted_tokens, tok_to_id, tokenizer=tokenizer
@@ -991,11 +1069,45 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
 
             other_candidates = [i for i in range(num_neurons) if i != neuron_idx]
             control_kls: List[float] = []
-            # Sample up to 3 control neurons across the layer to establish the random ablation KL baseline
+            tracker = self.injector.get_stats_tracker(layer_name)
+            # Sample up to 3 control neurons across the layer and evaluate each on its OWN peak activating input
+            # (peak-matched null baseline) so random neurons do not look falsely specific on their own peak tokens.
             if other_candidates:
                 stride_c = max(1, len(other_candidates) // 3)
                 sampled_controls = other_candidates[::stride_c][:3]
                 for c_idx in sampled_controls:
+                    c_input = pos_input
+                    c_clean_lp = clean_lp
+                    c_clean_p = clean_p
+                    if (
+                        not is_continuous_input
+                        and tok_to_id
+                        and tracker is not None
+                        and tracker.pos_heaps.get(c_idx)
+                    ):
+                        c_top_toks = list(
+                            dict.fromkeys(
+                                item[2].token_str
+                                for item in sorted(
+                                    tracker.pos_heaps[c_idx], key=lambda x: x[0], reverse=True
+                                )[:3]
+                                if item[2].token_str
+                            )
+                        )
+                        if c_top_toks:
+                            c_input = self._encode_context_or_tokens(
+                                c_top_toks, tok_to_id, device=device, tokenizer=tokenizer
+                            )
+                            with self.injector.without_interventions():
+                                c_base_out = model(c_input)
+                                c_base_logits = (
+                                    c_base_out.logits
+                                    if hasattr(c_base_out, "logits")
+                                    else c_base_out
+                                ).float()
+                                c_clean_lp = F.log_softmax(c_base_logits, dim=-1)
+                                c_clean_p = c_clean_lp.exp()
+
                     c_spec = InterventionSpec(
                         layer_name=layer_name,
                         neuron_indices=[c_idx],
@@ -1004,15 +1116,15 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                         value=0.0,
                     )
                     with self.injector.temporary_interventions([c_spec]):
-                        c_out = model(pos_input)
+                        c_out = model(c_input)
                         c_logits = (c_out.logits if hasattr(c_out, "logits") else c_out).float()
                         c_lp = F.log_softmax(c_logits, dim=-1)
-                        c_kl = float((clean_p * (clean_lp - c_lp)).sum(dim=-1).mean().item())
+                        c_kl = float((c_clean_p * (c_clean_lp - c_lp)).sum(dim=-1).mean().item())
                         control_kls.append(c_kl)
             random_ctrl_kl = (
                 sorted(control_kls)[len(control_kls) // 2] if control_kls else 0.0
             )
-            kl_vs_random_ratio = target_kl / max(random_ctrl_kl, 1e-6) if target_kl > 0 else 0.0
+            kl_vs_random_ratio = target_kl / max(random_ctrl_kl, 1e-15) if target_kl > 0 else 0.0
 
             # Test 3: Native-Scale Pole-Flip Clamping on Positive Input
             # Clamps to the neuron's native negative scale (never an arbitrary out-of-distribution -5.0 on tiny noise)
@@ -1034,7 +1146,8 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     flip_pos_out.logits if hasattr(flip_pos_out, "logits") else flip_pos_out
                 ).float()
 
-            # Compute logit shifts on expected promoted & suppressed tokens
+            # Compute logit shifts on expected promoted & suppressed tokens and normalize by vocabulary logit_std
+            logit_std = float(clean_pos_logits.std(dim=-1).mean().clamp(min=1e-12).item())
             if prom_ids:
                 clean_prom = clean_pos_logits[..., prom_ids].mean().item()
                 zero_prom = zero_pos_logits[..., prom_ids].mean().item()
@@ -1048,6 +1161,9 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 pole_flip_shift = float(flip_supp - clean_supp)
             else:
                 pole_flip_shift = 0.0
+
+            z_logit_drop = logit_drop / logit_std
+            z_pole_flip = pole_flip_shift / logit_std
 
             # Test 4: Verify downstream circuit predictions if `dst_layer` is provided
             has_circuit_test = bool(
@@ -1065,34 +1181,55 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     compute_jacobian=False,
                     top_k=32,
                 )
-                delta_map = {e.dst_neuron: e.mean_causal_delta for e in traced.edges}
+                edge_map = {e.dst_neuron: e for e in traced.edges}
+                clean_mags = sorted(abs(e.clean_dst_mean) for e in traced.edges)
+                median_clean_mag = (
+                    clean_mags[len(clean_mags) // 2] if clean_mags else 1.0
+                )
                 matches = 0
                 total_expected = len(exp.expected_excited_dst_neurons) + len(
                     exp.expected_inhibited_dst_neurons
                 )
-                # Require non-trivial causal shift (> 0.05) so floating-point noise does not count as a match
                 for dst_n in exp.expected_excited_dst_neurons:
-                    if delta_map.get(dst_n, 0.0) > 0.05:
-                        matches += 1
+                    e_obj = edge_map.get(dst_n)
+                    if e_obj is not None:
+                        thresh = max(
+                            0.02 * abs(e_obj.clean_dst_mean),
+                            0.02 * median_clean_mag,
+                            1e-6,
+                        )
+                        if e_obj.mean_causal_delta > thresh:
+                            matches += 1
                 for dst_n in exp.expected_inhibited_dst_neurons:
-                    if delta_map.get(dst_n, 0.0) < -0.05:
-                        matches += 1
+                    e_obj = edge_map.get(dst_n)
+                    if e_obj is not None:
+                        thresh = max(
+                            0.02 * abs(e_obj.clean_dst_mean),
+                            0.02 * median_clean_mag,
+                            1e-6,
+                        )
+                        if e_obj.mean_causal_delta < -thresh:
+                            matches += 1
                 circuit_match_ratio = matches / max(total_expected, 1)
 
-            # Compute overall empirical verification score in [0.0, 1.0]
-            # Requires genuine causal specificity (logit shift > 0.05 or KL > 2x random control)
+            # Compute scale-invariant empirical verification score in [0.0, 1.0]
+            # Requires genuine causal specificity above the peak-matched random-neuron null
             causal_specific = (
-                target_kl > 0.01
-                or kl_vs_random_ratio >= 2.0
-                or abs(logit_drop) > 0.05
-                or abs(pole_flip_shift) > 0.05
+                (kl_vs_random_ratio >= 2.0)
+                if other_candidates
+                else (abs(z_logit_drop) >= 0.05 or abs(z_pole_flip) >= 0.05)
             )
+            if not causal_specific and falsification_outcome == "won":
+                falsification_outcome = "tied"
+
             score = 0.0
-            if pole_separation_passed:
+            if pole_separation_passed and causal_specific:
                 score += 0.35 if has_circuit_test else 0.45
-            if causal_specific and logit_drop > 0.02:
+            elif pole_separation_passed:
+                score += 0.20
+            if causal_specific and z_logit_drop > 0.02:
                 score += 0.25 if has_circuit_test else 0.30
-            if causal_specific and pole_flip_shift > 0.02:
+            if causal_specific and z_pole_flip > 0.02:
                 score += 0.20 if has_circuit_test else 0.25
             if has_circuit_test:
                 score += 0.20 * circuit_match_ratio
@@ -1224,8 +1361,10 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             else:
                 hypothesis.taxonomy_class = NeuronTaxonomy.TRUE_POLYSEMANTIC
         elif (
-            hypothesis.taxonomy_class == NeuronTaxonomy.UNVERIFIED
+            hypothesis.taxonomy_class
+            in (NeuronTaxonomy.UNVERIFIED, NeuronTaxonomy.TRUE_POLYSEMANTIC)
             and rep.empirical_verification_score >= 0.65
+            and rep.falsification_outcome == "won"
         ):
             if rep.branch_relatedness_score >= 0.25 and len(hypothesis.recursive_offshoots) >= 2:
                 hypothesis.taxonomy_class = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE
