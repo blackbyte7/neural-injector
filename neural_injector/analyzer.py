@@ -82,12 +82,17 @@ class StreamingLayerStats:
         self.neg_m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
 
         # SwiGLU Double-Negative route counter (a > 0 where gate < 0 and up < 0)
-        # and full 4-quadrant sign regime counters
+        # and full 4-quadrant sign regime counters + uncontaminated (+ x +) positive moments
         self.double_neg_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
         self.q_pp_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
         self.q_nn_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
         self.q_pn_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
         self.q_np_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
+        self.true_pos_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
+        self.true_pos_mean = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        self.true_pos_m2 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        self.true_pos_m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        self.true_pos_m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
 
         # Per-neuron bounded min-heaps for top positive, negative, and SwiGLU double-negative activations
         self._tie_breaker = 0
@@ -321,11 +326,21 @@ class StreamingLayerStats:
             u_pos = flat_up > 0
             u_neg = flat_up < 0
             dbl_neg_mask = pos_mask & g_neg & u_neg
+            true_pp_mask = pos_mask & g_pos & u_pos
             self.double_neg_count.add_(dbl_neg_mask.sum(dim=0))
-            self.q_pp_count.add_((pos_mask & g_pos & u_pos).sum(dim=0))
+            self.q_pp_count.add_(true_pp_mask.sum(dim=0))
             self.q_nn_count.add_(dbl_neg_mask.sum(dim=0))
             self.q_pn_count.add_((neg_mask & g_pos & u_neg).sum(dim=0))
             self.q_np_count.add_((neg_mask & g_neg & u_pos).sum(dim=0))
+            self._update_conditional_moments(
+                true_pp_mask,
+                flat_acts,
+                self.true_pos_count,
+                self.true_pos_mean,
+                self.true_pos_m2,
+                self.true_pos_m3,
+                self.true_pos_m4,
+            )
         else:
             dbl_neg_mask = None
 
@@ -417,7 +432,7 @@ class StreamingLayerStats:
                     float(val), pos_mag_res, self._pos_mag_seen, neuron_idx
                 )
 
-            # Select candidate ranks covering top-k AND evenly spaced quantiles across all positive firings
+            # Select candidate ranks covering top-k (including top-k true positive) AND evenly spaced quantiles
             if len(pos_positions) <= self._reservoir_cap:
                 selected_pos_ranks = pos_positions
             else:
@@ -425,7 +440,20 @@ class StreamingLayerStats:
                     1,
                     (len(pos_positions) - self.top_k) // max(1, self._reservoir_cap - self.top_k),
                 )
-                selected_pos_ranks = list(range(self.top_k)) + pos_positions[self.top_k:: stride]
+                true_top_ranks: List[int] = []
+                if dbl_row is not None:
+                    for r_pos in pos_positions:
+                        if not dbl_row[idx_row[r_pos]]:
+                            true_top_ranks.append(r_pos)
+                            if len(true_top_ranks) >= self.top_k:
+                                break
+                selected_pos_ranks = list(
+                    dict.fromkeys(
+                        list(range(self.top_k))
+                        + true_top_ranks
+                        + pos_positions[self.top_k:: stride]
+                    )
+                )
 
             for rank_i in selected_pos_ranks:
                 val = float(vals_row[rank_i])
@@ -433,7 +461,7 @@ class StreamingLayerStats:
                 f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
                 is_dbl_neg = bool(dbl_row[r_idx]) if dbl_row is not None else False
 
-                need_top = rank_i < self.top_k and (
+                need_top = (not is_dbl_neg or val >= 0.80 * running_pos_max) and (
                     len(pos_heap) < self.top_k or val > pos_heap[0][0]
                 )
                 need_dbl = is_dbl_neg and (
@@ -573,7 +601,9 @@ class StreamingLayerStats:
                     break
                 r_idx = p_idxs[j]
                 is_dbl = bool(p_dbls[j]) if p_dbls is not None else False
-                need_top = len(pos_heap) < self.top_k or val > p_min_heap
+                need_top = (not is_dbl or val >= 0.80 * running_pos_max) and (
+                    len(pos_heap) < self.top_k or val > p_min_heap
+                )
                 need_dbl = is_dbl and (len(dbl_heap) < self.top_k or val > dbl_heap[0][0])
                 need_res = len(pos_res) < self._reservoir_cap
                 if not (need_top or need_dbl or need_res):
@@ -968,6 +998,43 @@ class StreamingLayerStats:
             torch.zeros_like(pos_var),
         )
 
+        # When SwiGLU 4-quadrant sign regimes are tracked, also evaluate the uncontaminated
+        # True Positive (+ x +, gate > 0 and up > 0) moments so double-negative (- x -) echoes
+        # do not dilute positive pole kurtosis or falsely inflate firing rate into the dense regime.
+        if (self.true_pos_count > 0).any():
+            tp_n = torch.clamp(self.true_pos_count.to(torch.float64), min=1.0)
+            tp_rate = tp_n / n_total
+            tp_var = self.true_pos_m2 / tp_n
+            tp_std = torch.sqrt(torch.clamp(tp_var, min=1e-12))
+            tp_kurt = (self.true_pos_m4 / tp_n) / (tp_var.pow(2) + 1e-12)
+            # Under random-init SwiGLU (G, U ~ N(0,1)), P(G>0, U>0) = 0.25
+            tp_null_kurt = torch.where(tp_rate > 0.18, 22.0, 12.5)
+            tp_eff_kurt = torch.clamp(tp_kurt - tp_null_kurt, min=1.0)
+            tp_snr = torch.where(
+                self.true_pos_count == 1,
+                torch.full_like(self.true_pos_mean, 6.0),
+                self.true_pos_mean.abs() / torch.clamp(tp_std, min=1e-6),
+            )
+            tp_focal_kurt = torch.where(
+                (tp_rate <= 0.12) & (self.true_pos_mean.abs() >= overall_std),
+                torch.clamp((tp_snr - 2.0) * 6.0, min=1.0, max=64.0),
+                torch.ones_like(tp_snr),
+            )
+            tp_eff_kurt = torch.maximum(tp_eff_kurt, tp_focal_kurt)
+            tp_raw_sparsity = (0.18 / torch.clamp(tp_rate, min=1e-4)).pow(0.25)
+            tp_sparsity_factor = torch.where(
+                tp_eff_kurt > 1.05,
+                tp_raw_sparsity,
+                torch.clamp(tp_raw_sparsity, max=1.0),
+            )
+            tp_sel = torch.where(
+                self.true_pos_count > 0,
+                torch.clamp(tp_eff_kurt.pow(0.25) * tp_sparsity_factor, min=0.0, max=100.0),
+                torch.zeros_like(tp_var),
+            )
+            pos_sel = torch.maximum(pos_sel, tp_sel)
+            pos_std = torch.where(self.true_pos_count > 0, torch.maximum(pos_std, tp_std), pos_std)
+
         neg_n = torch.clamp(self.neg_count.to(torch.float64), min=1.0)
         neg_rate = neg_n / n_total
         neg_var = self.neg_m2 / neg_n
@@ -1036,13 +1103,19 @@ class StreamingLayerStats:
             )
             return 0.0, 0.0, 0.0, 0.0, motif
 
+        def _norm_tok(t: Optional[str]) -> str:
+            if not t:
+                return ""
+            stripped = t.lstrip("Ġ▁ ").strip()
+            return stripped if stripped else t
+
         n_tok = len(tok_samples)
-        tok_counts = Counter(s.token_str for s in tok_samples if s.token_str)
+        tok_counts = Counter(_norm_tok(s.token_str) for s in tok_samples if s.token_str)
         top2_curr = sum(c for _, c in tok_counts.most_common(2))
         curr_conc = float(top2_curr / max(n_tok, 1))
 
         next_valid = [
-            s.next_token_str
+            _norm_tok(s.next_token_str)
             for s in tok_samples
             if s.next_token_str is not None and s.next_token_str != "<eos>"
         ]
@@ -1053,13 +1126,29 @@ class StreamingLayerStats:
         else:
             next_conc = 0.0
 
+        # Also evaluate top-heap concentrations per pole independently so opposite poles and
+        # low-amplitude tertiary reservoirs do not dilute peak current/next-token detectors.
+        for pole_heap in (self.pos_heaps.get(neuron_idx, []), self.neg_heaps.get(neuron_idx, [])):
+            p_toks = [_norm_tok(s.token_str) for _, _, s in pole_heap if s.token_str]
+            if len(p_toks) >= 3:
+                p_curr = sum(c for _, c in Counter(p_toks).most_common(2)) / float(len(p_toks))
+                curr_conc = max(curr_conc, p_curr)
+            p_next = [
+                _norm_tok(s.next_token_str)
+                for _, _, s in pole_heap
+                if s.next_token_str is not None and s.next_token_str != "<eos>"
+            ]
+            if len(p_next) >= 3:
+                p_nx = sum(c for _, c in Counter(p_next).most_common(2)) / float(len(p_next))
+                next_conc = max(next_conc, p_nx)
+
         punct_hits = sum(
             1
             for s in tok_samples
             if s.token_str
             and (
-                all(ch in self._PUNCTUATION_CHARS for ch in s.token_str.strip())
-                or s.token_str.strip() in {".", ",", ";", ":", "!", "?", "(", ")", "-", "/"}
+                all(ch in self._PUNCTUATION_CHARS for ch in _norm_tok(s.token_str))
+                or _norm_tok(s.token_str) in {".", ",", ";", ":", "!", "?", "(", ")", "-", "/"}
             )
         )
         punct_rate = float(punct_hits / max(n_tok, 1))
@@ -1069,11 +1158,12 @@ class StreamingLayerStats:
         vals = [float(s.activation_value) for s in tok_samples]
         grand_mean = sum(vals) / n_tok
         ss_total = sum((v - grand_mean) ** 2 for v in vals)
+        r2 = 0.0
         if ss_total > 1e-9 and len(tok_counts) < n_tok:
             by_tok: Dict[str, List[float]] = defaultdict(list)
             for s in tok_samples:
                 if s.token_str is not None:
-                    by_tok[s.token_str].append(float(s.activation_value))
+                    by_tok[_norm_tok(s.token_str)].append(float(s.activation_value))
             repeated_groups = [g for g in by_tok.values() if len(g) >= 2]
             if repeated_groups:
                 ss_between = sum(
@@ -1086,10 +1176,22 @@ class StreamingLayerStats:
                     r2 = float(min(max(adj_r2, 0.0), 1.0))
                 else:
                     r2 = raw_r2 * float(sum(len(g) for g in repeated_groups) / max(n_tok, 1))
-            else:
-                r2 = 0.0
-        else:
-            r2 = 0.0
+
+        # Between-context (sample_id) ANOVA R^2 for contextual/clause routers on multi-sentence corpora
+        if ss_total > 1e-9 and self.count >= 256:
+            by_ctx: Dict[int, List[float]] = defaultdict(list)
+            for s in tok_samples:
+                if s.sample_id is not None:
+                    by_ctx[int(s.sample_id)].append(float(s.activation_value))
+            ctx_groups = [g for g in by_ctx.values() if len(g) >= 3]
+            if len(ctx_groups) >= 4 and n_tok > len(ctx_groups) + 4:
+                ss_ctx = sum(
+                    len(g) * ((sum(g) / len(g)) - grand_mean) ** 2 for g in ctx_groups
+                )
+                raw_ctx_r2 = float(min(max(ss_ctx / ss_total, 0.0), 1.0))
+                k_ctx = len(ctx_groups)
+                adj_ctx_r2 = 1.0 - (1.0 - raw_ctx_r2) * (n_tok - 1.0) / float(n_tok - k_ctx - 1)
+                r2 = max(r2, float(min(max(adj_ctx_r2 * 0.85, 0.0), 1.0)))
 
         if punct_rate >= 0.40:
             motif = "punctuation_consolidation"
@@ -1218,6 +1320,24 @@ class StreamingLayerStats:
                 pos_sel = round(pos_sel + lex_bonus, 3)
             if neg_rate > 0:
                 neg_sel = round(neg_sel + lex_bonus, 3)
+        elif (
+            self.count >= 256
+            and scale_salience >= 0.75
+            and max(selectivity, pos_sel, neg_sel) >= 1.15
+        ):
+            motif_signal = max(
+                r2 if r2 >= 0.38 else 0.0,
+                next_conc if next_conc >= 0.40 else 0.0,
+                curr_conc if curr_conc >= 0.45 else 0.0,
+                punct_rate * 0.85 if punct_rate >= 0.45 else 0.0,
+            )
+            if motif_signal >= 0.38:
+                lex_bonus = 0.55 * motif_signal
+                selectivity = round(selectivity + lex_bonus, 3)
+                if pos_rate > 0:
+                    pos_sel = round(pos_sel + lex_bonus, 3)
+                if neg_rate > 0:
+                    neg_sel = round(neg_sel + lex_bonus, 3)
 
         pos_cnt = int(self.pos_count[neuron_idx].item())
         dbl_neg_cnt = int(self.double_neg_count[neuron_idx].item())
@@ -1244,9 +1364,13 @@ class StreamingLayerStats:
         pos_prior = self._classify_pole_prior(pos_sel, pos_rate, pos_std, other_pole_rate=neg_rate)
         neg_prior = self._classify_pole_prior(neg_sel, neg_rate, neg_std, other_pole_rate=pos_rate)
 
+        effective_pos_heap = (
+            self.pos_heaps.get(neuron_idx, [])
+            or self.double_neg_heaps.get(neuron_idx, [])
+        )
         pos_samples = [
             item[2]
-            for item in sorted(self.pos_heaps.get(neuron_idx, []), key=lambda x: x[0], reverse=True)
+            for item in sorted(effective_pos_heap, key=lambda x: x[0], reverse=True)
         ]
         neg_samples = [
             item[2]
@@ -1433,7 +1557,7 @@ class StreamingLayerStats:
             pos_std_i = float(pos_std_cpu[idx])
             neg_std_i = float(neg_std_cpu[idx])
 
-            pos_heap = self.pos_heaps.get(idx, [])
+            pos_heap = self.pos_heaps.get(idx, []) or self.double_neg_heaps.get(idx, [])
             neg_heap = self.neg_heaps.get(idx, [])
             r2_i = 0.0
             scale_salience = (
@@ -1444,7 +1568,7 @@ class StreamingLayerStats:
             if (pos_heap and pos_heap[0][2].token_str is not None) or (
                 neg_heap and neg_heap[0][2].token_str is not None
             ):
-                r2_i, _, _, _, _ = self._compute_token_selectivity_and_motifs(
+                r2_i, curr_c_i, next_c_i, punct_r_i, _ = self._compute_token_selectivity_and_motifs(
                     idx, pos_r, neg_r, pos_std_i, neg_std_i
                 )
                 salient_for_lex = (
@@ -1464,6 +1588,24 @@ class StreamingLayerStats:
                         pos_sel_i += lex_bonus
                     if neg_r > 0:
                         neg_sel_i += lex_bonus
+                elif (
+                    self.count >= 256
+                    and scale_salience >= 0.75
+                    and max(sel, pos_sel_i, neg_sel_i) >= 1.15
+                ):
+                    motif_signal = max(
+                        r2_i if r2_i >= 0.38 else 0.0,
+                        next_c_i if next_c_i >= 0.40 else 0.0,
+                        curr_c_i if curr_c_i >= 0.45 else 0.0,
+                        punct_r_i * 0.85 if punct_r_i >= 0.45 else 0.0,
+                    )
+                    if motif_signal >= 0.38:
+                        lex_bonus = 0.55 * motif_signal
+                        sel += lex_bonus
+                        if pos_r > 0:
+                            pos_sel_i += lex_bonus
+                        if neg_r > 0:
+                            neg_sel_i += lex_bonus
 
             pos_tax = self._classify_pole_taxonomy(pos_sel_i, pos_r, pos_std_i, wnorm)
             neg_tax = self._classify_pole_taxonomy(neg_sel_i, neg_r, neg_std_i, wnorm)
@@ -1566,6 +1708,11 @@ class StreamingLayerStats:
             "q_nn_count": self.q_nn_count.cpu(),
             "q_pn_count": self.q_pn_count.cpu(),
             "q_np_count": self.q_np_count.cpu(),
+            "true_pos_count": self.true_pos_count.cpu(),
+            "true_pos_mean": self.true_pos_mean.cpu(),
+            "true_pos_m2": self.true_pos_m2.cpu(),
+            "true_pos_m3": self.true_pos_m3.cpu(),
+            "true_pos_m4": self.true_pos_m4.cpu(),
             "pos_mag_reservoirs": dict(self.pos_mag_reservoirs),
             "neg_mag_reservoirs": dict(self.neg_mag_reservoirs),
             "pos_mag_seen": dict(self._pos_mag_seen),
@@ -1616,6 +1763,11 @@ class StreamingLayerStats:
             "q_nn_count",
             "q_pn_count",
             "q_np_count",
+            "true_pos_count",
+            "true_pos_mean",
+            "true_pos_m2",
+            "true_pos_m3",
+            "true_pos_m4",
         ):
             if attr in state:
                 getattr(inst, attr).copy_(state[attr].to(device=device))

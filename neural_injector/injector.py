@@ -25,6 +25,7 @@ from .types import (
     BipolarVerbHypothesis,
     CircuitGraph,
     ContrastiveDiscoveryReport,
+    ContrastiveNeuronMatch,
     DownstreamReadoutReport,
     GateConditionSpec,
     InterventionMode,
@@ -1258,6 +1259,7 @@ class NeuralInjector:
         }
         prior_counts: Dict[str, int] = {}
         verified_cnt = 0
+        untriggered_cnt = 0
         for summary_item in summaries:
             pole_counts[summary_item.pos_taxonomy_class.value] = (
                 pole_counts.get(summary_item.pos_taxonomy_class.value, 0) + 1
@@ -1269,6 +1271,12 @@ class NeuralInjector:
             prior_counts[p_val] = prior_counts.get(p_val, 0) + 1
             if summary_item.semantic_verified:
                 verified_cnt += 1
+            peak_abs = max(abs(summary_item.max_val), abs(summary_item.min_val))
+            if (
+                summary_item.taxonomy_class == NeuronTaxonomy.TRUE_POLYSEMANTIC
+                and peak_abs < 3.2 * max(summary_item.std, 1e-6)
+            ):
+                untriggered_cnt += 1
 
         total_poles = max(2 * tracker.num_neurons, 1)
         pole_pcts = {k: round((v / total_poles) * 100.0, 2) for k, v in pole_counts.items()}
@@ -1302,6 +1310,15 @@ class NeuralInjector:
             if summaries
             else 0.0
         )
+        total_neurons = max(tracker.num_neurons, 1)
+        untriggered_pct = round((untriggered_cnt / total_neurons) * 100.0, 2)
+        triggered_neurons = max(total_neurons - untriggered_cnt, 1)
+        clean_plus_struct_cnt = counts.get(NeuronTaxonomy.CLEAN_MONOSEMANTIC.value, 0) + counts.get(
+            NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value, 0
+        )
+        clean_among_triggered_pct = round(
+            min(100.0, (clean_plus_struct_cnt / triggered_neurons) * 100.0), 2
+        )
 
         if limit is not None:
             summaries = summaries[:limit]
@@ -1324,6 +1341,9 @@ class NeuralInjector:
             combined_clean_and_structured_poles_pct=round(clean_poles_pct + struct_poles_pct, 2),
             prior_counts=prior_counts,
             semantically_verified_count=verified_cnt,
+            untriggered_on_sample_count=untriggered_cnt,
+            untriggered_on_sample_pct=untriggered_pct,
+            clean_and_structured_among_triggered_pct=clean_among_triggered_pct,
         )
 
     # -------------------------------------------------------------------------
@@ -1353,6 +1373,55 @@ class NeuralInjector:
                 top_k=top_k,
                 device=self.device,
             )
+
+    def inject_contrastive_behavior(
+        self,
+        contrastive_report_or_matches: Union[ContrastiveDiscoveryReport, List[ContrastiveNeuronMatch]],
+        strength: float = 2.0,
+        top_k: Optional[int] = None,
+        direction: float = 1.0,
+        mode: InterventionMode = InterventionMode.ADDITIVE_STEER,
+    ) -> List[InterventionSpec]:
+        """
+        Native-Scale Contrastive Behavioral Neural Injection:
+        Registers surgical neuron-basis interventions across the top discovered contrastive
+        neurons, scaling each neuron's shift to its own native empirical differential
+        `direction * strength * (m.pos_mean - m.neg_mean)` (or clamping to `m.pos_mean * strength`
+        for `direction > 0` / `m.neg_mean * strength` for `direction < 0` when `mode == HARD_CLAMP`).
+        """
+        matches = (
+            contrastive_report_or_matches.top_matches
+            if isinstance(contrastive_report_or_matches, ContrastiveDiscoveryReport)
+            else list(contrastive_report_or_matches)
+        )
+        if top_k is not None:
+            matches = matches[:top_k]
+
+        by_layer: Dict[str, List[Tuple[int, float]]] = {}
+        for m in matches:
+            if mode == InterventionMode.HARD_CLAMP:
+                target_val = (
+                    m.pos_mean * abs(strength) if direction >= 0 else m.neg_mean * abs(strength)
+                )
+            else:
+                target_val = float(direction) * float(strength) * (m.pos_mean - m.neg_mean)
+            by_layer.setdefault(m.layer_name, []).append((m.neuron_idx, float(target_val)))
+
+        specs: List[InterventionSpec] = []
+        for lname, pairs in by_layer.items():
+            n_indices = [p[0] for p in pairs]
+            n_vals = [p[1] for p in pairs]
+            spec = InterventionSpec(
+                layer_name=lname,
+                neuron_indices=n_indices,
+                mode=mode,
+                pole=PoleType.BOTH,
+                value=n_vals[0] if n_vals else 0.0,
+                per_neuron_values=n_vals,
+            )
+            self.add_intervention(spec)
+            specs.append(spec)
+        return specs
 
     def track_checkpoint_evolution(
         self,

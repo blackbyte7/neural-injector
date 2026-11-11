@@ -457,6 +457,7 @@ class VerificationReport:
     causal_kl_vs_random_ratio: float = 0.0
     held_out_simulation_correlation: float = 0.0
     branch_relatedness_score: float = 0.0
+    positive_injection_target_logit_boost: float = 0.0
 
 
 @dataclass
@@ -647,6 +648,9 @@ class LayerCleanlinessReport:
     combined_clean_and_structured_poles_pct: float = 0.0
     prior_counts: Dict[str, int] = field(default_factory=dict)
     semantically_verified_count: int = 0
+    untriggered_on_sample_count: int = 0
+    untriggered_on_sample_pct: float = 0.0
+    clean_and_structured_among_triggered_pct: float = 0.0
 
 
 @dataclass

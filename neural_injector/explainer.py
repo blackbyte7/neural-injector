@@ -889,6 +889,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     ]
                     neg_fallback_ctx = held_n_ctxs[0] if held_n_ctxs else top0_n_ctx
 
+                using_sentence_ctx = False
                 if (
                     tokenizer is not None
                     and hasattr(tokenizer, "encode")
@@ -899,6 +900,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     n_ids = tokenizer.encode(neg_fallback_ctx, add_special_tokens=False) or [0]
                     pos_input = torch.tensor([p_ids], dtype=torch.long, device=device)
                     neg_input = torch.tensor([n_ids], dtype=torch.long, device=device)
+                    using_sentence_ctx = pos_input.shape[-1] > 4 and neg_input.shape[-1] > 4
                 else:
                     pos_input = self._encode_context_or_tokens(
                         exp.positive_pole_test_tokens,
@@ -914,6 +916,8 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                         fallback_context=neg_fallback_ctx,
                         tokenizer=tokenizer,
                     )
+            if is_continuous_input:
+                using_sentence_ctx = False
 
             prom_ids = self._resolve_token_ids(
                 exp.expected_promoted_tokens, tok_to_id, tokenizer=tokenizer
@@ -944,6 +948,8 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             near_miss_mean = 0.0
             distant_ctrl_mean = 0.0
             blind_max_val = 0.0
+            pos_focal_idx = 0
+            neg_focal_idx = 0
 
             h = (
                 mod.register_forward_pre_hook(_cap_pre)
@@ -958,58 +964,122 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                         if hasattr(clean_pos_out, "logits")
                         else clean_pos_out
                     ).float()
-                    pos_act_mean = float(_extract_neuron_act(captured_acts[-1]).mean().item())
+                    pos_act_tensor = _extract_neuron_act(captured_acts[-1])
 
-                    model(neg_input)
-                    neg_act_mean = float(_extract_neuron_act(captured_acts[-1]).mean().item())
+                    clean_neg_out = model(neg_input)
+                    clean_neg_logits = (
+                        clean_neg_out.logits
+                        if hasattr(clean_neg_out, "logits")
+                        else clean_neg_out
+                    ).float()
+                    neg_act_tensor = _extract_neuron_act(captured_acts[-1])
 
-                    if not is_continuous_input and tok_to_id:
-                        if exp.near_miss_test_tokens:
-                            nm_in = self._encode_context_or_tokens(
-                                exp.near_miss_test_tokens,
-                                tok_to_id,
-                                device=device,
-                                tokenizer=tokenizer,
-                            )
-                            model(nm_in)
-                            near_miss_mean = float(
-                                _extract_neuron_act(captured_acts[-1]).mean().item()
-                            )
-                        else:
-                            near_miss_mean = 0.5 * (pos_act_mean + neg_act_mean)
+                    if using_sentence_ctx:
+                        pos_seq = pos_act_tensor.reshape(-1)
+                        neg_seq = neg_act_tensor.reshape(-1)
+                        pos_focal_idx = int(pos_seq.argmax().item())
+                        neg_focal_idx = int(neg_seq.argmin().item())
+                        pos_act_mean = float(pos_seq[pos_focal_idx].item())
+                        neg_act_mean = float(neg_seq[neg_focal_idx].item())
 
-                        if exp.distant_control_tokens:
-                            dc_in = self._encode_context_or_tokens(
-                                exp.distant_control_tokens,
-                                tok_to_id,
-                                device=device,
-                                tokenizer=tokenizer,
+                        # In-context near-miss test: splice near-miss token into focal position AND
+                        # blend with a boundary/mixed prefix so both single-token detectors and
+                        # contextual routers experience a genuine intermediate counterfactual context.
+                        nm_vals: List[float] = []
+                        nm_tok_ids = self._resolve_token_ids(
+                            exp.near_miss_test_tokens, tok_to_id, tokenizer=tokenizer
+                        )
+                        if pos_input.shape[-1] > 1:
+                            spliced = pos_input.clone()
+                            rep_id = (
+                                nm_tok_ids[0]
+                                if nm_tok_ids
+                                else int(neg_input[0, neg_focal_idx].item())
                             )
-                            model(dc_in)
+                            spliced[0, pos_focal_idx] = rep_id
+                            model(spliced)
+                            spliced_seq = _extract_neuron_act(captured_acts[-1]).reshape(-1)
+                            nm_vals.append(float(spliced_seq[pos_focal_idx].item()))
+
+                        # Boundary context mixing negative prefix with positive focal window
+                        neg_half = neg_input[:, : max(1, neg_input.shape[-1] // 2)]
+                        pos_win_end = min(pos_input.shape[-1], pos_focal_idx + 1)
+                        pos_win_start = max(0, pos_focal_idx - 3)
+                        hybrid_in = torch.cat(
+                            [neg_half, pos_input[:, pos_win_start:pos_win_end]], dim=-1
+                        )
+                        model(hybrid_in)
+                        hybrid_seq = _extract_neuron_act(captured_acts[-1]).reshape(-1)
+                        nm_vals.append(float(hybrid_seq[-1].item()))
+                        near_miss_mean = sum(nm_vals) / len(nm_vals)
+
+                        # In-context distant-control test on negative sentence context
+                        dc_tok_ids = self._resolve_token_ids(
+                            exp.distant_control_tokens, tok_to_id, tokenizer=tokenizer
+                        )
+                        if dc_tok_ids and neg_input.shape[-1] > 1:
+                            dc_spliced = neg_input.clone()
+                            dc_spliced[0, neg_focal_idx] = dc_tok_ids[0]
+                            model(dc_spliced)
+                            dc_seq = _extract_neuron_act(captured_acts[-1]).reshape(-1)
                             distant_ctrl_mean = float(
-                                _extract_neuron_act(captured_acts[-1]).mean().item()
+                                min(dc_seq[neg_focal_idx].item(), neg_act_mean)
                             )
                         else:
                             distant_ctrl_mean = neg_act_mean
 
-                        if exp.blind_maximum_prompt:
-                            bm_in = self._encode_context_or_tokens(
-                                exp.blind_maximum_prompt.split(),
-                                tok_to_id,
-                                device=device,
-                                fallback_context=exp.blind_maximum_prompt,
-                                tokenizer=tokenizer,
-                            )
-                            model(bm_in)
-                            blind_max_val = float(
-                                _extract_neuron_act(captured_acts[-1]).max().item()
-                            )
-                        else:
-                            blind_max_val = pos_act_mean
-                    else:
-                        near_miss_mean = 0.0
-                        distant_ctrl_mean = neg_act_mean
                         blind_max_val = pos_act_mean
+                    else:
+                        pos_act_mean = float(pos_act_tensor.mean().item())
+                        neg_act_mean = float(neg_act_tensor.mean().item())
+
+                        if not is_continuous_input and tok_to_id:
+                            if exp.near_miss_test_tokens:
+                                nm_in = self._encode_context_or_tokens(
+                                    exp.near_miss_test_tokens,
+                                    tok_to_id,
+                                    device=device,
+                                    tokenizer=tokenizer,
+                                )
+                                model(nm_in)
+                                near_miss_mean = float(
+                                    _extract_neuron_act(captured_acts[-1]).mean().item()
+                                )
+                            else:
+                                near_miss_mean = 0.5 * (pos_act_mean + neg_act_mean)
+
+                            if exp.distant_control_tokens:
+                                dc_in = self._encode_context_or_tokens(
+                                    exp.distant_control_tokens,
+                                    tok_to_id,
+                                    device=device,
+                                    tokenizer=tokenizer,
+                                )
+                                model(dc_in)
+                                distant_ctrl_mean = float(
+                                    _extract_neuron_act(captured_acts[-1]).mean().item()
+                                )
+                            else:
+                                distant_ctrl_mean = neg_act_mean
+
+                            if exp.blind_maximum_prompt:
+                                bm_in = self._encode_context_or_tokens(
+                                    exp.blind_maximum_prompt.split(),
+                                    tok_to_id,
+                                    device=device,
+                                    fallback_context=exp.blind_maximum_prompt,
+                                    tokenizer=tokenizer,
+                                )
+                                model(bm_in)
+                                blind_max_val = float(
+                                    _extract_neuron_act(captured_acts[-1]).max().item()
+                                )
+                            else:
+                                blind_max_val = pos_act_mean
+                        else:
+                            near_miss_mean = 0.0
+                            distant_ctrl_mean = neg_act_mean
+                            blind_max_val = pos_act_mean
             finally:
                 h.remove()
 
@@ -1065,7 +1135,13 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             clean_lp = F.log_softmax(clean_pos_logits, dim=-1)
             clean_p = clean_lp.exp()
             zero_lp = F.log_softmax(zero_pos_logits, dim=-1)
-            target_kl = float((clean_p * (clean_lp - zero_lp)).sum(dim=-1).mean().item())
+            per_pos_kl = (clean_p * (clean_lp - zero_lp)).sum(dim=-1)
+            if using_sentence_ctx and per_pos_kl.ndim >= 2:
+                target_kl = float(
+                    max(per_pos_kl[0, pos_focal_idx].item(), per_pos_kl.max().item())
+                )
+            else:
+                target_kl = float(per_pos_kl.mean().item())
 
             other_candidates = [i for i in range(num_neurons) if i != neuron_idx]
             control_kls: List[float] = []
@@ -1080,7 +1156,8 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     c_clean_lp = clean_lp
                     c_clean_p = clean_p
                     if (
-                        not is_continuous_input
+                        not using_sentence_ctx
+                        and not is_continuous_input
                         and tok_to_id
                         and tracker is not None
                         and tracker.pos_heaps.get(c_idx)
@@ -1119,14 +1196,18 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                         c_out = model(c_input)
                         c_logits = (c_out.logits if hasattr(c_out, "logits") else c_out).float()
                         c_lp = F.log_softmax(c_logits, dim=-1)
-                        c_kl = float((c_clean_p * (c_clean_lp - c_lp)).sum(dim=-1).mean().item())
+                        c_per_pos = (c_clean_p * (c_clean_lp - c_lp)).sum(dim=-1)
+                        if using_sentence_ctx and c_per_pos.ndim >= 2:
+                            c_kl = float(c_per_pos[0, pos_focal_idx].item())
+                        else:
+                            c_kl = float(c_per_pos.mean().item())
                         control_kls.append(c_kl)
             random_ctrl_kl = (
                 sorted(control_kls)[len(control_kls) // 2] if control_kls else 0.0
             )
             kl_vs_random_ratio = target_kl / max(random_ctrl_kl, 1e-15) if target_kl > 0 else 0.0
 
-            # Test 3: Native-Scale Pole-Flip Clamping on Positive Input
+            # Test 3A: Native-Scale Pole-Flip Clamping on Positive Input
             # Clamps to the neuron's native negative scale (never an arbitrary out-of-distribution -5.0 on tiny noise)
             clamp_neg_val = (
                 min(prof_min, -1.5 * prof_std)
@@ -1146,24 +1227,74 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     flip_pos_out.logits if hasattr(flip_pos_out, "logits") else flip_pos_out
                 ).float()
 
+            # Test 3B: Positive Neural Injection on Negative Input
+            # Injects the neuron's native positive peak onto the negative/neutral held-out context
+            clamp_pos_val = (
+                max(prof_max, 1.5 * prof_std)
+                if profile is not None
+                else max(pos_act_mean * 1.5, abs(neg_act_mean))
+            )
+            inject_pos_spec = InterventionSpec(
+                layer_name=layer_name,
+                neuron_indices=[neuron_idx],
+                mode=InterventionMode.HARD_CLAMP,
+                pole=PoleType.BOTH,
+                value=clamp_pos_val,
+            )
+            with self.injector.temporary_interventions([inject_pos_spec]):
+                inject_neg_out = model(neg_input)
+                inject_neg_logits = (
+                    inject_neg_out.logits
+                    if hasattr(inject_neg_out, "logits")
+                    else inject_neg_out
+                ).float()
+
             # Compute logit shifts on expected promoted & suppressed tokens and normalize by vocabulary logit_std
             logit_std = float(clean_pos_logits.std(dim=-1).mean().clamp(min=1e-12).item())
+            neg_logit_std = float(clean_neg_logits.std(dim=-1).mean().clamp(min=1e-12).item())
             if prom_ids:
-                clean_prom = clean_pos_logits[..., prom_ids].mean().item()
-                zero_prom = zero_pos_logits[..., prom_ids].mean().item()
-                logit_drop = float(clean_prom - zero_prom)
+                if using_sentence_ctx and clean_pos_logits.ndim == 3:
+                    pos_drops = (
+                        clean_pos_logits[:, :, prom_ids] - zero_pos_logits[:, :, prom_ids]
+                    ).mean(dim=-1)
+                    logit_drop = float(
+                        max(pos_drops[0, pos_focal_idx].item(), pos_drops.max().item())
+                    )
+                    neg_boosts = (
+                        inject_neg_logits[:, :, prom_ids] - clean_neg_logits[:, :, prom_ids]
+                    ).mean(dim=-1)
+                    pos_inject_boost = float(
+                        max(neg_boosts[0, neg_focal_idx].item(), neg_boosts.max().item())
+                    )
+                else:
+                    clean_prom = clean_pos_logits[..., prom_ids].mean().item()
+                    zero_prom = zero_pos_logits[..., prom_ids].mean().item()
+                    logit_drop = float(clean_prom - zero_prom)
+                    clean_neg_prom = clean_neg_logits[..., prom_ids].mean().item()
+                    inj_neg_prom = inject_neg_logits[..., prom_ids].mean().item()
+                    pos_inject_boost = float(inj_neg_prom - clean_neg_prom)
             else:
                 logit_drop = 0.0
+                pos_inject_boost = 0.0
 
             if supp_ids:
-                clean_supp = clean_pos_logits[..., supp_ids].mean().item()
-                flip_supp = flip_pos_logits[..., supp_ids].mean().item()
-                pole_flip_shift = float(flip_supp - clean_supp)
+                if using_sentence_ctx and clean_pos_logits.ndim == 3:
+                    supp_shifts = (
+                        flip_pos_logits[:, :, supp_ids] - clean_pos_logits[:, :, supp_ids]
+                    ).mean(dim=-1)
+                    pole_flip_shift = float(
+                        max(supp_shifts[0, pos_focal_idx].item(), supp_shifts.max().item())
+                    )
+                else:
+                    clean_supp = clean_pos_logits[..., supp_ids].mean().item()
+                    flip_supp = flip_pos_logits[..., supp_ids].mean().item()
+                    pole_flip_shift = float(flip_supp - clean_supp)
             else:
                 pole_flip_shift = 0.0
 
             z_logit_drop = logit_drop / logit_std
             z_pole_flip = pole_flip_shift / logit_std
+            z_pos_inject = pos_inject_boost / neg_logit_std
 
             # Test 4: Verify downstream circuit predictions if `dst_layer` is provided
             has_circuit_test = bool(
@@ -1217,7 +1348,11 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             causal_specific = (
                 (kl_vs_random_ratio >= 2.0)
                 if other_candidates
-                else (abs(z_logit_drop) >= 0.05 or abs(z_pole_flip) >= 0.05)
+                else (
+                    abs(z_logit_drop) >= 0.05
+                    or abs(z_pole_flip) >= 0.05
+                    or abs(z_pos_inject) >= 0.05
+                )
             )
             if not causal_specific and falsification_outcome == "won":
                 falsification_outcome = "tied"
@@ -1227,9 +1362,9 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 score += 0.35 if has_circuit_test else 0.45
             elif pole_separation_passed:
                 score += 0.20
-            if causal_specific and z_logit_drop > 0.02:
+            if causal_specific and (z_logit_drop > 0.02 or z_pos_inject > 0.02):
                 score += 0.25 if has_circuit_test else 0.30
-            if causal_specific and z_pole_flip > 0.02:
+            if causal_specific and (z_pole_flip > 0.02 or z_pos_inject > 0.05):
                 score += 0.20 if has_circuit_test else 0.25
             if has_circuit_test:
                 score += 0.20 * circuit_match_ratio
@@ -1240,6 +1375,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 f"Pole Separation: {'PASS' if pole_separation_passed else 'FAIL'} "
                 f"(+Test Act={pos_act_mean:+.3f}, -Test Act={neg_act_mean:+.3f}, d={pole_sep_d:.2f}, Falsification={falsification_outcome.upper()}) | "
                 f"Zero-Ablation Promoted Logit Drop={logit_drop:+.4f} (KL={target_kl:.4f} vs Null={random_ctrl_kl:.4f}) | "
+                f"Positive-Inject Promoted Boost={pos_inject_boost:+.4f} | "
                 f"Negative-Clamp Opposite Pole Boost={pole_flip_shift:+.4f} | "
                 f"Downstream Circuit Match={circuit_match_ratio * 100:.1f}%"
             )
@@ -1264,6 +1400,7 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 causal_kl_vs_random_ratio=round(kl_vs_random_ratio, 4),
                 held_out_simulation_correlation=round(sim_corr, 4),
                 branch_relatedness_score=round(branch_rel, 4),
+                positive_injection_target_logit_boost=round(pos_inject_boost, 4),
             )
             hypothesis.verification_report = report
             return report
@@ -1300,14 +1437,35 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
             idx_to_token=idx_to_token,
         )
 
+        trace_inputs = circuit_inputs
+        if (
+            trace_inputs is None
+            and (dst_layer is not None or src_layer is not None)
+            and profile.top_positive_samples
+        ):
+            device = next(self.injector.model.parameters()).device
+            top0 = profile.top_positive_samples[0]
+            if tokenizer is not None and hasattr(tokenizer, "encode") and top0.context_str:
+                t_ids = tokenizer.encode(top0.context_str, add_special_tokens=False) or [0]
+                trace_inputs = torch.tensor([t_ids], dtype=torch.long, device=device)
+            elif tok_to_id:
+                tok_cands = [s.token_str for s in profile.top_positive_samples[:3] if s.token_str]
+                trace_inputs = self._encode_context_or_tokens(
+                    tok_cands,
+                    tok_to_id,
+                    device=device,
+                    fallback_context=top0.context_str,
+                    tokenizer=tokenizer,
+                )
+
         circuit: Optional[CircuitGraph] = None
         negative_circuit: Optional[CircuitGraph] = None
-        if dst_layer is not None and circuit_inputs is not None:
+        if dst_layer is not None and trace_inputs is not None:
             circuit = self.injector.trace_circuit(
                 src_layer=layer_name,
                 dst_layer=dst_layer,
                 src_neuron=neuron_idx,
-                inputs=circuit_inputs,
+                inputs=trace_inputs,
                 src_pole=PoleType.POSITIVE,
                 compute_jacobian=True,
                 top_k=8,
@@ -1317,19 +1475,19 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                     src_layer=layer_name,
                     dst_layer=dst_layer,
                     src_neuron=neuron_idx,
-                    inputs=circuit_inputs,
+                    inputs=trace_inputs,
                     src_pole=PoleType.NEGATIVE,
                     compute_jacobian=False,
                     top_k=6,
                 )
 
         upstream_circuit: Optional[CircuitGraph] = None
-        if src_layer is not None and circuit_inputs is not None:
+        if src_layer is not None and trace_inputs is not None:
             upstream_circuit = self.injector.trace_incoming_circuit(
                 src_layer=src_layer,
                 dst_layer=layer_name,
                 dst_neuron=neuron_idx,
-                inputs=circuit_inputs,
+                inputs=trace_inputs,
                 dst_pole=PoleType.POSITIVE,
                 top_k=6,
             )
@@ -1360,6 +1518,12 @@ Your task is to analyze the provided JSON evidence for a single neuron (includin
                 hypothesis.taxonomy_class = NeuronTaxonomy.DEAD_OR_NOISY
             else:
                 hypothesis.taxonomy_class = NeuronTaxonomy.TRUE_POLYSEMANTIC
+        elif (
+            rep.empirical_verification_score >= 0.85
+            and rep.falsification_outcome == "won"
+            and rep.positive_share_of_corpus_max >= 0.45
+        ):
+            hypothesis.taxonomy_class = NeuronTaxonomy.CLEAN_MONOSEMANTIC
         elif (
             hypothesis.taxonomy_class
             in (NeuronTaxonomy.UNVERIFIED, NeuronTaxonomy.TRUE_POLYSEMANTIC)

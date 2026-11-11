@@ -2335,3 +2335,78 @@ class TestStatisticalCalibrationAndModelAgnosticism:
         with pytest.raises(ValueError, match="out of range|dimension mismatch"):
             rt = ProductionSteeringRuntime(tiny, preset_file)
             rt.attach(use_compiled_residual_vectors=True)
+
+    def test_focal_sentence_verification_uncontaminated_swiglu_and_contrastive_injection(
+        self, demo_session: WorkbenchSession
+    ):
+        """
+        Verifies the 4 real-world LLM benchmark fixes:
+          1. Sparse detector neurons evaluated on long multi-token held-out sentence contexts
+             (`using_sentence_ctx`) measure focal token activations and causal KL/logit shifts
+             without whole-sentence `.mean()` dilution.
+          2. SwiGLU `true_pos_count` / `true_pos_m4` preserves sparse (+ x +) pole selectivity
+             even when (- x -) double-negative echoes inflate raw `pos_count` above 25%.
+          3. `LayerCleanlinessReport` exposes `untriggered_on_sample_count` and
+             `clean_and_structured_among_triggered_pct`.
+          4. `VerificationReport.positive_injection_target_logit_boost` and
+             `NeuralInjector.inject_contrastive_behavior` steer multi-neuron contrastive circuits.
+        """
+        # 1. Test SwiGLU true (+ x +) selectivity preservation under heavy (- x -) echo contamination
+        tracker = StreamingLayerStats("swiglu_uncontaminated", num_neurons=1, top_k=5)
+        # 20 tokens total: 1 sparse (+ x +) peak of +9.0, 9 (- x -) echoes of +0.05, 10 negative of -0.2
+        acts = torch.tensor(
+            [[[9.0]] + [[0.05]] * 9 + [[-0.20]] * 10], dtype=torch.float32
+        )
+        gates = torch.tensor(
+            [[[3.0]] + [[-0.5]] * 9 + [[-0.5]] * 10], dtype=torch.float32
+        )
+        ups = torch.tensor(
+            [[[3.0]] + [[-0.2]] * 9 + [[0.8]] * 10], dtype=torch.float32
+        )
+        toks = [["__init__"] + ["echo_tok"] * 9 + ["neg_tok"] * 10]
+        tracker.update(
+            acts,
+            sample_ids=[0],
+            tokens_per_sample=toks,
+            contexts_per_sample=[" ".join(toks[0])],
+            gate_activations=gates,
+            up_activations=ups,
+        )
+        prof = tracker.export_profile(0)
+        # Raw positive rate is 10/20 = 0.50 (90% double-negative), but true (+ x +) rate is 1/20 = 0.05
+        assert prof.positive_firing_rate == pytest.approx(0.50)
+        assert prof.double_negative_positive_rate == pytest.approx(0.90)
+        assert prof.pos_pole_selectivity_score >= 2.0
+        assert prof.top_positive_samples[0].token_str == "__init__"
+        assert prof.top_positive_samples[0].is_double_negative_route is False
+
+        # 2. Verify positive_injection_target_logit_boost and untriggered_on_sample metrics
+        hyp = demo_session.injector.explain_neuron(
+            layer_name="mlp_block_0.down_proj",
+            neuron_idx=7,
+            tok_to_id=demo_session.tok_to_id,
+            idx_to_token=demo_session.id_to_tok,
+            unembed_weight=demo_session.unembed_weight,
+            dst_layer="mlp_block_1.down_proj",
+        )
+        assert hyp.verification_report is not None
+        assert hyp.verification_report.positive_injection_target_logit_boost > 0.0
+
+        clean_rep = demo_session.injector.scan_layer_cleanliness("mlp_block_0.down_proj")
+        assert clean_rep.untriggered_on_sample_count >= 0
+        assert clean_rep.clean_and_structured_among_triggered_pct >= clean_rep.combined_clean_and_structured_pct
+
+        # 3. Verify inject_contrastive_behavior registers native-scale interventions
+        pos_ids = torch.tensor([[1, 2, 5, 6]], dtype=torch.long)
+        neg_ids = torch.tensor([[1, 2, 9, 10]], dtype=torch.long)
+        c_rep = demo_session.injector.discover_contrastive_neurons(
+            pos_inputs=pos_ids,
+            neg_inputs=neg_ids,
+            layer_names=["mlp_block_0.down_proj"],
+            top_k=3,
+        )
+        demo_session.injector.clear_interventions()
+        specs = demo_session.injector.inject_contrastive_behavior(c_rep, strength=2.0, top_k=2)
+        assert len(specs) == 1
+        assert len(specs[0].neuron_indices) == 2
+        demo_session.injector.clear_interventions()
