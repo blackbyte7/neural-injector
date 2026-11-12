@@ -19,8 +19,7 @@ from .types import InterventionMode, InterventionSpec, PoleType
 class AuditRequest(BaseModel):
     layer_names: List[str] = Field(..., description="Target neuron layer names to audit")
     prompts: List[str] = Field(..., min_length=1, description="Corpus of text prompts to stream")
-    top_k: int = Field(default=8, ge=1, le=50)
-    tracked_neurons: Optional[List[int]] = Field(default=None)
+    top_k: int = Field(default=16, ge=1, le=256)
     batch_size: int = Field(default=1, ge=1, le=128)
 
 
@@ -32,6 +31,7 @@ class InterventionRequest(BaseModel):
     value: float = Field(default=0.0)
     per_neuron_values: Optional[List[float]] = Field(default=None)
     token_positions: Optional[List[int]] = Field(default=None)
+    condition_signal: str = Field(default="activation", description="EXTREME_CULL: 'gate' or 'activation'")
 
 
 class CircuitTraceRequest(BaseModel):
@@ -71,10 +71,12 @@ class ExplainRequest(BaseModel):
     dst_layer: Optional[str] = Field(default=None)
     src_layer: Optional[str] = Field(default=None)
     circuit_prompt: Optional[str] = Field(default=None)
+    steering_prompts: Optional[List[str]] = Field(default=None)
+    steering_tokens: int = Field(default=24, ge=1, le=256)
 
 
 class ExportPresetRequest(BaseModel):
-    preset_name: str = Field(default="crypto_sql_steering_v1")
+    preset_name: str = Field(default="steering_preset")
     description: str = Field(default="Exported from Neural Injector Workbench")
     save_json_path: Optional[str] = Field(default=None)
     save_pt_vectors_path: Optional[str] = Field(default=None)
@@ -101,7 +103,7 @@ def create_workbench_app(
     app = FastAPI(
         title="Neural Injector Workbench API",
         description="Bipolar Neuron Auditor, Surgical Activation Injector, Circuit Tracer & Agentic Explainer",
-        version="0.6.0",
+        version="0.7.0",
     )
     session_lock = asyncio.Lock()
     app_state = getattr(app, "state", None)
@@ -137,16 +139,15 @@ def create_workbench_app(
                     layer_names=req.layer_names,
                     prompts=req.prompts,
                     top_k=req.top_k,
-                    tracked_neurons=req.tracked_neurons,
                     batch_size=req.batch_size,
                 )
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/layers/{layer_name}/scan")
-    async def scan_layer_cleanliness(
+    async def scan_layer(
         layer_name: str,
-        sort_by: str = "pole_selectivity_score",
+        sort_by: str = "rms_write_norm",
         compute_kl_top_n: int = 3,
         limit: int = 64,
         kl_prompt: Optional[str] = None,
@@ -159,7 +160,7 @@ def create_workbench_app(
                         if compute_kl_top_n > 0
                         else None
                     )
-                    report = wb_session.injector.scan_layer_cleanliness(
+                    report = wb_session.injector.scan_layer(
                         layer_name=layer_name,
                         sort_by=sort_by,
                         compute_kl_for_top_n=compute_kl_top_n,
@@ -171,6 +172,8 @@ def create_workbench_app(
                 return await asyncio.to_thread(_run_scan)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/layers/{layer_name}/neurons/{neuron_idx}")
     async def get_neuron_profile(layer_name: str, neuron_idx: int) -> Dict[str, Any]:
@@ -183,9 +186,7 @@ def create_workbench_app(
                         unembed_weight=wb_session.unembed_weight,
                         idx_to_token=wb_session.id_to_tok,
                     )
-                    data = asdict(profile)
-                    data["is_clean_candidate"] = profile.is_clean_candidate
-                    return data
+                    return asdict(profile)
 
                 return await asyncio.to_thread(_get_prof)
             except KeyError as exc:
@@ -206,8 +207,12 @@ def create_workbench_app(
                 value=req.value,
                 per_neuron_values=req.per_neuron_values,
                 token_positions=req.token_positions,
+                condition_signal=req.condition_signal,
             )
-            wb_session.injector.add_intervention(spec)
+            try:
+                wb_session.injector.add_intervention(spec)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             return {
                 "status": "registered",
                 "active_count": wb_session.injector.active_intervention_count,
@@ -290,15 +295,14 @@ def create_workbench_app(
                     if req.dst_layer or req.src_layer:
                         circuit_inputs = wb_session.get_default_eval_inputs(req.circuit_prompt)
 
-                    hypothesis = wb_session.injector.explain_neuron(
-                        layer_name=req.layer_name,
-                        neuron_idx=req.neuron_idx,
-                        tok_to_id=wb_session.tok_to_id,
-                        idx_to_token=wb_session.id_to_tok,
-                        unembed_weight=wb_session.unembed_weight,
+                    hypothesis = wb_session.explain_neuron(
+                        req.layer_name,
+                        req.neuron_idx,
                         dst_layer=req.dst_layer,
                         circuit_inputs=circuit_inputs,
                         src_layer=req.src_layer,
+                        steering_prompts=req.steering_prompts,
+                        steering_tokens=req.steering_tokens,
                     )
                     return asdict(hypothesis)
 
@@ -366,26 +370,28 @@ WORKBENCH_HTML = """<!DOCTYPE html>
     <header class="flex items-center justify-between border-b border-slate-800 pb-4">
       <div>
         <h1 class="text-2xl font-bold text-emerald-400">Neural Injector Workbench v0.6</h1>
-        <p class="text-sm text-slate-400">Bipolar Auditor • Layer-Wide Cleanliness Scanner • Surgical Injector • Circuit Tracer • Production Steering Exporter</p>
+        <p class="text-sm text-slate-400">Bipolar Auditor • Layer Scan • Surgical Injector • Circuit Tracer • Production Steering Exporter</p>
       </div>
       <span id="model-badge" class="px-3 py-1 rounded bg-slate-800 text-xs font-mono text-emerald-300">Loading...</span>
     </header>
 
-    <!-- Row 1: Layer-Wide Cleanliness Scanner & Heatmap -->
+    <!-- Row 1: Layer Scan & Heatmap -->
     <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 class="text-lg font-semibold text-indigo-400">1. Batch Layer-Wide Cleanliness Scanner</h2>
+          <h2 class="text-lg font-semibold text-indigo-400">1. Batch Layer Scan</h2>
           <p class="text-xs text-slate-400">Scans all neurons &amp; poles in parallel using GPU Welford 4th-moment kurtosis &amp; outgoing residual norms. Click any neuron tile to inspect it.</p>
         </div>
         <div class="flex items-center gap-2">
           <select id="scan-sort" class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-xs">
-            <option value="pole_selectivity_score">Sort: Pole Selectivity</option>
-            <option value="estimated_causal_impact">Sort: Causal Impact</option>
-            <option value="bipolar_balance">Sort: Bipolar Balance</option>
+            <option value="rms_write_norm">Sort: RMS write norm</option>
+            <option value="max_val">Sort: positive extreme</option>
+            <option value="min_val">Sort: negative extreme</option>
+            <option value="positive_excess_kurtosis">Sort: + pole excess kurtosis</option>
+            <option value="double_negative_positive_rate">Sort: -- share of a&gt;0</option>
             <option value="neuron_idx">Sort: Neuron Index</option>
           </select>
-          <button onclick="scanLayerCleanliness()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-4 py-2 rounded">Scan Layer Cleanliness</button>
+          <button onclick="scanLayer()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-4 py-2 rounded">Scan Layer</button>
         </div>
       </div>
       <div id="scan-metrics" class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs"></div>
@@ -399,7 +405,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
         <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="text-xs text-slate-400">Layer</label>
-            <select id="layer-select" onchange="scanLayerCleanliness()" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"></select>
+            <select id="layer-select" onchange="scanLayer()" class="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-sm"></select>
           </div>
           <div>
             <label class="text-xs text-slate-400">Neuron Index</label>
@@ -496,35 +502,35 @@ WORKBENCH_HTML = """<!DOCTYPE html>
         dstSel.add(new Option(`${l.name} (${l.num_neurons}n)`, l.name));
       });
       if (data.layers.length > 1) dstSel.selectedIndex = 1;
-      await scanLayerCleanliness();
+      await scanLayer();
       await inspectNeuron();
     }
 
-    async function scanLayerCleanliness() {
+    async function scanLayer() {
       const layer = document.getElementById('layer-select').value;
       const sortBy = document.getElementById('scan-sort').value;
       const res = await fetch(`/api/layers/${encodeURIComponent(layer)}/scan?sort_by=${sortBy}&compute_kl_top_n=3&limit=64`);
       const data = await res.json();
 
       document.getElementById('scan-metrics').innerHTML = `
-        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Clean Monosemantic</span><span class="text-lg font-bold text-emerald-400">${data.clean_monosemantic_pct}%</span></div>
-        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Clean Poles (+ / -)</span><span class="text-lg font-bold text-sky-400">${data.clean_poles_pct}%</span></div>
-        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Combined Clean + Structured</span><span class="text-lg font-bold text-indigo-400">${data.combined_clean_and_structured_pct}%</span></div>
-        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Mean Selectivity Score</span><span class="text-lg font-bold text-amber-400">${data.mean_selectivity_score}</span></div>
+        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Tokens scanned</span><span class="text-lg font-bold text-emerald-400">${data.tokens_scanned}</span></div>
+        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">-- share of a&gt;0 (layer)</span><span class="text-lg font-bold text-sky-400">${data.layer_double_negative_positive_rate.toFixed(4)}</span></div>
+        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Explained poles</span><span class="text-lg font-bold text-indigo-400">${data.explanation_audit.poles_explained}</span></div>
+        <div class="bg-slate-950 p-3 rounded border border-slate-800"><span class="text-slate-400 block">Outcomes (won/tied/lost)</span><span class="text-lg font-bold text-amber-400">${JSON.stringify(data.explanation_audit.outcome_counts)}</span></div>
       `;
 
       const heatmap = document.getElementById('scan-heatmap');
       heatmap.innerHTML = '';
       data.neurons.forEach(n => {
         let color = 'bg-slate-800 border-slate-700 text-slate-300';
-        if (n.taxonomy_class === 'clean_monosemantic') color = 'bg-emerald-950 border-emerald-600 text-emerald-300';
-        else if (n.taxonomy_class === 'structured_recursive_mixture') color = 'bg-sky-950 border-sky-600 text-sky-300';
-        else if (n.taxonomy_class === 'true_polysemantic') color = 'bg-amber-950 border-amber-600 text-amber-300';
+        if (n.explained && n.pos_outcome === 'won') color = 'bg-emerald-950 border-emerald-600 text-emerald-300';
+        else if (n.explained && n.pos_outcome === 'tied') color = 'bg-sky-950 border-sky-600 text-sky-300';
+        else if (n.explained && n.pos_outcome === 'lost') color = 'bg-amber-950 border-amber-600 text-amber-300';
 
         const btn = document.createElement('button');
         btn.className = `px-2 py-1 rounded border text-xs font-mono hover:scale-105 transition ${color}`;
-        btn.title = `N#${n.neuron_idx} | ${n.taxonomy_class} | Selectivity=${n.pole_selectivity_score} | Impact=${n.estimated_causal_impact}`;
-        btn.textContent = `N${n.neuron_idx} (${n.pole_selectivity_score.toFixed(1)})`;
+        btn.title = `N#${n.neuron_idx} | max ${n.max_val.toFixed(3)} min ${n.min_val.toFixed(3)} | +tok ${n.top_pos_token} -tok ${n.top_neg_token} | ${n.explained ? (n.pos_taxonomy + '/' + n.pos_outcome) : 'unexplained'}`;
+        btn.textContent = `N${n.neuron_idx}`;
         btn.onclick = () => {
           document.getElementById('neuron-idx').value = n.neuron_idx;
           inspectNeuron();

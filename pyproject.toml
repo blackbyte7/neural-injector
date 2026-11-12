@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neural-injector"
-version = "0.6.0"
-description = "Universal Bipolar Neuron Auditor, Surgical Activation Injector, Circuit Tracer, Agentic Explainer, and FastAPI/CLI Workbench"
+version = "0.7.0"
+description = "Native-basis neuron auditing, circuit tracing, explanation testing and surgical steering (Neural Networks Are Already Clean)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

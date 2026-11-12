@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+import weakref
 
 import torch
 import torch.nn as nn
@@ -207,72 +208,69 @@ class LayerDiscovery:
         return int(w_dp.shape[-1])
 
     @classmethod
-    def forward_moe_param_container(
+    def iter_moe_experts(
         cls,
         module: nn.Module,
-        inputs: Tuple[torch.Tensor, ...],
-        intervention_fn: Optional[Any] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        inputs: Tuple[Any, ...],
+    ) -> Iterator[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
-        Computes the intermediate `d_mlp` SwiGLU activations `(agg_act, agg_gate, agg_up)`
-        inside a 3D MoE parameter container (`MixtralExperts`, `Qwen2MoeExperts`, `Qwen3MoeExperts`)
-        from its forward inputs `(hidden_states, top_k_index, top_k_weights)`.
-        When `intervention_fn` is provided, applies `intervention_fn` to each expert's intermediate
-        `d_mlp` activations before projecting through `down_proj[expert_idx]` and returns the
-        modified `[num_tokens, d_model]` output tensor.
+        Iterates the experts hit by a HuggingFace 3D MoE parameter container forward
+        (`hidden_states [T, d_model], top_k_index [T, k], top_k_weights [T, k]`), yielding
+        `(expert_idx, token_idx, top_k_pos, gate, up, act)` with `act = act_fn(gate) * up` the expert's
+        intermediate neuron activations for its routed tokens (before the routing weight).
         """
-        if len(inputs) < 3 or not isinstance(inputs[0], torch.Tensor):
-            return None, None, None, None
-        hidden_states, top_k_index, top_k_weights = inputs[0], inputs[1], inputs[2]
-        if not isinstance(top_k_index, torch.Tensor) or not isinstance(top_k_weights, torch.Tensor):
-            return None, None, None, None
-
-        d_mlp = cls.get_moe_param_container_d_mlp(module)
+        if len(inputs) < 3 or not all(isinstance(t, torch.Tensor) for t in inputs[:3]):
+            return
+        hidden_states, top_k_index = inputs[0], inputs[1]
         num_experts = int(getattr(module, "num_experts", module.down_proj.shape[0]))
         act_fn = getattr(module, "act_fn", torch.nn.functional.silu)
-
-        agg_act = torch.zeros(
-            (hidden_states.shape[0], d_mlp), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        agg_gate = torch.zeros_like(agg_act)
-        agg_up = torch.zeros_like(agg_act)
-        final_hidden_states = (
-            torch.zeros_like(hidden_states) if intervention_fn is not None else None
-        )
-
         with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(
-                top_k_index.long(), num_classes=num_experts + 1
-            )
+            expert_mask = torch.nn.functional.one_hot(top_k_index.long(), num_classes=num_experts + 1)
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx_tensor in expert_hit:
-            expert_idx = int(expert_idx_tensor[0].item())
-            if expert_idx >= num_experts:
+        for e_t in expert_hit:
+            e = int(e_t[0].item())
+            if e >= num_experts:
                 continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = torch.nn.functional.linear(
-                current_state, module.gate_up_proj[expert_idx]
-            ).chunk(2, dim=-1)
-            current_act = act_fn(gate) * up
-            w = top_k_weights[token_idx, top_k_pos, None].to(current_act.dtype)
-            agg_act.index_add_(0, token_idx, current_act * w)
-            agg_gate.index_add_(0, token_idx, gate * w)
-            agg_up.index_add_(0, token_idx, up * w)
+            top_k_pos, token_idx = torch.where(expert_mask[e])
+            current = hidden_states[token_idx]
+            gate, up = torch.nn.functional.linear(current, module.gate_up_proj[e]).chunk(2, dim=-1)
+            yield e, token_idx, top_k_pos, gate, up, act_fn(gate) * up
 
-            if intervention_fn is not None and final_hidden_states is not None:
-                mod_act = intervention_fn(current_act)
-                current_out = (
-                    torch.nn.functional.linear(mod_act, module.down_proj[expert_idx])
-                    * top_k_weights[token_idx, top_k_pos, None]
-                )
-                final_hidden_states.index_add_(
-                    0, token_idx, current_out.to(final_hidden_states.dtype)
-                )
+    @classmethod
+    def recompute_moe_container(
+        cls,
+        module: nn.Module,
+        inputs: Tuple[Any, ...],
+        expert_fns: Dict[int, Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]],
+    ) -> Optional[torch.Tensor]:
+        """
+        Recomputes the container's output, applying `expert_fns[e](act, gate, token_idx)` to the
+        intermediate activations of each listed expert before its down projection; other experts are
+        recomputed unchanged. Mirrors the HuggingFace computation (routing weight after down_proj).
+        """
+        if len(inputs) < 3:
+            return None
+        hidden_states, top_k_weights = inputs[0], inputs[2]
+        out = torch.zeros_like(hidden_states)
+        for e, token_idx, top_k_pos, gate, _up, act in cls.iter_moe_experts(module, inputs):
+            fn = expert_fns.get(e)
+            if fn is not None:
+                act = fn(act, gate, token_idx)
+            cur = torch.nn.functional.linear(act, module.down_proj[e])
+            cur = cur * top_k_weights[token_idx, top_k_pos, None]
+            out.index_add_(0, token_idx, cur.to(out.dtype))
+        return out
 
-        return agg_act, agg_gate, agg_up, final_hidden_states
+    EXPERT_SUFFIX = "@expert"
+
+    @classmethod
+    def split_expert_layer_name(cls, layer_name: str) -> Tuple[str, Optional[int]]:
+        """'model.layers.3.mlp.experts@expert7' -> ('model.layers.3.mlp.experts', 7)."""
+        if cls.EXPERT_SUFFIX in layer_name:
+            base, e = layer_name.rsplit(cls.EXPERT_SUFFIX, 1)
+            return base, int(e)
+        return layer_name, None
 
     @staticmethod
     def is_quantized_or_offloaded(module: nn.Module) -> bool:
@@ -322,7 +320,9 @@ class LayerDiscovery:
         (e.g., `gate_up_proj`, `c_fc_fused`, `w13`), returns that executable `nn.Module` so
         forward hooks can split its output into `(gate_activations, up_activations)`.
         """
-        _, _, num_neurons = cls.resolve_module(model, layer_name)
+        _, target, num_neurons = cls.resolve_module(model, layer_name)
+        if target == "moe_expert":
+            return None
         parent_path = ".".join(layer_name.split(".")[:-1])
         if not parent_path:
             return None
@@ -355,7 +355,13 @@ class LayerDiscovery:
         `intermediate.dense` -> `output.dense` siblings, fused `gate_up_proj` `[2 * d_mlp, d_model]`,
         and 3D MoE expert tensors.
         """
-        write_mod, _, num_neurons = cls.resolve_module(model, layer_name)
+        write_mod, target, num_neurons = cls.resolve_module(model, layer_name)
+
+        if target == "moe_expert":
+            e = cls.expert_index(model, layer_name)
+            g_w, u_w = write_mod.gate_up_proj[e].detach().chunk(2, dim=0)
+            # Linear conventions: write view weight [d_model, d_mlp]; read views [d_mlp, d_model]
+            return _SlicedLinearView(write_mod.down_proj[e].detach()), _SlicedLinearView(u_w), _SlicedLinearView(g_w)
 
         if cls.is_moe_param_container(write_mod):
             w_dp = getattr(write_mod, "down_proj").detach()
@@ -533,8 +539,26 @@ class LayerDiscovery:
             scale = scale + 1.0
         return scale
 
+    _DISCOVERY_CACHE: "weakref.WeakKeyDictionary[nn.Module, Dict[Tuple[bool, int], Dict[str, LayerDescriptor]]]" = weakref.WeakKeyDictionary()
+
     @classmethod
     def discover_neuron_layers(
+        cls,
+        model: nn.Module,
+        include_all_linear: bool = False,
+    ) -> Dict[str, LayerDescriptor]:
+        """Cached wrapper around `_discover_neuron_layers` (recomputed when the module count changes)."""
+        n_mod = sum(1 for _ in model.modules())
+        per_model = cls._DISCOVERY_CACHE.setdefault(model, {})
+        if any(k[1] != n_mod for k in per_model):
+            per_model.clear()
+        key = (bool(include_all_linear), n_mod)
+        if key not in per_model:
+            per_model[key] = cls._discover_neuron_layers(model, include_all_linear)
+        return per_model[key]
+
+    @classmethod
+    def _discover_neuron_layers(
         cls,
         model: nn.Module,
         include_all_linear: bool = False,
@@ -624,52 +648,146 @@ class LayerDiscovery:
                 )
 
             # 4. Check for 3D Mixture-of-Experts (MoE) down-projection modules or fused expert containers
-            elif hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and module.weight.ndim == 3:
-                if is_down_proj or include_all_linear:
-                    w = module.weight
-                    d_mlp = w.shape[-1]
-                    descriptors[name] = LayerDescriptor(
-                        name=name,
+            elif cls.is_moe_param_container(module):
+                # HuggingFace MoE expert container (3D `down_proj` / `gate_up_proj` parameters).
+                # Neuron i of expert e and neuron i of expert e' are different neurons, so each expert
+                # is exposed as its own virtual layer '<container>@expert<e>'.
+                d_mlp = cls.get_moe_param_container_d_mlp(module)
+                n_exp = int(getattr(module, "num_experts", module.down_proj.shape[0]))
+                for e in range(n_exp):
+                    vname = f"{name}{cls.EXPERT_SUFFIX}{e}"
+                    descriptors[vname] = LayerDescriptor(
+                        name=vname,
                         module=module,
-                        module_type="MoE_Expert_Neuron_Basis (Pre-DownProj)",
+                        module_type="MoE_Expert_Neuron_Basis (Parameter Container)",
                         num_neurons=d_mlp,
-                        hook_target="input",
-                        expert_idx=expert_idx,
+                        hook_target="moe_expert",
+                        expert_idx=e,
                         is_quantized=quant_flag,
                     )
-            elif cls.is_moe_param_container(module):
-                # Newer HuggingFace MoE expert container where `down_proj` is a 3D nn.Parameter
-                d_mlp = cls.get_moe_param_container_d_mlp(module)
-                descriptors[name] = LayerDescriptor(
-                    name=name,
-                    module=module,
-                    module_type="MoE_Parameter_Container_Basis",
-                    num_neurons=d_mlp,
-                    hook_target="output",
-                    expert_idx=expert_idx,
-                    is_quantized=quant_flag,
-                )
 
         # Fallback: if no specialized `down_proj` layers were found, register all Linear/Conv2d layers
         if not descriptors and not include_all_linear:
-            return cls.discover_neuron_layers(model, include_all_linear=True)
+            return cls._discover_neuron_layers(model, include_all_linear=True)
 
         return descriptors
 
-    @staticmethod
-    def resolve_module(model: nn.Module, layer_name: str) -> Tuple[nn.Module, str, int]:
-        """Resolves a dot-separated layer name to its module, default hook target, and neuron count."""
-        discovered_primary = LayerDiscovery.discover_neuron_layers(model, include_all_linear=False)
-        if layer_name in discovered_primary:
-            desc = discovered_primary[layer_name]
-            return desc.module, desc.hook_target, desc.num_neurons
-
-        discovered_all = LayerDiscovery.discover_neuron_layers(model, include_all_linear=True)
-        if layer_name in discovered_all:
-            desc = discovered_all[layer_name]
-            return desc.module, desc.hook_target, desc.num_neurons
-
-        # Direct lookup if user specified an activation module (e.g., 'mlp.act_fn')
+    @classmethod
+    def resolve_module(cls, model: nn.Module, layer_name: str) -> Tuple[nn.Module, str, int]:
+        """Resolves a layer name to (module, hook target: 'input' | 'output' | 'moe_expert', neuron count)."""
+        primary = cls.discover_neuron_layers(model, include_all_linear=False)
+        if layer_name in primary:
+            d = primary[layer_name]
+            return d.module, d.hook_target, d.num_neurons
+        everything = cls.discover_neuron_layers(model, include_all_linear=True)
+        if layer_name in everything:
+            d = everything[layer_name]
+            return d.module, d.hook_target, d.num_neurons
         submodule = model.get_submodule(layer_name)
-        num_neurons = getattr(submodule, "out_features", getattr(submodule, "in_features", -1))
-        return submodule, "output", num_neurons
+        num_neurons = getattr(submodule, "out_features", None)
+        if num_neurons is None:
+            raise ValueError(f"Cannot determine the neuron basis of module '{layer_name}'.")
+        return submodule, "output", int(num_neurons)
+
+    @classmethod
+    def expert_index(cls, model: nn.Module, layer_name: str) -> Optional[int]:
+        return cls.split_expert_layer_name(layer_name)[1]
+
+    # ------------------------------------------------------------------
+    # Read / write vectors of the neuron basis
+    # ------------------------------------------------------------------
+    @classmethod
+    def neuron_write_vectors(cls, model: nn.Module, layer_name: str) -> Optional[torch.Tensor]:
+        """
+        Residual-stream write vectors of every neuron as rows, shape [num_neurons, d_model]
+        (W_down[:, i] for each neuron i). None for output-hooked layers, whose units do not write
+        to the residual stream through a single matrix column.
+        """
+        module, target, n = cls.resolve_module(model, layer_name)
+        if target == "moe_expert":
+            e = cls.expert_index(model, layer_name)
+            return module.down_proj[e].detach().T  # down_proj[e]: [d_model, d_mlp]
+        if target != "input" or not hasattr(module, "weight"):
+            return None
+        w = module.weight.detach()
+        if module.__class__.__name__ == "Conv1D":
+            return w  # [d_mlp, d_model]
+        if isinstance(module, nn.Linear):
+            return w.T  # [d_mlp, d_model]
+        return None
+
+    @classmethod
+    def neuron_read_vectors(
+        cls, model: nn.Module, layer_name: str
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """(value/up read rows [num_neurons, d_model], gate read rows or None) for the layer's neurons."""
+        module, target, n = cls.resolve_module(model, layer_name)
+        if target == "moe_expert":
+            e = cls.expert_index(model, layer_name)
+            g, u = module.gate_up_proj[e].detach().chunk(2, dim=0)
+            return u, g
+        _, up_mod, gate_mod = cls.resolve_mlp_read_write_modules(model, layer_name)
+
+        def _rows(m: Optional[nn.Module]) -> Optional[torch.Tensor]:
+            if m is None or not hasattr(m, "weight"):
+                return None
+            w = m.weight.detach()
+            if w.ndim != 2:
+                return None
+            if m.__class__.__name__ == "Conv1D":
+                w = w.T
+            return w if w.shape[0] == n else None
+
+        return _rows(up_mod), _rows(gate_mod)
+
+    @classmethod
+    def up_source(cls, model: nn.Module, layer_name: str) -> Tuple[Optional[nn.Module], str]:
+        """Where the value/up projection u can be read: (module, "full" | "second_half" | "moe" | "none")."""
+        module, target, n = cls.resolve_module(model, layer_name)
+        if target == "moe_expert":
+            return module, "moe"
+        if target != "input":
+            return None, "none"
+        _, up_mod, gate_mod = cls.resolve_mlp_read_write_modules(model, layer_name)
+        if up_mod is not None and not isinstance(up_mod, _SlicedLinearView):
+            return up_mod, "full"
+        fused = cls.resolve_fused_gate_up_module(model, layer_name)
+        if fused is not None:
+            return fused, "second_half"
+        return None, "none"
+
+    @classmethod
+    def resolve_mlp_activation(cls, model: nn.Module, layer_name: str) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """The gate nonlinearity act(.) of the MLP containing `layer_name`, if it is exposed as an attribute."""
+        module, target, _ = cls.resolve_module(model, layer_name)
+        if target == "moe_expert":
+            return getattr(module, "act_fn", None)
+        base, _ = cls.split_expert_layer_name(layer_name)
+        parent_path = ".".join(base.split(".")[:-1])
+        parent = model.get_submodule(parent_path) if parent_path else model
+        for attr in ("act_fn", "activation_fn", "act", "activation"):
+            fn = getattr(parent, attr, None)
+            if callable(fn):
+                return fn
+        return None
+
+    @classmethod
+    def gate_source(cls, model: nn.Module, layer_name: str) -> Tuple[Optional[nn.Module], str]:
+        """
+        Where the gate pre-activation g of an input-hooked gated MLP layer can be read during a
+        forward pass: (gate module, "full") when a separate gate projection exists, (fused module,
+        "first_half") for a fused gate_up projection, (None, "none") for non-gated MLPs.
+        MoE expert layers compute their gate during recomputation ("moe").
+        """
+        module, target, n = cls.resolve_module(model, layer_name)
+        if target == "moe_expert":
+            return module, "moe"
+        if target != "input":
+            return None, "none"
+        _, up_mod, gate_mod = cls.resolve_mlp_read_write_modules(model, layer_name)
+        if gate_mod is not None and not isinstance(gate_mod, _SlicedLinearView):
+            return gate_mod, "full"
+        fused = cls.resolve_fused_gate_up_module(model, layer_name)
+        if fused is not None:
+            return fused, "first_half"
+        return None, "none"

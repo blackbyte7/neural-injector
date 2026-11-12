@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.utils.hooks import RemovableHandle
 
 from .discovery import LayerDiscovery
-from .interventions import InterventionKernel
+from .interventions import build_intervention_hookset
 from .types import (
     CompiledSteeringVector,
     GateConditionSpec,
@@ -22,765 +22,302 @@ from .types import (
     ProductionPresetBundle,
 )
 
+_AFFINE_MODES = (InterventionMode.ZERO_ABLATE, InterventionMode.SCALE, InterventionMode.ADDITIVE_STEER, InterventionMode.HARD_CLAMP)
+
 
 class SteeringExporter:
     """
-    Compiles surgical neuron manipulations into residual-stream steering vectors,
-    exports/imports portable JSON production presets (with path-traversal security),
-    and folds unconditional interventions directly into model weights for zero-overhead inference.
+    Turns registered interventions into deployable artefacts:
+      * JSON presets (all modes, including conditional gates and gate-conditioned modes),
+      * residual-stream steering vectors v = sum_i delta_i W_down[:, i] for layers whose interventions
+        are purely additive and unconditional (the only case in which a vector reproduces them exactly
+        with a single output hook),
+      * exact weight folding of unconditional affine interventions a' = s a + t into W_down and its bias.
     """
 
     @staticmethod
-    def validate_safe_export_path(
-        filepath: Union[str, Path],
-        allowed_workspace_dir: Optional[Union[str, Path]] = None,
-    ) -> Path:
-        """
-        Validates a file path against path-traversal attacks (`..` segments or escaping
-        `allowed_workspace_dir` when configured). Raises `PermissionError` if unsafe.
-        """
-        raw_path = Path(filepath)
-        if ".." in raw_path.parts:
-            raise PermissionError(
-                f"Path traversal ('..') is not permitted in export path: '{filepath}'."
-            )
-        resolved = raw_path.expanduser().resolve()
+    def validate_safe_export_path(filepath: Union[str, Path], allowed_workspace_dir: Optional[Union[str, Path]] = None) -> Path:
+        raw = Path(filepath)
+        if ".." in raw.parts:
+            raise PermissionError(f"Path traversal ('..') is not permitted: '{filepath}'.")
+        resolved = raw.expanduser().resolve()
         if allowed_workspace_dir is not None:
-            workspace_root = Path(allowed_workspace_dir).expanduser().resolve()
-            if not resolved.is_relative_to(workspace_root):
-                raise PermissionError(
-                    f"Export path '{resolved}' escapes allowed workspace '{workspace_root}'."
-                )
+            root = Path(allowed_workspace_dir).expanduser().resolve()
+            if not resolved.is_relative_to(root):
+                raise PermissionError(f"Path '{resolved}' escapes allowed workspace '{root}'.")
         return resolved
 
     @staticmethod
-    def is_spec_compilable_to_residual_vector(spec: InterventionSpec) -> bool:
-        """
-        Returns True if and only if `spec` is an unconditional, position-independent
-        ADDITIVE_STEER, HARD_CLAMP, or ZERO_ABLATE operation without dynamic gating.
-        """
-        return (
-            spec.enabled
-            and spec.mode
-            in (
-                InterventionMode.ADDITIVE_STEER,
-                InterventionMode.HARD_CLAMP,
-                InterventionMode.ZERO_ABLATE,
-            )
-            and spec.pole == PoleType.BOTH
-            and spec.token_positions is None
-            and spec.gate_condition is None
-            and spec.custom_fn is None
-        )
+    def _unconditional(spec: InterventionSpec) -> bool:
+        return (spec.enabled and spec.pole == PoleType.BOTH and spec.token_positions is None
+                and spec.gate_condition is None and spec.custom_fn is None)
 
-    @staticmethod
-    def is_spec_weight_foldable(spec: InterventionSpec) -> bool:
-        """
-        Returns True if and only if `spec` is an unconditional (`PoleType.BOTH`),
-        position-independent affine neuron operation (`ZERO_ABLATE`, `SCALE`,
-        `ADDITIVE_STEER`, or `HARD_CLAMP`) without dynamic gating or custom callables.
-        """
-        return (
-            spec.enabled
-            and spec.pole == PoleType.BOTH
-            and spec.token_positions is None
-            and spec.gate_condition is None
-            and spec.custom_fn is None
-            and spec.mode
-            in (
-                InterventionMode.ZERO_ABLATE,
-                InterventionMode.SCALE,
-                InterventionMode.ADDITIVE_STEER,
-                InterventionMode.HARD_CLAMP,
-            )
-        )
+    @classmethod
+    def is_spec_compilable_to_residual_vector(cls, spec: InterventionSpec) -> bool:
+        return cls._unconditional(spec) and spec.mode == InterventionMode.ADDITIVE_STEER
 
-    @staticmethod
-    def _resolve_composed_neuron_affine_ops(
-        specs: List[InterventionSpec],
-        d_mlp: int,
-    ) -> Dict[int, Tuple[float, float]]:
-        """
-        Composes a sequence of unconditional specs on the same layer in exact execution order.
-        For each targeted neuron `i`, tracks `(scale_i, shift_i)` such that:
-            a_final[i] = scale_i * a_clean[i] + shift_i
-        This guarantees that sequential interventions on the same neuron (e.g., HARD_CLAMP(-10)
-        followed by HARD_CLAMP(+5) or ADDITIVE_STEER(+2)) produce identical results in
-        compiled vectors and weight folding as in `InterventionKernel.apply`.
-        """
+    @classmethod
+    def is_spec_weight_foldable(cls, spec: InterventionSpec) -> bool:
+        return cls._unconditional(spec) and spec.mode in _AFFINE_MODES
+
+    @classmethod
+    def _compose_affine(cls, specs: List[InterventionSpec], d_mlp: int) -> Dict[int, Tuple[float, float]]:
+        """Per neuron (scale, shift) with a_final = scale * a + shift, composed in execution order."""
         composed: Dict[int, Tuple[float, float]] = {}
-
         for spec in specs:
-            if not SteeringExporter.is_spec_weight_foldable(spec):
+            if not cls.is_spec_weight_foldable(spec):
                 continue
-
-            per_vals = (
-                spec.per_neuron_values
-                if spec.per_neuron_values is not None
-                and len(spec.per_neuron_values) == len(spec.neuron_indices)
-                else [float(spec.value)] * len(spec.neuron_indices)
-            )
-
-            for n_idx, val_i in zip(spec.neuron_indices, per_vals):
-                idx = int(n_idx)
-                if idx < 0 or idx >= d_mlp:
+            vals = spec.per_neuron_values if spec.per_neuron_values is not None else [float(spec.value)] * len(spec.neuron_indices)
+            for n_idx, v in zip(spec.neuron_indices, vals):
+                i = int(n_idx)
+                if not 0 <= i < d_mlp:
                     continue
-                v = float(val_i)
-                scale_curr, shift_curr = composed.get(idx, (1.0, 0.0))
-
+                sc, sh = composed.get(i, (1.0, 0.0))
+                v = float(v)
                 if spec.mode == InterventionMode.ZERO_ABLATE:
-                    composed[idx] = (0.0, 0.0)
+                    composed[i] = (0.0, 0.0)
                 elif spec.mode == InterventionMode.HARD_CLAMP:
-                    composed[idx] = (0.0, v)
+                    composed[i] = (0.0, v)
                 elif spec.mode == InterventionMode.SCALE:
-                    composed[idx] = (scale_curr * v, shift_curr * v)
-                elif spec.mode == InterventionMode.ADDITIVE_STEER:
-                    composed[idx] = (scale_curr, shift_curr + v)
-
+                    composed[i] = (sc * v, sh * v)
+                else:
+                    composed[i] = (sc, sh + v)
         return composed
 
     @classmethod
     @torch.no_grad()
-    def compile_residual_steering_vectors(
-        cls,
-        model: nn.Module,
-        interventions_by_layer: Dict[str, List[InterventionSpec]],
-    ) -> List[CompiledSteeringVector]:
-        """
-        For any non-MoE, non-quantized layer where all enabled interventions are unconditional
-        ADDITIVE_STEER, HARD_CLAMP, or ZERO_ABLATE operations, resolves the exact composed
-        per-neuron affine state `(scale_i, shift_i)` and compiles the linear shift:
-          - When `hook_target == "input"` (`down_proj`):
-                v_steer = sum_{i} shift_i * W_down[:, i]  (shape: [d_model])
-          - When `hook_target == "output"` (output-hooked Linear/Conv1D):
-                v_steer[i] = shift_i  (shape: [out_features])
-        For neurons whose composed `scale_i == 0.0` (i.e. HARD_CLAMPed or ZERO_ABLATEd),
-        records their indices in `clamped_neurons` so dynamic activations are zeroed prior to
-        adding `v_steer`.
-        """
-        compiled_list: List[CompiledSteeringVector] = []
-
+    def compile_residual_steering_vectors(cls, model: nn.Module, interventions_by_layer: Dict[str, List[InterventionSpec]]) -> List[CompiledSteeringVector]:
+        out: List[CompiledSteeringVector] = []
         for layer_name, specs in interventions_by_layer.items():
-            enabled_specs = [s for s in specs if s.enabled]
-            if not enabled_specs:
+            active = [s for s in specs if s.enabled]
+            if not active or not all(cls.is_spec_compilable_to_residual_vector(s) for s in active):
                 continue
-            if not all(cls.is_spec_compilable_to_residual_vector(s) for s in enabled_specs):
+            module, target, n = LayerDiscovery.resolve_module(model, layer_name)
+            if target != "input" or LayerDiscovery.is_quantized_or_offloaded(module):
                 continue
-
-            module, hook_target, num_neurons = LayerDiscovery.resolve_module(model, layer_name)
-            if not hasattr(module, "weight") or LayerDiscovery.is_quantized_or_offloaded(module):
+            W = LayerDiscovery.neuron_write_vectors(model, layer_name)
+            if W is None:
                 continue
+            composed = cls._compose_affine(active, n)
+            v = torch.zeros(W.shape[1], dtype=torch.float64, device=W.device)
+            for i, (_sc, sh) in composed.items():
+                v += float(sh) * W[i].double()
+            out.append(CompiledSteeringVector(
+                layer_name=layer_name, d_model=int(W.shape[1]), source_neurons=list(composed.keys()),
+                source_deltas=[float(sh) for _sc, sh in composed.values()], vector_norm=float(v.norm()),
+                vector_values=[float(x) for x in v.cpu().tolist()],
+            ))
+        return out
 
-            w = module.weight.detach()
-            # 3D MoE experts only apply to routed token subsets, so static all-token residual
-            # vectors cannot be compiled without a router mask; use standard hooks instead.
-            if w.ndim == 3 or isinstance(module, nn.Conv2d):
-                continue
-
-            is_conv1d = module.__class__.__name__ == "Conv1D"
-            if hook_target == "input":
-                d_model = w.shape[1] if is_conv1d else w.shape[0]
-                d_mlp = w.shape[0] if is_conv1d else w.shape[1]
-            else:
-                d_model = num_neurons
-                d_mlp = num_neurons
-
-            composed = cls._resolve_composed_neuron_affine_ops(enabled_specs, d_mlp)
-            if not composed:
-                continue
-
-            v_steer = torch.zeros(d_model, dtype=torch.float32, device=w.device)
-            src_neurons: List[int] = []
-            src_deltas: List[float] = []
-            clamped_neurons: List[int] = []
-
-            for n_idx, (scale_i, shift_i) in composed.items():
-                if abs(scale_i) < 1e-12:
-                    clamped_neurons.append(int(n_idx))
-
-                if hook_target == "input":
-                    if is_conv1d:
-                        col_vec = w[n_idx, :].float()
-                    else:
-                        col_vec = w[:, n_idx].float()
-                    v_steer = v_steer + float(shift_i) * col_vec
-                else:
-                    v_steer[n_idx] += float(shift_i)
-
-                src_neurons.append(int(n_idx))
-                src_deltas.append(float(shift_i))
-
-            if src_neurons:
-                vec_norm = float(torch.norm(v_steer, p=2).item())
-                compiled_list.append(
-                    CompiledSteeringVector(
-                        layer_name=layer_name,
-                        d_model=d_model,
-                        source_neurons=src_neurons,
-                        source_deltas=src_deltas,
-                        vector_norm=round(vec_norm, 5),
-                        vector_values=[round(float(x), 6) for x in v_steer.cpu().tolist()],
-                        clamped_neurons=clamped_neurons,
-                    )
-                )
-
-        return compiled_list
+    @staticmethod
+    def serialize_spec(s: InterventionSpec) -> Dict[str, Any]:
+        if s.custom_fn is not None:
+            raise ValueError("Specs with custom_fn cannot be serialised.")
+        d: Dict[str, Any] = {
+            "layer_name": s.layer_name, "neuron_indices": [int(i) for i in s.neuron_indices], "mode": s.mode.value,
+            "pole": s.pole.value, "value": float(s.value), "token_positions": s.token_positions,
+            "condition_signal": s.condition_signal,
+        }
+        if s.per_neuron_values is not None:
+            d["per_neuron_values"] = [float(v) for v in s.per_neuron_values]
+        if s.gate_condition is not None:
+            g = s.gate_condition
+            d["gate_condition"] = {"detector_layer": g.detector_layer, "detector_neuron": g.detector_neuron,
+                                   "detector_pole": g.detector_pole.value, "threshold": float(g.threshold),
+                                   "action_mode": g.action_mode.value, "sequence_scope": g.sequence_scope,
+                                   "sticky_on_decode": bool(g.sticky_on_decode)}
+        return d
 
     @classmethod
-    def build_preset_bundle(
-        cls,
-        model: nn.Module,
-        interventions_by_layer: Dict[str, List[InterventionSpec]],
-        preset_name: str = "default_steering_preset",
-        model_name: str = "custom-model",
-        description: str = "Exported surgical neuron interventions and compiled residual steering vectors.",
-    ) -> ProductionPresetBundle:
-        """Creates a complete ProductionPresetBundle from currently registered interventions."""
-        serialized_specs: List[Dict[str, Any]] = []
-        for _layer_name, specs in interventions_by_layer.items():
-            for s in specs:
-                if not s.enabled:
-                    continue
-                item_dict: Dict[str, Any] = {
-                    "layer_name": s.layer_name,
-                    "neuron_indices": list(s.neuron_indices),
-                    "mode": s.mode.value,
-                    "pole": s.pole.value,
-                    "value": float(s.value),
-                    "token_positions": s.token_positions,
-                }
-                if s.per_neuron_values is not None:
-                    item_dict["per_neuron_values"] = [float(v) for v in s.per_neuron_values]
-                if s.gate_condition is not None:
-                    item_dict["gate_condition"] = {
-                        "detector_layer": s.gate_condition.detector_layer,
-                        "detector_neuron": s.gate_condition.detector_neuron,
-                        "detector_pole": s.gate_condition.detector_pole.value,
-                        "threshold": float(s.gate_condition.threshold),
-                        "action_mode": s.gate_condition.action_mode.value,
-                        "sequence_scope": s.gate_condition.sequence_scope,
-                        "sticky_on_decode": bool(s.gate_condition.sticky_on_decode),
-                    }
-                serialized_specs.append(item_dict)
-
-        compiled_vectors = cls.compile_residual_steering_vectors(model, interventions_by_layer)
-
-        return ProductionPresetBundle(
-            preset_name=preset_name,
-            model_name=model_name,
-            created_at_utc=datetime.now(timezone.utc).isoformat(),
-            description=description,
-            interventions=serialized_specs,
-            compiled_vectors=compiled_vectors,
-        )
+    def build_preset_bundle(cls, model: nn.Module, interventions_by_layer: Dict[str, List[InterventionSpec]],
+                            preset_name: str = "steering_preset", model_name: str = "custom-model",
+                            description: str = "") -> ProductionPresetBundle:
+        specs = [cls.serialize_spec(s) for ss in interventions_by_layer.values() for s in ss if s.enabled]
+        return ProductionPresetBundle(preset_name=preset_name, model_name=model_name,
+                                      created_at_utc=datetime.now(timezone.utc).isoformat(), description=description,
+                                      interventions=specs,
+                                      compiled_vectors=cls.compile_residual_steering_vectors(model, interventions_by_layer))
 
     @classmethod
-    def save_preset_json(
-        cls,
-        bundle: ProductionPresetBundle,
-        filepath: Union[str, Path],
-        export_pt_vectors_path: Optional[Union[str, Path]] = None,
-        allowed_workspace_dir: Optional[Union[str, Path]] = None,
-    ) -> Dict[str, str]:
-        """
-        Writes the ProductionPresetBundle to disk as a portable JSON file.
-        Optionally also saves a `.pt` dictionary mapping `{layer_name: tensor(d_model)}`
-        for direct loading into vLLM / PyTorch serving pipelines.
-        """
+    def save_preset_json(cls, bundle: ProductionPresetBundle, filepath: Union[str, Path],
+                         export_pt_vectors_path: Optional[Union[str, Path]] = None,
+                         allowed_workspace_dir: Optional[Union[str, Path]] = None) -> Dict[str, str]:
         path = cls.validate_safe_export_path(filepath, allowed_workspace_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(bundle), indent=2), encoding="utf-8")
-
-        result = {"json_preset_path": str(path)}
-
+        res = {"json_preset_path": str(path)}
         if export_pt_vectors_path is not None and bundle.compiled_vectors:
-            pt_path = cls.validate_safe_export_path(export_pt_vectors_path, allowed_workspace_dir)
-            pt_path.parent.mkdir(parents=True, exist_ok=True)
-            tensor_dict = {
-                cv.layer_name: torch.tensor(cv.vector_values, dtype=torch.float32)
-                for cv in bundle.compiled_vectors
-            }
-            torch.save(tensor_dict, pt_path)
-            result["pt_vectors_path"] = str(pt_path)
-
-        return result
+            pt = cls.validate_safe_export_path(export_pt_vectors_path, allowed_workspace_dir)
+            pt.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({cv.layer_name: torch.tensor(cv.vector_values, dtype=torch.float32) for cv in bundle.compiled_vectors}, pt)
+            res["pt_vectors_path"] = str(pt)
+        return res
 
     @staticmethod
-    def parse_preset_dict(
-        data: Dict[str, Any],
-    ) -> Tuple[ProductionPresetBundle, List[InterventionSpec]]:
-        """Parses a raw dictionary (from JSON or API payload) back into a bundle and InterventionSpecs."""
+    def parse_preset_dict(data: Dict[str, Any]) -> Tuple[ProductionPresetBundle, List[InterventionSpec]]:
         specs: List[InterventionSpec] = []
         for item in data.get("interventions", []):
-            gc_raw = item.get("gate_condition")
-            gate_cond = (
-                GateConditionSpec(
-                    detector_layer=gc_raw["detector_layer"],
-                    detector_neuron=int(gc_raw["detector_neuron"]),
-                    detector_pole=PoleType(gc_raw.get("detector_pole", "positive")),
-                    threshold=float(gc_raw.get("threshold", 0.5)),
-                    action_mode=InterventionMode(gc_raw.get("action_mode", "additive_steer")),
-                    sequence_scope=gc_raw.get("sequence_scope", "token_wise"),
-                    sticky_on_decode=bool(gc_raw.get("sticky_on_decode", True)),
-                )
-                if isinstance(gc_raw, dict)
-                else None
-            )
-            specs.append(
-                InterventionSpec(
-                    layer_name=item["layer_name"],
-                    neuron_indices=[int(i) for i in item["neuron_indices"]],
-                    mode=InterventionMode(item.get("mode", "zero_ablate")),
-                    pole=PoleType(item.get("pole", "both")),
-                    value=float(item.get("value", 0.0)),
-                    per_neuron_values=item.get("per_neuron_values"),
-                    token_positions=item.get("token_positions"),
-                    gate_condition=gate_cond,
-                )
-            )
-
-        compiled = [
-            CompiledSteeringVector(
-                layer_name=cv["layer_name"],
-                d_model=int(cv["d_model"]),
-                source_neurons=cv["source_neurons"],
-                source_deltas=cv["source_deltas"],
-                vector_norm=float(cv["vector_norm"]),
-                vector_values=cv["vector_values"],
-                clamped_neurons=[int(i) for i in cv.get("clamped_neurons", [])],
-            )
-            for cv in data.get("compiled_vectors", [])
-        ]
-
-        bundle = ProductionPresetBundle(
-            preset_name=data.get("preset_name", "imported_preset"),
-            model_name=data.get("model_name", "unknown"),
-            created_at_utc=data.get("created_at_utc", ""),
-            description=data.get("description", ""),
-            interventions=data.get("interventions", []),
-            compiled_vectors=compiled,
-        )
+            g = item.get("gate_condition")
+            gate = GateConditionSpec(
+                detector_layer=g["detector_layer"], detector_neuron=int(g["detector_neuron"]),
+                threshold=float(g["threshold"]), detector_pole=PoleType(g.get("detector_pole", "positive")),
+                action_mode=InterventionMode(g.get("action_mode", "additive_steer")),
+                sequence_scope=g.get("sequence_scope", "token_wise"), sticky_on_decode=bool(g.get("sticky_on_decode", True)),
+            ) if isinstance(g, dict) else None
+            specs.append(InterventionSpec(
+                layer_name=item["layer_name"], neuron_indices=[int(i) for i in item["neuron_indices"]],
+                mode=InterventionMode(item.get("mode", "zero_ablate")), pole=PoleType(item.get("pole", "both")),
+                value=float(item.get("value", 0.0)), per_neuron_values=item.get("per_neuron_values"),
+                token_positions=item.get("token_positions"), gate_condition=gate,
+                condition_signal=item.get("condition_signal", "activation"),
+            ))
+        compiled = [CompiledSteeringVector(
+            layer_name=cv["layer_name"], d_model=int(cv["d_model"]), source_neurons=list(cv["source_neurons"]),
+            source_deltas=list(cv["source_deltas"]), vector_norm=float(cv["vector_norm"]), vector_values=list(cv["vector_values"]),
+        ) for cv in data.get("compiled_vectors", [])]
+        bundle = ProductionPresetBundle(preset_name=data.get("preset_name", "imported_preset"),
+                                        model_name=data.get("model_name", "unknown"),
+                                        created_at_utc=data.get("created_at_utc", ""), description=data.get("description", ""),
+                                        interventions=data.get("interventions", []), compiled_vectors=compiled)
         return bundle, specs
 
     @classmethod
     @torch.no_grad()
-    def fold_interventions_into_weights(
-        cls,
-        model: nn.Module,
-        interventions_by_layer: Dict[str, List[InterventionSpec]],
-    ) -> Dict[str, Any]:
+    def fold_interventions_into_weights(cls, model: nn.Module, interventions_by_layer: Dict[str, List[InterventionSpec]]) -> Dict[str, Any]:
         """
-        Folds unconditional (`PoleType.BOTH`, all token positions) surgical interventions
-        directly into module weights and biases for ZERO runtime hook overhead.
-
-        Supports BOTH:
-          - `hook_target == "input"` (e.g. `down_proj` where neuron `i` is an input column):
-              1. Adds `sum_i shift_i * W_down_original[:, i]` to `module.bias`
-              2. Multiplies `W_down[:, i] *= scale_i`
-          - `hook_target == "output"` (e.g. `fc_in`, `Conv2d`, or fallback `Linear` where neuron `i`
-            is an output row/channel `y[i] = W[i, :] @ x + b[i]`):
-              1. Multiplies `W[i, :] *= scale_i`
-              2. Updates `b[i] = b[i] * scale_i + shift_i`
-
-        Never silently drops unfoldable specs (`CONDITIONAL_GATE`, `pole != BOTH`, `WEAK_PRUNE`,
-        `POLE_RECTIFY`, or `token_positions != None`): returns `"folded_spec_ids"` so callers
-        retain all unfoldable specs in active hooks.
-        Raises `ValueError` if called on quantized/offloaded or 3D parameter-container MoE layers.
+        Folds unconditional affine interventions into weights:
+          input-hooked layers (neuron i = column i of W):  b += sum_i t_i W[:, i];  W[:, i] *= s_i
+          output-hooked layers (unit i = row i):            W[i, :] *= s_i;  b[i] = s_i b[i] + t_i
+        A neuron also touched by any unfoldable spec is not folded, so execution order is preserved.
         """
-        folded_summary: List[Dict[str, Any]] = []
-        folded_spec_ids: Set[int] = set()
-        retained_unfoldable_count = 0
-
+        summary: List[Dict[str, Any]] = []
+        folded: Set[int] = set()
+        retained = 0
         for layer_name, specs in interventions_by_layer.items():
-            enabled_specs = [s for s in specs if s.enabled]
-            if not enabled_specs:
+            active = [s for s in specs if s.enabled]
+            if not active:
                 continue
-
-            module, hook_target, num_neurons = LayerDiscovery.resolve_module(model, layer_name)
+            module, target, n = LayerDiscovery.resolve_module(model, layer_name)
+            if target == "moe_expert" or (hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and module.weight.ndim == 3):
+                retained += len(active)
+                continue
             if LayerDiscovery.is_quantized_or_offloaded(module):
-                raise ValueError(
-                    f"Cannot fold interventions into quantized or offloaded layer '{layer_name}'. "
-                    "Use active_injection() or ProductionSteeringRuntime instead."
-                )
-            if hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and module.weight.ndim == 3:
-                raise ValueError(
-                    f"Cannot fold interventions into 3D MoE parameter container '{layer_name}'. "
-                    "Use active_injection() or ProductionSteeringRuntime instead."
-                )
-
-            is_conv1d = module.__class__.__name__ == "Conv1D" and hasattr(module, "nf")
-            is_conv2d = isinstance(module, nn.Conv2d)
-            if not isinstance(module, nn.Linear) and not is_conv1d and not is_conv2d:
-                retained_unfoldable_count += len(enabled_specs)
+                raise ValueError(f"Cannot fold into quantized/offloaded layer '{layer_name}'.")
+            is_c1 = module.__class__.__name__ == "Conv1D" and hasattr(module, "nf")
+            is_c2 = isinstance(module, nn.Conv2d)
+            if not (isinstance(module, nn.Linear) or is_c1 or is_c2):
+                retained += len(active)
                 continue
-
-            # Identify neurons touched by any unfoldable spec so we do not partially fold
-            # a neuron that also has a conditional or pole-specific hook on the same layer.
-            unfoldable_neurons: Set[int] = set()
-            for s in enabled_specs:
+            blocked: Set[int] = set()
+            for s in active:
                 if not cls.is_spec_weight_foldable(s):
-                    retained_unfoldable_count += 1
-                    unfoldable_neurons.update(int(i) for i in s.neuron_indices)
-
-            foldable_specs = [
-                s
-                for s in enabled_specs
-                if cls.is_spec_weight_foldable(s)
-                and not any(int(i) in unfoldable_neurons for i in s.neuron_indices)
-            ]
-            for s in enabled_specs:
-                if cls.is_spec_weight_foldable(s) and s not in foldable_specs:
-                    retained_unfoldable_count += 1
-
-            if not foldable_specs:
+                    blocked.update(int(i) for i in s.neuron_indices)
+            foldable = [s for s in active if cls.is_spec_weight_foldable(s) and not blocked.intersection(int(i) for i in s.neuron_indices)]
+            retained += len(active) - len(foldable)
+            if not foldable:
                 continue
-
-            composed = cls._resolve_composed_neuron_affine_ops(foldable_specs, num_neurons)
-            if not composed:
-                continue
-
-            device = module.weight.device
-            dtype = module.weight.dtype
-
-            if hook_target == "input":
-                out_features = (
-                    module.nf
-                    if is_conv1d
-                    else (module.out_channels if is_conv2d else module.out_features)
-                )
-                v_shift_total = torch.zeros(out_features, dtype=dtype, device=device)
-                has_bias_shift = False
-
-                for n_idx, (scale_i, shift_i) in composed.items():
-                    if abs(shift_i) > 0.0:
-                        has_bias_shift = True
-                        if is_conv1d:
-                            v_shift_total.add_(module.weight[n_idx, :] * float(shift_i))
-                        elif is_conv2d:
-                            v_shift_total.add_(
-                                module.weight[:, n_idx, :, :].sum(dim=(1, 2)) * float(shift_i)
-                            )
-                        else:
-                            v_shift_total.add_(module.weight[:, n_idx] * float(shift_i))
-
-                    if is_conv1d:
-                        module.weight[n_idx, :] *= float(scale_i)
-                    elif is_conv2d:
-                        module.weight[:, n_idx, :, :] *= float(scale_i)
+            composed = cls._compose_affine(foldable, n)
+            W = module.weight
+            if target == "input":
+                out_f = module.nf if is_c1 else (module.out_channels if is_c2 else module.out_features)
+                shift = torch.zeros(out_f, dtype=torch.float64, device=W.device)
+                for i, (sc, sh) in composed.items():
+                    if sh != 0.0:
+                        col = W[i, :] if is_c1 else (W[:, i].sum(dim=(1, 2)) if is_c2 else W[:, i])
+                        shift += float(sh) * col.double()
+                    if is_c1:
+                        W[i, :] *= sc
+                    elif is_c2:
+                        W[:, i] *= sc
                     else:
-                        module.weight[:, n_idx] *= float(scale_i)
-
-                if has_bias_shift:
+                        W[:, i] *= sc
+                if bool((shift != 0).any()):
                     if module.bias is None:
-                        module.bias = nn.Parameter(
-                            torch.zeros(out_features, dtype=dtype, device=device)
-                        )
-                    module.bias.add_(v_shift_total)
+                        module.bias = nn.Parameter(torch.zeros(out_f, dtype=W.dtype, device=W.device))
+                    module.bias.add_(shift.to(W.dtype))
             else:
-                # hook_target == "output": y'[n_idx] = scale_i * (W[n_idx] @ x + b[n_idx]) + shift_i
-                out_features = num_neurons
-                need_bias = any(abs(shift_i) > 0.0 for _, shift_i in composed.values())
-                if need_bias and module.bias is None:
-                    module.bias = nn.Parameter(
-                        torch.zeros(out_features, dtype=dtype, device=device)
-                    )
-
-                for n_idx, (scale_i, shift_i) in composed.items():
-                    if is_conv1d:
-                        module.weight[:, n_idx] *= float(scale_i)
-                    elif is_conv2d:
-                        module.weight[n_idx, :, :, :] *= float(scale_i)
+                if any(sh != 0.0 for _s, sh in composed.values()) and module.bias is None:
+                    module.bias = nn.Parameter(torch.zeros(n, dtype=W.dtype, device=W.device))
+                for i, (sc, sh) in composed.items():
+                    if is_c1:
+                        W[:, i] *= sc
                     else:
-                        module.weight[n_idx, :] *= float(scale_i)
-
+                        W[i] *= sc
                     if module.bias is not None:
-                        module.bias[n_idx] = (
-                            module.bias[n_idx] * float(scale_i) + float(shift_i)
-                        )
-
-            axis_word = "columns" if hook_target == "input" else "rows"
-            for s in foldable_specs:
-                folded_spec_ids.add(id(s))
-                if s.mode == InterventionMode.ZERO_ABLATE:
-                    op_label = f"zero_weight_{axis_word}"
-                elif s.mode == InterventionMode.SCALE:
-                    op_label = f"scale_weight_{axis_word}({s.value})"
-                else:
-                    op_label = f"folded_{s.mode.value}_into_{axis_word}_and_bias"
-                folded_summary.append({
-                    "layer": layer_name,
-                    "neurons": list(s.neuron_indices),
-                    "hook_target": hook_target,
-                    "folded_op": op_label,
-                })
-
-        return {
-            "status": "folded_into_weights",
-            "operations_applied": len(folded_summary),
-            "unfolded_specs_retained": retained_unfoldable_count,
-            "folded_spec_ids": list(folded_spec_ids),
-            "details": folded_summary,
-        }
+                        module.bias[i] = module.bias[i] * sc + sh
+            for s in foldable:
+                folded.add(id(s))
+                summary.append({"layer": layer_name, "neurons": list(s.neuron_indices), "mode": s.mode.value, "hook_target": target})
+        return {"status": "folded_into_weights", "operations_applied": len(summary), "unfolded_specs_retained": retained,
+                "folded_spec_ids": list(folded), "details": summary}
 
 
 class ProductionSteeringRuntime:
     """
-    Lightweight, standalone production inference applier.
-    Can load a saved JSON preset and apply either:
-      - Mode A (`use_compiled_residual_vectors=True`): Fast residual-stream vector addition `output + v_steer`
-        for layers with compiled vectors (plus dynamic pre-zeroing for any `clamped_neurons`),
-        and exact neuron hooks for any remaining layers.
-      - Mode B (`use_compiled_residual_vectors=False`): Exact pole-conditional and
-        cross-layer `CONDITIONAL_GATE` neuron hooks with KV-cache latching (`sticky_on_decode`).
+    Standalone applier for a saved preset, without NeuralInjector:
+      * compiled mode: layers with compiled vectors get one output hook adding v; all other layers use
+        exact neuron hooks;
+      * hook mode: exact neuron hooks for every spec (conditional gates with KV-cache latching,
+        gate-conditioned modes, pole-specific operations).
     """
 
     def __init__(self, model: nn.Module, preset_json_or_dict: Union[str, Path, Dict[str, Any]]):
         self.model = model
-        if isinstance(preset_json_or_dict, (str, Path)):
-            raw = json.loads(Path(preset_json_or_dict).read_text(encoding="utf-8"))
-        else:
-            raw = preset_json_or_dict
-
+        raw = json.loads(Path(preset_json_or_dict).read_text(encoding="utf-8")) if isinstance(preset_json_or_dict, (str, Path)) else preset_json_or_dict
         self.bundle, self.specs = SteeringExporter.parse_preset_dict(raw)
+        self._hookset = None
         self._handles: List[RemovableHandle] = []
         self._latched_masks: Dict[int, torch.Tensor] = {}
 
     def reset_latched_gates(self) -> None:
-        """Clears any latched KV-cache masks accumulated by `sticky_on_decode` conditional gates."""
         self._latched_masks.clear()
 
-    def _validate_against_model(self, use_compiled_residual_vectors: bool = False) -> None:
-        """
-        Validates that all layer names, neuron indices, and compiled vector dimensions
-        in the loaded preset match `self.model` before attaching hooks.
-        """
+    def _validate(self, compiled: bool) -> None:
         for s in self.specs:
-            _, _, num_neurons = LayerDiscovery.resolve_module(self.model, s.layer_name)
-            for idx in s.neuron_indices:
-                if idx < 0 or idx >= num_neurons:
-                    raise ValueError(
-                        f"Neuron index {idx} in preset spec for layer '{s.layer_name}' "
-                        f"is out of range for model layer with {num_neurons} neurons."
-                    )
+            _, _, n = LayerDiscovery.resolve_module(self.model, s.layer_name)
+            bad = [i for i in s.neuron_indices if not 0 <= i < n]
+            if bad:
+                raise ValueError(f"Neuron indices {bad} out of range for '{s.layer_name}' ({n} neurons).")
             if s.gate_condition is not None:
-                _, _, det_num = LayerDiscovery.resolve_module(
-                    self.model, s.gate_condition.detector_layer
-                )
-                d_idx = s.gate_condition.detector_neuron
-                if d_idx < 0 or d_idx >= det_num:
-                    raise ValueError(
-                        f"Detector neuron index {d_idx} for layer "
-                        f"'{s.gate_condition.detector_layer}' is out of range ({det_num})."
-                    )
-
-        if use_compiled_residual_vectors and self.bundle.compiled_vectors:
+                _, _, dn = LayerDiscovery.resolve_module(self.model, s.gate_condition.detector_layer)
+                if not 0 <= s.gate_condition.detector_neuron < dn:
+                    raise ValueError(f"Detector neuron out of range for '{s.gate_condition.detector_layer}'.")
+        if compiled:
             for cv in self.bundle.compiled_vectors:
-                module, hook_target, num_neurons = LayerDiscovery.resolve_module(
-                    self.model, cv.layer_name
-                )
-                for c_idx in cv.clamped_neurons or []:
-                    if c_idx < 0 or c_idx >= num_neurons:
-                        raise ValueError(
-                            f"Clamped neuron index {c_idx} in compiled vector for layer "
-                            f"'{cv.layer_name}' is out of range for {num_neurons} neurons."
-                        )
-                expected_dim: Optional[int] = None
-                if isinstance(module, nn.Linear):
-                    expected_dim = module.out_features
-                elif hasattr(module, "weight") and isinstance(module.weight, torch.Tensor):
-                    if module.__class__.__name__ == "Conv1D":
-                        expected_dim = int(module.weight.shape[1])
-                    elif module.weight.ndim == 2:
-                        expected_dim = int(module.weight.shape[0])
-                if expected_dim is not None and len(cv.vector_values) != expected_dim:
-                    raise ValueError(
-                        f"Compiled steering vector dimension mismatch for layer '{cv.layer_name}': "
-                        f"preset vector has length {len(cv.vector_values)}, but model module has "
-                        f"output dimension {expected_dim}."
-                    )
+                W = LayerDiscovery.neuron_write_vectors(self.model, cv.layer_name)
+                if W is None or W.shape[1] != len(cv.vector_values):
+                    raise ValueError(f"Compiled vector for '{cv.layer_name}' does not match the model.")
 
     def attach(self, use_compiled_residual_vectors: bool = False) -> None:
         self.detach()
-        self._validate_against_model(
-            use_compiled_residual_vectors=use_compiled_residual_vectors
-        )
-        device = next(self.model.parameters()).device
-        dtype = next(self.model.parameters()).dtype
-        conditional_masks: Dict[int, torch.Tensor] = {}
-        latched_masks = self._latched_masks
-
-        # Clear conditional_masks at the start of every forward pass on the root model
-        self._handles.append(
-            self.model.register_forward_pre_hook(lambda _m, _inp: conditional_masks.clear())
-        )
-
-        compiled_layers = set()
-        if use_compiled_residual_vectors and self.bundle.compiled_vectors:
+        self._validate(use_compiled_residual_vectors)
+        compiled_layers: Set[str] = set()
+        if use_compiled_residual_vectors:
             for cv in self.bundle.compiled_vectors:
-                module, hook_target, _ = LayerDiscovery.resolve_module(self.model, cv.layer_name)
-                steer_tensor = torch.tensor(cv.vector_values, dtype=dtype, device=device)
+                module, _, _ = LayerDiscovery.resolve_module(self.model, cv.layer_name)
+                vec = torch.tensor(cv.vector_values, dtype=torch.float64)
                 compiled_layers.add(cv.layer_name)
-                clamp_idx = list(cv.clamped_neurons) if cv.clamped_neurons else []
 
-                # If any neurons in this compiled vector were HARD_CLAMPed, zero their dynamic
-                # activations before `down_proj` (when hook_target == "input") so adding `v_steer`
-                # gives exact clamp output.
-                if clamp_idx and hook_target == "input":
+                def _add(_m, _i, out, v=vec):
+                    t = out[0] if isinstance(out, tuple) else out
+                    t2 = t + v.to(device=t.device, dtype=t.dtype)
+                    return (t2,) + tuple(out[1:]) if isinstance(out, tuple) else t2
 
-                    def _make_clamp_zero_pre(c_indices: List[int]):
-                        def _pre_zero(_mod: nn.Module, inputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
-                            if inputs and isinstance(inputs[0], torch.Tensor):
-                                cloned = inputs[0].clone()
-                                idx_t = torch.as_tensor(
-                                    c_indices, dtype=torch.long, device=cloned.device
-                                )
-                                cloned[..., idx_t] = 0.0
-                                return (cloned,) + inputs[1:]
-                            return inputs
-
-                        return _pre_zero
-
-                    self._handles.append(
-                        module.register_forward_pre_hook(_make_clamp_zero_pre(clamp_idx))
-                    )
-
-                def _make_res_hook(
-                    vec: torch.Tensor, c_indices: List[int], h_target: str
-                ):
-                    def _fwd_hook(_mod: nn.Module, _inp: Tuple[Any, ...], out: Any) -> Any:
-                        t0 = out[0] if isinstance(out, tuple) else out
-                        if not isinstance(t0, torch.Tensor):
-                            return out
-                        modified = t0.clone() if (c_indices and h_target == "output") else t0
-                        if c_indices and h_target == "output":
-                            idx_t = torch.as_tensor(
-                                c_indices, dtype=torch.long, device=modified.device
-                            )
-                            modified[..., idx_t] = 0.0
-                        modified = modified + vec.to(device=modified.device, dtype=modified.dtype)
-                        return (modified,) + out[1:] if isinstance(out, tuple) else modified
-
-                    return _fwd_hook
-
-                self._handles.append(
-                    module.register_forward_hook(
-                        _make_res_hook(steer_tensor, clamp_idx, hook_target)
-                    )
-                )
-
-        # Standard surgical neuron-basis hooks grouped by layer (for any layer not already handled by a compiled vector)
+                self._handles.append(module.register_forward_hook(_add))
         by_layer: Dict[str, List[InterventionSpec]] = {}
         for s in self.specs:
-            if use_compiled_residual_vectors and s.layer_name in compiled_layers:
-                continue
-            by_layer.setdefault(s.layer_name, []).append(s)
-
-        # Register cross-layer detector hooks first so conditional_masks are populated
-        for layer_name, layer_specs in by_layer.items():
-            for spec in layer_specs:
-                if not spec.enabled or spec.gate_condition is None:
-                    continue
-                det_layer = spec.gate_condition.detector_layer
-                if det_layer == layer_name:
-                    continue
-                det_mod, det_target, _ = LayerDiscovery.resolve_module(self.model, det_layer)
-                is_det_conv = isinstance(det_mod, nn.Conv2d)
-
-                def _make_det_pre(s_obj: InterventionSpec, conv_f: bool):
-                    def _det_pre(_mod: nn.Module, inputs: Tuple[Any, ...]) -> None:
-                        if inputs and isinstance(inputs[0], torch.Tensor) and s_obj.gate_condition:
-                            conditional_masks[id(s_obj)] = (
-                                InterventionKernel.compute_detector_mask(
-                                    inputs[0].detach(),
-                                    s_obj.gate_condition,
-                                    is_conv2d=conv_f,
-                                    latched_masks=latched_masks,
-                                    spec_id=id(s_obj),
-                                )
-                            )
-
-                    return _det_pre
-
-                def _make_det_fwd(s_obj: InterventionSpec, conv_f: bool):
-                    def _det_fwd(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
-                        act = output[0] if isinstance(output, tuple) else output
-                        if isinstance(act, torch.Tensor) and s_obj.gate_condition:
-                            conditional_masks[id(s_obj)] = (
-                                InterventionKernel.compute_detector_mask(
-                                    act.detach(),
-                                    s_obj.gate_condition,
-                                    is_conv2d=conv_f,
-                                    latched_masks=latched_masks,
-                                    spec_id=id(s_obj),
-                                )
-                            )
-
-                    return _det_fwd
-
-                if det_target == "input":
-                    self._handles.append(
-                        det_mod.register_forward_pre_hook(_make_det_pre(spec, is_det_conv))
-                    )
-                else:
-                    self._handles.append(
-                        det_mod.register_forward_hook(_make_det_fwd(spec, is_det_conv))
-                    )
-
-        for layer_name, layer_specs in by_layer.items():
-            module, hook_target, _ = LayerDiscovery.resolve_module(self.model, layer_name)
-            is_conv2d = isinstance(module, nn.Conv2d)
-            if hook_target == "input":
-
-                def _make_pre(ls: List[InterventionSpec], cf: bool):
-                    def _pre(_mod: nn.Module, inputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
-                        if inputs and isinstance(inputs[0], torch.Tensor):
-                            return (
-                                InterventionKernel.apply(
-                                    inputs[0],
-                                    ls,
-                                    is_conv2d=cf,
-                                    conditional_masks=conditional_masks,
-                                    latched_masks=latched_masks,
-                                ),
-                            ) + inputs[1:]
-                        return inputs
-
-                    return _pre
-
-                self._handles.append(
-                    module.register_forward_pre_hook(_make_pre(layer_specs, is_conv2d))
-                )
-            else:
-
-                def _make_fwd(ls: List[InterventionSpec], cf: bool):
-                    def _fwd(_mod: nn.Module, _inputs: Tuple[Any, ...], out: Any) -> Any:
-                        if isinstance(out, torch.Tensor):
-                            return InterventionKernel.apply(
-                                out,
-                                ls,
-                                is_conv2d=cf,
-                                conditional_masks=conditional_masks,
-                                latched_masks=latched_masks,
-                            )
-                        elif isinstance(out, tuple) and isinstance(out[0], torch.Tensor):
-                            return (
-                                InterventionKernel.apply(
-                                    out[0],
-                                    ls,
-                                    is_conv2d=cf,
-                                    conditional_masks=conditional_masks,
-                                    latched_masks=latched_masks,
-                                ),
-                            ) + out[1:]
-                        return out
-
-                    return _fwd
-
-                self._handles.append(
-                    module.register_forward_hook(_make_fwd(layer_specs, is_conv2d))
-                )
+            if s.layer_name not in compiled_layers:
+                by_layer.setdefault(s.layer_name, []).append(s)
+        if by_layer:
+            hs, cond = build_intervention_hookset(self.model, by_layer, self._latched_masks)
+            self._handles.append(self.model.register_forward_pre_hook(lambda _m, _i: cond.clear()))
+            hs.attach()
+            self._hookset = hs
 
     def detach(self) -> None:
+        if self._hookset is not None:
+            self._hookset.detach()
+            self._hookset = None
         for h in self._handles:
             h.remove()
         self._handles.clear()
@@ -788,11 +325,9 @@ class ProductionSteeringRuntime:
     @contextmanager
     def active(self, use_compiled_residual_vectors: bool = False):
         self.reset_latched_gates()
-        self.attach(use_compiled_residual_vectors=use_compiled_residual_vectors)
+        self.attach(use_compiled_residual_vectors)
         try:
             yield self
-        except Exception:
-            raise
         finally:
             self.detach()
             self.reset_latched_gates()

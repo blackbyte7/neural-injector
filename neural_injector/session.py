@@ -144,7 +144,6 @@ class WorkbenchSession:
         session.run_audit(
             layer_names=list(session.injector.list_targetable_layers().keys()),
             prompts=default_prompts,
-            tracked_neurons=list(range(128)),
         )
         return session
 
@@ -171,7 +170,7 @@ class WorkbenchSession:
         tokenizer = AutoTokenizer.from_pretrained(
             model_id, trust_remote_code=trust_remote_code
         )
-        load_kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
+        load_kwargs: Dict[str, Any] = {"dtype": torch_dtype}
         if low_cpu_mem_usage:
             load_kwargs["low_cpu_mem_usage"] = True
         if device_map is not None:
@@ -287,6 +286,22 @@ class WorkbenchSession:
             attn_mask = torch.ones_like(input_ids, dtype=torch.bool)
         return input_ids, tokens, attn_mask
 
+    def encode_text(self, text: str) -> Tuple[torch.Tensor, List[str]]:
+        """Encoder used for every text measured by the explanation tests (same as the audit encoding)."""
+        ids, toks, _ = self.encode_prompt_with_mask(text)
+        return ids, toks
+
+    def decode_ids(self, token_ids: List[int]) -> str:
+        return self._decode_token_ids(token_ids)[1]
+
+    def explain_neuron(self, layer_name: str, neuron_idx: int, **kwargs: Any):
+        """Runs the two-agent explanation protocol with this session's encoder, decoder and vocabulary."""
+        kwargs.setdefault("encode_fn", self.encode_text)
+        kwargs.setdefault("decode_fn", self.decode_ids)
+        kwargs.setdefault("unembed_weight", self.unembed_weight)
+        kwargs.setdefault("idx_to_token", self.id_to_tok)
+        return self.injector.explain_neuron(layer_name, neuron_idx, **kwargs)
+
     def encode_prompt(self, text: str) -> Tuple[torch.Tensor, List[str]]:
         """Tokenizes a text string into an input_ids tensor [1, seq_len] and list of token strings."""
         input_ids, tokens, _ = self.encode_prompt_with_mask(text)
@@ -316,7 +331,7 @@ class WorkbenchSession:
         max_new_tokens: int = 12,
         temperature: float = 0.0,
         use_kv_cache: bool = True,
-        repetition_penalty: float = 1.15,
+        repetition_penalty: float = 1.0,
     ) -> Tuple[List[int], List[str], str]:
         """
         Runs multi-token autoregressive decoding for `max_new_tokens` steps.
@@ -344,7 +359,7 @@ class WorkbenchSession:
 
             next_logits = logits[0, -1, :].clone()
 
-            # Apply mild repetition penalty on already-generated tokens so completions don't loop on 1 token
+            # Optional repetition penalty (1.0 = plain greedy / sampling, the default)
             if repetition_penalty != 1.0 and generated_ids:
                 for prev_id in set(generated_ids):
                     if next_logits[prev_id] > 0:
@@ -374,7 +389,7 @@ class WorkbenchSession:
         max_new_tokens: int = 8,
         temperature: float = 0.0,
         use_kv_cache: bool = True,
-        repetition_penalty: float = 1.15,
+        repetition_penalty: float = 1.0,
     ) -> Dict[str, Any]:
         """
         Runs a side-by-side multi-token autoregressive generation (Chain-of-Thought /
@@ -436,14 +451,13 @@ class WorkbenchSession:
         self,
         layer_names: List[str],
         prompts: List[str],
-        top_k: int = 8,
-        tracked_neurons: Optional[List[int]] = None,
+        top_k: int = 16,
         batch_size: int = 1,
+        **tracker_kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Streams a list of text prompts through the model to populate bipolar neuron stats.
-        Supports batched execution (`batch_size > 1`) with right-padding and boolean
-        `attention_mask` propagation so padded positions never contaminate neuron statistics.
+        Streams text prompts through the model and records exact streaming statistics for each layer.
+        Batched execution right-pads and passes the attention mask, so padded positions are excluded.
         """
         self.last_audit_prompts = list(prompts)
         encoded_items = []
@@ -519,7 +533,7 @@ class WorkbenchSession:
             dataloader_or_batches=batches,
             forward_fn=_forward_batch,
             top_k=top_k,
-            tracked_neurons=tracked_neurons,
+            **tracker_kwargs,
         )
         return {
             "status": "audited",

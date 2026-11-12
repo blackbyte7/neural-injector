@@ -4,1537 +4,756 @@ import inspect
 import json
 import math
 import os
+import random
 import time
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Type
 
 from pydantic import BaseModel, Field, ValidationError
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .discovery import LayerDiscovery
+from .analyzer import is_punctuation_token
+from .hooks import HookSet, default_forward, extract_logits, flat_neuron_view
 from .types import (
+    ActivationBand,
+    ActivationSample,
     BipolarVerbHypothesis,
+    BlindTestSuite,
+    BundleBlindMaximumResult,
+    CausalCheckReport,
     CircuitEdge,
     CircuitGraph,
     EcologyNeighborContext,
+    ExplanationAuditSummary,
+    FalsificationOutcome,
     InterventionMode,
     InterventionSpec,
+    LayerEcologySolveReport,
     NeuronPoleProfile,
     NeuronTaxonomy,
     PoleType,
-    VerificationExperimentSpec,
-    VerificationReport,
+    PoleVerificationReport,
+    TextActivation,
 )
 
 if TYPE_CHECKING:
     from .injector import NeuralInjector
 
+# 'Responses are a share of the neuron's strongest example in the corpus; a strong response is 30% or more.'
+PAPER_STRONG_FRACTION = 0.30
+
 
 # =============================================================================
-# 1. Pydantic Structured Output Schemas for LLM Response Validation
+# Structured outputs
 # =============================================================================
-class ProposedExperimentSchema(BaseModel):
-    positive_pole_test_tokens: List[str] = Field(default_factory=list)
-    negative_pole_test_tokens: List[str] = Field(default_factory=list)
-    expected_promoted_tokens: List[str] = Field(default_factory=list)
-    expected_suppressed_tokens: List[str] = Field(default_factory=list)
-    expected_excited_dst_neurons: List[int] = Field(default_factory=list)
-    expected_inhibited_dst_neurons: List[int] = Field(default_factory=list)
-    blind_maximum_prompt: Optional[str] = Field(default=None)
-    near_miss_test_tokens: List[str] = Field(default_factory=list)
-    distant_control_tokens: List[str] = Field(default_factory=list)
-
-
-class AgentHypothesisResponseSchema(BaseModel):
-    positive_pole_motif: str = Field(..., min_length=1)
-    negative_pole_motif: str = Field(..., min_length=1)
-    unified_verb_hypothesis: str = Field(..., min_length=1)
+class ExplanationResponse(BaseModel):
+    positive_pole_explanation: str = Field(..., description="What drives the positive pole, or '' if unknown")
+    negative_pole_explanation: str = Field(..., description="What drives the negative pole, or '' if unknown")
+    unified_explanation: str = Field(..., description="The distinction the neuron draws between its poles")
     recursive_offshoots: List[str] = Field(default_factory=list)
-    taxonomy_class: NeuronTaxonomy = Field(default=NeuronTaxonomy.UNVERIFIED)
-    confidence_score: float = Field(default=0.5, ge=0.0, le=1.0)
-    proposed_experiment: ProposedExperimentSchema = Field(
-        default_factory=ProposedExperimentSchema
-    )
+    positive_pole_taxonomy: NeuronTaxonomy
+    negative_pole_taxonomy: NeuronTaxonomy
+    confidence: float = Field(..., ge=0.0, le=1.0)
 
 
+class TestSuiteResponse(BaseModel):
+    blind_maximum: str = Field(..., min_length=1)
+    positive_examples: List[str] = Field(..., min_length=5, max_length=5)
+    near_misses: List[str] = Field(..., min_length=5, max_length=5)
+    distant_concept: str = Field(..., min_length=1)
+    distant_examples: List[str] = Field(..., min_length=5, max_length=5)
+
+
+class BundleExplanationResponse(BaseModel):
+    explanation: str = Field(..., min_length=1)
+
+
+class BlindMaximumResponse(BaseModel):
+    blind_maximum: str = Field(..., min_length=1)
+
+
+class RelatednessResponse(BaseModel):
+    related: bool
+    reason: str = ""
+
+
+# =============================================================================
+# LLM clients
+# =============================================================================
 class LLMClientProtocol(Protocol):
-    """Protocol for any LLM backend used by NeuronExplainerAgent."""
-
     def complete_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         ...
 
 
 class OpenAICompatibleClient:
     """
-    OpenAI-compatible JSON completion client using stdlib `urllib.request` with
-    exponential backoff retry logic and strict Pydantic schema validation.
-    Works with OpenAI, Ollama (http://localhost:11434/v1), vLLM, OpenRouter, and proxies.
+    JSON chat-completion client for any OpenAI-compatible endpoint (OpenAI, Ollama at
+    http://localhost:11434/v1, vLLM, OpenRouter, LM Studio, ...). Retries transport and JSON errors
+    with exponential backoff; schema validation is done by the caller.
     """
 
-    def __init__(
-        self,
-        model: str = "gpt-4o",
-        api_key: Optional[str] = None,
-        base_url: str = "https://api.openai.com/v1",
-        temperature: float = 0.1,
-        max_retries: int = 3,
-        backoff_base: float = 0.5,
-        timeout: float = 60.0,
-        validate_schema: bool = True,
-    ):
+    def __init__(self, model: str, api_key: Optional[str] = None, base_url: str = "https://api.openai.com/v1",
+                 temperature: float = 0.0, max_retries: int = 3, backoff_base: float = 1.0, timeout: float = 120.0,
+                 json_mode: bool = True):
         self.model = model
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
         self.max_retries = max(1, max_retries)
         self.backoff_base = backoff_base
         self.timeout = timeout
-        self.validate_schema = validate_schema
+        self.json_mode = json_mode
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/chat/completions"
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.model,
             "temperature": self.temperature,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
         }
+        if self.json_mode:
+            payload["response_format"] = {"type": "json_object"}
         data = json.dumps(payload).encode("utf-8")
-        last_exc: Optional[Exception] = None
-
+        last: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
-                req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.api_key}",
-                    },
-                    method="POST",
-                )
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                req = urllib.request.Request(f"{self.base_url}/chat/completions", data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                 content = body["choices"][0]["message"]["content"]
-                parsed = json.loads(content)
-                if self.validate_schema:
-                    validated = AgentHypothesisResponseSchema.model_validate(parsed)
-                    return validated.model_dump(mode="json")
-                return parsed
-            except (
-                urllib.error.HTTPError,
-                urllib.error.URLError,
-                TimeoutError,
-                KeyError,
-                json.JSONDecodeError,
-                ValidationError,
-            ) as exc:
-                last_exc = exc
+                return _parse_json_content(content)
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
+                last = exc
                 if attempt + 1 < self.max_retries:
                     time.sleep(self.backoff_base * (2 ** attempt))
+        raise RuntimeError(f"OpenAICompatibleClient failed after {self.max_retries} attempts: {last}") from last
 
-        raise RuntimeError(
-            f"OpenAICompatibleClient failed after {self.max_retries} attempts: {last_exc}"
-        ) from last_exc
+
+def _parse_json_content(content: str) -> Dict[str, Any]:
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.strip("`")
+        content = content[content.find("{"):]
+    start, end = content.find("{"), content.rfind("}")
+    if start < 0 or end < 0:
+        raise json.JSONDecodeError("no JSON object in response", content, 0)
+    return json.loads(content[start:end + 1])
+
+
+class CallableLLMClient:
+    """Wraps any `fn(system_prompt, user_prompt) -> dict | str` (e.g. a human in the loop or another SDK)."""
+
+    def __init__(self, fn: Callable[[str, str], Any]):
+        self.fn = fn
+
+    def complete_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        out = self.fn(system_prompt, user_prompt)
+        return _parse_json_content(out) if isinstance(out, str) else dict(out)
 
 
 # =============================================================================
-# 2. Persistent Crossword / Circuit Ecology Store (Cammarata: 'Understanding Compounds')
+# Crossword store
 # =============================================================================
 class CircuitEcologyMap:
     """
-    Persistent Crossword Graph Store implementing Cammarata's 'Understanding Compounds'
-    loop:
-      - Stores verified `BipolarVerbHypothesis` objects indexed by `(layer_name, neuron_idx)`.
-      - Stores directed `CircuitEdge` connections traced across layers (both outgoing and incoming)
-        as well as same-layer functional sibling links (`register_same_layer_siblings`).
-      - Retrieves upstream (`L-1`), downstream (`L+1`), and same-layer sibling (`L`) neighbor
-        hypotheses so that when explaining neuron `(L, i)`, already-verified motifs of connected
-        neurons are injected into the Explainer Agent's context.
+    Stores explanations and traced circuit edges so explained neurons become clues for their real
+    circuit neighbours ('Understanding Compounds'). Neighbours are only ever neurons connected by a
+    traced edge, or same-layer neurons whose traced top edges reach the same downstream neuron.
     """
 
     def __init__(self) -> None:
         self.hypotheses: Dict[Tuple[str, int], BipolarVerbHypothesis] = {}
-        self.edges_from: Dict[Tuple[str, int], List[CircuitEdge]] = {}
-        self.edges_to: Dict[Tuple[str, int], List[CircuitEdge]] = {}
-        self.siblings: Dict[Tuple[str, int], List[Tuple[str, int, str, float]]] = {}
+        self.edges_from: Dict[Tuple[str, int], Dict[Tuple[str, int], CircuitEdge]] = {}
+        self.edges_to: Dict[Tuple[str, int], Dict[Tuple[str, int], CircuitEdge]] = {}
 
-    def register_hypothesis(self, hypothesis: BipolarVerbHypothesis) -> None:
-        """Stores or updates a neuron's BipolarVerbHypothesis in the ecology map."""
-        self.hypotheses[(hypothesis.layer_name, hypothesis.neuron_idx)] = hypothesis
+    def register_hypothesis(self, h: BipolarVerbHypothesis) -> None:
+        self.hypotheses[(h.layer_name, h.neuron_idx)] = h
 
-    def get_hypothesis(
-        self, layer_name: str, neuron_idx: int
-    ) -> Optional[BipolarVerbHypothesis]:
-        """Returns the stored BipolarVerbHypothesis for `(layer_name, neuron_idx)` if present."""
+    def get_hypothesis(self, layer_name: str, neuron_idx: int) -> Optional[BipolarVerbHypothesis]:
         return self.hypotheses.get((layer_name, neuron_idx))
 
     def register_circuit_graph(self, graph: CircuitGraph) -> None:
-        """Indexes all directed edges from a traced CircuitGraph for bidirectional lookup."""
-        for edge in graph.edges:
-            src_key = (edge.src_layer, edge.src_neuron)
-            dst_key = (edge.dst_layer, edge.dst_neuron)
+        for e in graph.edges:
+            s, d = (e.src_layer, e.src_neuron), (e.dst_layer, e.dst_neuron)
+            self.edges_from.setdefault(s, {})[d] = e
+            self.edges_to.setdefault(d, {})[s] = e
 
-            existing_out = {
-                (e.dst_layer, e.dst_neuron): e for e in self.edges_from.get(src_key, [])
-            }
-            existing_out[dst_key] = edge
-            self.edges_from[src_key] = list(existing_out.values())
+    def _ctx(self, layer: str, idx: int, direction: str, role: str, delta: float) -> Optional[EcologyNeighborContext]:
+        h = self.hypotheses.get((layer, idx))
+        if h is None:
+            return None
+        return EcologyNeighborContext(
+            layer_name=layer, neuron_idx=idx, direction=direction, role=role, mean_causal_delta=delta,
+            positive_pole_motif=h.positive_pole_motif, negative_pole_motif=h.negative_pole_motif,
+            unified_verb_hypothesis=h.unified_verb_hypothesis,
+            positive_outcome=h.outcome(PoleType.POSITIVE).value, negative_outcome=h.outcome(PoleType.NEGATIVE).value,
+        )
 
-            existing_in = {
-                (e.src_layer, e.src_neuron): e for e in self.edges_to.get(dst_key, [])
-            }
-            existing_in[src_key] = edge
-            self.edges_to[dst_key] = list(existing_in.values())
-
-    def register_same_layer_siblings(
-        self,
-        layer_name: str,
-        neuron_a: int,
-        neuron_b: int,
-        role: str = "shared_circuit_reader",
-        coupling_strength: float = 0.5,
-    ) -> None:
-        """
-        Registers a bidirectional same-layer functional sibling link between two neurons
-        in `layer_name` (e.g. sharing downstream readers or co-activating on the same motif)
-        so Crossword Pass 2 contextual neurons receive Pass 1 anchor clues.
-        """
-        if neuron_a == neuron_b:
-            return
-        for k_src, k_dst in (((layer_name, neuron_a), (layer_name, neuron_b)), ((layer_name, neuron_b), (layer_name, neuron_a))):
-            existing = {
-                (l_n, n_i): (l_n, n_i, r_s, c_s)
-                for l_n, n_i, r_s, c_s in self.siblings.get(k_src, [])
-            }
-            existing[k_dst] = (k_dst[0], k_dst[1], role, float(coupling_strength))
-            self.siblings[k_src] = list(existing.values())
-
-    def get_neighbor_contexts(
-        self, layer_name: str, neuron_idx: int, max_neighbors: int = 6
-    ) -> List[EcologyNeighborContext]:
-        """
-        Returns already-explained upstream, downstream, and same-layer sibling neighbor clues
-        connected to `(layer_name, neuron_idx)`, sorted by causal delta / coupling magnitude.
-        """
+    def get_neighbor_contexts(self, layer_name: str, neuron_idx: int, max_neighbors: int = 8) -> List[EcologyNeighborContext]:
         key = (layer_name, neuron_idx)
-        neighbors: List[EcologyNeighborContext] = []
+        out: List[EcologyNeighborContext] = []
+        for (sl, si), e in self.edges_to.get(key, {}).items():
+            c = self._ctx(sl, si, "upstream", e.role.value, e.mean_causal_delta)
+            if c:
+                out.append(c)
+        for (dl, di), e in self.edges_from.get(key, {}).items():
+            c = self._ctx(dl, di, "downstream", e.role.value, e.mean_causal_delta)
+            if c:
+                out.append(c)
+        my_readers = set(self.edges_from.get(key, {}).keys())
+        if my_readers:
+            for (ol, oi), outs in self.edges_from.items():
+                if ol != layer_name or oi == neuron_idx:
+                    continue
+                shared = my_readers & set(outs.keys())
+                if shared:
+                    r = sorted(shared)[0]
+                    c = self._ctx(ol, oi, "shares_downstream_reader", f"both feed {r[0]}[{r[1]}]",
+                                  outs[r].mean_causal_delta)
+                    if c:
+                        out.append(c)
+        out.sort(key=lambda n: abs(n.mean_causal_delta), reverse=True)
+        return out[:max_neighbors]
 
-        # 1. Upstream neighbors (L-1 -> L)
-        for edge in self.edges_to.get(key, []):
-            up_hyp = self.hypotheses.get((edge.src_layer, edge.src_neuron))
-            if up_hyp is not None:
-                neighbors.append(
-                    EcologyNeighborContext(
-                        layer_name=edge.src_layer,
-                        neuron_idx=edge.src_neuron,
-                        direction="upstream",
-                        role=edge.role.value,
-                        mean_causal_delta=round(edge.mean_causal_delta, 4),
-                        positive_pole_motif=up_hyp.positive_pole_motif,
-                        negative_pole_motif=up_hyp.negative_pole_motif,
-                        unified_verb_hypothesis=up_hyp.unified_verb_hypothesis,
-                        confidence_score=up_hyp.confidence_score,
-                    )
-                )
+    def connected_neurons(self, layer_name: str, neuron_idx: int, limit: int) -> List[Tuple[str, int, float]]:
+        key = (layer_name, neuron_idx)
+        cands = [(k[0], k[1], e.mean_causal_delta) for k, e in self.edges_from.get(key, {}).items()]
+        cands += [(k[0], k[1], e.mean_causal_delta) for k, e in self.edges_to.get(key, {}).items()]
+        cands.sort(key=lambda x: abs(x[2]), reverse=True)
+        return cands[:limit]
 
-        # 2. Downstream neighbors (L -> L+1)
-        for edge in self.edges_from.get(key, []):
-            dn_hyp = self.hypotheses.get((edge.dst_layer, edge.dst_neuron))
-            if dn_hyp is not None:
-                neighbors.append(
-                    EcologyNeighborContext(
-                        layer_name=edge.dst_layer,
-                        neuron_idx=edge.dst_neuron,
-                        direction="downstream",
-                        role=edge.role.value,
-                        mean_causal_delta=round(edge.mean_causal_delta, 4),
-                        positive_pole_motif=dn_hyp.positive_pole_motif,
-                        negative_pole_motif=dn_hyp.negative_pole_motif,
-                        unified_verb_hypothesis=dn_hyp.unified_verb_hypothesis,
-                        confidence_score=dn_hyp.confidence_score,
-                    )
-                )
-
-        # 3. Same-layer sibling anchors (L <-> L)
-        for sib_layer, sib_idx, sib_role, sib_strength in self.siblings.get(key, []):
-            sib_hyp = self.hypotheses.get((sib_layer, sib_idx))
-            if sib_hyp is not None:
-                neighbors.append(
-                    EcologyNeighborContext(
-                        layer_name=sib_layer,
-                        neuron_idx=sib_idx,
-                        direction="same_layer_sibling",
-                        role=sib_role,
-                        mean_causal_delta=round(float(sib_strength), 4),
-                        positive_pole_motif=sib_hyp.positive_pole_motif,
-                        negative_pole_motif=sib_hyp.negative_pole_motif,
-                        unified_verb_hypothesis=sib_hyp.unified_verb_hypothesis,
-                        confidence_score=sib_hyp.confidence_score,
-                    )
-                )
-
-        neighbors.sort(key=lambda n: abs(n.mean_causal_delta), reverse=True)
-        return neighbors[:max_neighbors]
+    def summarize(self, layer_name: Optional[str] = None, neuron_indices: Optional[List[int]] = None,
+                  sampling: str = "all explained neurons") -> ExplanationAuditSummary:
+        s = ExplanationAuditSummary(sampling=sampling)
+        pos_strong = pos_tot = nm_strong = nm_tot = d_strong = d_tot = 0
+        sel = set(neuron_indices) if neuron_indices is not None else None
+        for (lname, idx), h in self.hypotheses.items():
+            if layer_name is not None and lname != layer_name:
+                continue
+            if sel is not None and idx not in sel:
+                continue
+            for pole in (PoleType.POSITIVE, PoleType.NEGATIVE):
+                tax = h.taxonomy(pole)
+                if tax == NeuronTaxonomy.UNEXPLAINED:
+                    continue
+                s.poles_explained += 1
+                s.taxonomy_counts[tax.value] = s.taxonomy_counts.get(tax.value, 0) + 1
+                rep = h.verification.get(pole.value)
+                if rep is None or rep.outcome == FalsificationOutcome.UNTESTED:
+                    continue
+                s.outcome_counts[rep.outcome.value] = s.outcome_counts.get(rep.outcome.value, 0) + 1
+                pos_strong += rep.positive_strong_count
+                pos_tot += len(rep.positive_controls)
+                nm_strong += rep.near_miss_strong_count
+                nm_tot += len(rep.near_misses)
+                d_strong += rep.distant_strong_count
+                d_tot += len(rep.distant)
+                if rep.distant_strong_count == 0:
+                    s.poles_never_fired_on_distant += 1
+        s.positive_control_strong_rate = pos_strong / pos_tot if pos_tot else 0.0
+        s.near_miss_strong_rate = nm_strong / nm_tot if nm_tot else 0.0
+        s.distant_strong_rate = d_strong / d_tot if d_tot else 0.0
+        return s
 
     def clear(self) -> None:
-        """Clears all cached hypotheses and circuit/sibling links."""
         self.hypotheses.clear()
         self.edges_from.clear()
         self.edges_to.clear()
-        self.siblings.clear()
 
 
-class HeuristicSynthesisClient:
-    """
-    Built-in offline analytical synthesizer that inspects the structured NeuronPoleProfile
-    (including Forward Next-Token clues, SwiGLU Double-Negative Route diagnostics,
-    Stratified Quantile Activation Buckets, and Pole-Specific Selectivity),
-    Downstream & Upstream CircuitGraphs, and Crossword Ecology Neighbor clues
-    to formulate a BipolarVerbHypothesis and a falsifiable experimental test plan.
-    """
+# =============================================================================
+# The explainer and the blind test protocol
+# =============================================================================
+EXPLAINER_SYSTEM_PROMPT = """You are a mechanistic interpretability researcher explaining one MLP neuron of a language model from evidence about it.
+Working assumptions (from 'Neural Networks Are Already Clean'):
+- A neuron is better described as a verb than a noun: it draws a distinction that downstream neurons use. Its positive and negative poles both matter; describe each.
+- Ask what single shared pattern explains the examples. Avoid explanations that are lists of nouns; if the examples look unrelated, look for the shared pattern before concluding they are.
+- Read forward as well as backward: many activations are about what comes next (the next token), not the current token.
+- Attention often stores a running summary of the context on punctuation (commas, periods). If a neuron fires on punctuation, read the surrounding sentences to see what the summary is about. Some neurons push against a specific next token (for example 'don't say a dot'); check the suppressed logits.
+- In gated MLPs the positive pole mixes two sign regimes: '++' (gate open, value positive) and '--' (gate and value both negative, a small echo that usually resembles the negative pole). Explain the positive pole from the '++' examples and treat '--' examples as a separate regime.
+- Activation bands are fractions of the pole's strongest activation. Weaker bands usually radiate outward from the strongest meaning (related offshoots). Report offshoots separately from the main job.
+- Steering continuations show what the model writes when the neuron is forced to its corpus extremes.
+- Neighbour explanations come from neurons connected to this one by traced circuit edges; use them as clues, not as answers.
+- Say so when you cannot form a specific explanation. An explanation must be specific enough that it could be wrong.
+Pole taxonomy, one per pole:
+  one_main_job        - one job, possibly with small related offshoots
+  few_related_jobs    - two or three related jobs
+  unrelated_jobs      - the examples need jobs that are unrelated to each other
+  not_yet_understood  - you cannot form a specific explanation
+Return only JSON: {"positive_pole_explanation": str, "negative_pole_explanation": str, "unified_explanation": str,
+ "recursive_offshoots": [str], "positive_pole_taxonomy": str, "negative_pole_taxonomy": str, "confidence": float in [0,1]}"""
 
-    def complete_json(
-        self, system_prompt: str = "", user_prompt: Optional[str] = None
-    ) -> Dict[str, Any]:
-        raw_json = user_prompt if user_prompt is not None else system_prompt
-        evidence = json.loads(raw_json)
-        prof = evidence.get("neuron_profile", {})
-        circuit = evidence.get("downstream_circuit", {})
-        up_circuit = evidence.get("upstream_circuit", {})
-        neighbors = evidence.get("ecology_neighbors", [])
+TEST_WRITER_SYSTEM_PROMPT = """You write test texts for an explanation of one pole of a neuron in a language model.
+You never see the neuron or any of its data, only the explanation. A text counts as driving the neuron if the neuron responds strongly somewhere inside it.
+Write:
+- blind_maximum: one short, readable text you predict drives this pole as strongly as possible (aim at the center of what the explanation describes).
+- positive_examples: exactly 5 new, varied texts that should drive it strongly.
+- near_misses: exactly 5 texts that share surface features or topic with the explanation but should NOT drive it, because they miss the specific thing it describes.
+- distant_concept: the concept most distant from this explanation that you can think of.
+- distant_examples: exactly 5 texts about that distant concept.
+Return only JSON: {"blind_maximum": str, "positive_examples": [5 str], "near_misses": [5 str], "distant_concept": str, "distant_examples": [5 str]}"""
 
-        pos_samples = prof.get("top_positive_samples", [])
-        neg_samples = prof.get("top_negative_samples", [])
-        pos_tokens = list(dict.fromkeys(s["token"] for s in pos_samples if s.get("token")))
-        neg_tokens = list(dict.fromkeys(s["token"] for s in neg_samples if s.get("token")))
-        pos_next_tokens = list(
-            dict.fromkeys(
-                s["next_token"]
-                for s in pos_samples
-                if s.get("next_token") and s.get("next_token") != "<eos>"
-            )
-        )
+BUNDLE_EXPLAINER_SYSTEM_PROMPT = """You explain one bundle of upstream neurons that jointly drive a target neuron in a language model.
+You get the target's explanation, the contexts where this bundle drives the target most, and what the bundle's upstream neurons respond to.
+Describe in one or two sentences what this bundle contributes. Return only JSON: {"explanation": str}"""
 
-        promoted = [t[0] for t in prof.get("top_promoted_tokens", [])[:4]]
-        suppressed = [t[0] for t in prof.get("top_suppressed_tokens", [])[:4]]
+BUNDLE_BLIND_MAX_SYSTEM_PROMPT = """You see only a short description of what drives a neuron. Write one short, readable text you predict drives it as strongly as possible.
+Return only JSON: {"blind_maximum": str}"""
 
-        excited_dst = [e["dst_neuron"] for e in circuit.get("top_excited_downstream", [])[:3]]
-        inhibited_dst = [e["dst_neuron"] for e in circuit.get("top_inhibited_downstream", [])[:3]]
-        excited_up = [e["src_neuron"] for e in up_circuit.get("top_excitatory_upstream", [])[:3]]
+RELATEDNESS_SYSTEM_PROMPT = """Decide whether two descriptions of what drives the same neuron are related (one grew out of, or shares a pattern with, the other) or unrelated.
+Return only JSON: {"related": bool, "reason": str}"""
 
-        selectivity = float(prof.get("pole_selectivity_score", 0.0))
-        pos_sel = float(prof.get("pos_pole_selectivity_score", selectivity))
-        neg_sel = float(prof.get("neg_pole_selectivity_score", selectivity))
-        best_pole_sel = max(selectivity, pos_sel, neg_sel)
-        std_val = float(prof.get("std", 0.0))
-        r2_val = float(prof.get("lexical_selectivity_r2", 0.0))
-
-        pos_buckets = prof.get("positive_quantile_buckets", {})
-        peak_tokens = list(
-            dict.fromkeys(
-                s["token"] for s in pos_buckets.get("peak_trunk", []) if s.get("token")
-            )
-        )
-        sec_tokens = list(
-            dict.fromkeys(
-                s["token"]
-                for s in pos_buckets.get("secondary_branch", [])
-                if s.get("token") and s.get("token") not in pos_tokens[:1]
-            )
-        )
-        tert_tokens = list(
-            dict.fromkeys(
-                s["token"]
-                for s in pos_buckets.get("tertiary_offshoot", [])
-                if s.get("token") and s.get("token") not in pos_tokens[:1]
-            )
-        )
-
-        if std_val < 1e-5 or (not pos_tokens and not neg_tokens):
-            taxonomy = NeuronTaxonomy.DEAD_OR_NOISY.value
-            confidence = 0.25
-        elif best_pole_sel >= 1.95 or (r2_val >= 0.45 and std_val > 1.0):
-            taxonomy = NeuronTaxonomy.CLEAN_MONOSEMANTIC.value
-            confidence = min(0.96, 0.75 + 0.05 * best_pole_sel)
-        elif best_pole_sel >= 1.25 or (sec_tokens and (excited_dst or neighbors)):
-            taxonomy = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value
-            confidence = 0.72
-        else:
-            taxonomy = NeuronTaxonomy.TRUE_POLYSEMANTIC.value
-            confidence = 0.45
-
-        next_clue = (
-            f" (preparing next-token prediction toward [{' / '.join(pos_next_tokens[:2])}])"
-            if pos_next_tokens
-            else ""
-        )
-        pos_motif = (
-            f"Detects and amplifies [{' / '.join(pos_tokens[:3])}] features{next_clue}, driving output toward [{' / '.join(promoted[:2])}]"
-            if pos_tokens
-            else "Latent excitatory activation regime"
-        )
-        neg_motif = (
-            f"Opposes positive motif by firing negatively on [{' / '.join(neg_tokens[:3])}], promoting [{' / '.join(suppressed[:2])}]"
-            if neg_tokens
-            else "Latent inhibitory / baseline suppression regime"
-        )
-
-        verb_hypothesis = (
-            f"Acts as a bipolar semantic router ('verb') separating [{', '.join(pos_tokens[:3])}] (+Pole) "
-            f"from [{', '.join(neg_tokens[:3])}] (-Pole): when positive, it excites downstream neurons {excited_dst} "
-            f"and inhibits competing circuit branches {inhibited_dst}."
-        )
-
-        offshoots: List[str] = []
-        if sec_tokens:
-            offshoots.append(
-                f"Secondary quantile branch (40-80% max): recursive generalization onto {sec_tokens[:3]}"
-            )
-        if tert_tokens:
-            offshoots.append(
-                f"Tertiary quantile offshoot (15-40% max): weak semantic extension onto {tert_tokens[:3]}"
-            )
-        dbl_neg_rate = float(prof.get("double_negative_positive_rate", 0.0))
-        if dbl_neg_rate > 0.0:
-            dbl_toks = list(
-                dict.fromkeys(
-                    s["token"]
-                    for s in prof.get("double_negative_samples", [])
-                    if s.get("token")
-                )
-            )
-            offshoots.append(
-                f"SwiGLU double-negative route (gate<0, up<0; {dbl_neg_rate * 100:.1f}% of +Pole): separated from main positive pole on {dbl_toks[:3]}"
-            )
-        if excited_up:
-            offshoots.append(
-                f"Upstream incoming circuit drivers from {up_circuit.get('source_layer', 'L-1')}: neurons {excited_up}"
-            )
-        if len(pos_tokens) > 2 and not offshoots:
-            offshoots.append(
-                f"Recursive generalization across co-occurring context tokens {pos_tokens[1:]} sharing downstream readers {excited_dst}"
-            )
-        if circuit.get("top_excited_downstream"):
-            roles = [
-                f"N{e['dst_neuron']} ({e['role']})"
-                for e in circuit["top_excited_downstream"][:2]
-            ]
-            offshoots.append(
-                f"Downstream specialization into Layer+1 circuit nodes: {', '.join(roles)}"
-            )
-        if neighbors:
-            neighbor_summary = ", ".join(
-                f"{n['direction']} {n['layer_name']}[N{n['neuron_idx']}] ({n['role']})"
-                for n in neighbors[:2]
-            )
-            offshoots.append(
-                f"Crossword ecology alignment with verified neighbors: {neighbor_summary}"
-            )
-
-        near_miss = (sec_tokens[:2] + tert_tokens[:2])[:3]
-        distant_ctrl = (neg_tokens[:2] or suppressed[:2])[:3]
-        blind_max = " ".join((peak_tokens or pos_tokens)[:3]) if (peak_tokens or pos_tokens) else None
-
-        raw_result = {
-            "positive_pole_motif": pos_motif,
-            "negative_pole_motif": neg_motif,
-            "unified_verb_hypothesis": verb_hypothesis,
-            "recursive_offshoots": offshoots,
-            "taxonomy_class": taxonomy,
-            "confidence_score": round(confidence, 3),
-            "proposed_experiment": {
-                "positive_pole_test_tokens": pos_tokens[:3] or promoted[:2],
-                "negative_pole_test_tokens": neg_tokens[:3] or suppressed[:2],
-                "expected_promoted_tokens": promoted[:3] or pos_next_tokens[:3],
-                "expected_suppressed_tokens": suppressed[:3],
-                "expected_excited_dst_neurons": excited_dst,
-                "expected_inhibited_dst_neurons": inhibited_dst,
-                "blind_maximum_prompt": blind_max,
-                "near_miss_test_tokens": near_miss,
-                "distant_control_tokens": distant_ctrl,
-            },
-        }
-        validated = AgentHypothesisResponseSchema.model_validate(raw_result)
-        return validated.model_dump(mode="json")
+EncodeFn = Callable[[str], Tuple[torch.Tensor, List[str]]]
 
 
 class NeuronExplainerAgent:
     """
-    Automated Mechanistic Interpretability Agent implementing the methodology from
-    'Neural Networks Are Already Clean' (Cammarata / Goodfire, 2026).
-
-    1. Packages Bipolar Neuron Profiles (+Pole / -Pole contexts, Forward Next-Token clues,
-       SwiGLU Double-Negative Route diagnostics, Pole-Specific Selectivities, Stratified
-       Quantile Activation Buckets, and Direct Logit Attribution) alongside Downstream &
-       Upstream Circuit Ecology and verified Crossword Neighbor Clues (`CircuitEcologyMap`).
-    2. Prompts an LLM Agent to synthesize a unified 'Verb' hypothesis and recursive offshoots.
-    3. Automatically runs closed-loop surgical interventions (Zero-Ablation, Pole Clamping,
-       Random-Neuron Null Controls, and Blind-Maximum / Near-Miss Falsification) on the live
-       PyTorch model to empirically verify or falsify the agent's hypothesis.
+    Two-agent explanation protocol:
+      1. the explainer agent reads the neuron's evidence (both poles, sign regimes, activation bands,
+         forward context, logit attribution, steering continuations, traced circuits and explained
+         neighbours) and writes an explanation of each pole;
+      2. the test-writer agent sees only one pole's explanation and writes a blind maximum, five
+         positive examples, five near misses and five texts about the most distant concept;
+      3. every text is run through the model; a response is strong when the pole's peak activation in
+         the text reaches `strong_fraction` (paper: 30%) of the pole's corpus extreme; the explanation
+         wins if more positive examples than near misses are strong, ties if equal, loses otherwise.
+    No offline 'explainer' is provided: explanations require an LLM (or human) client.
     """
 
-    SYSTEM_PROMPT = """You are a senior mechanistic interpretability researcher auditing single neurons under the 'Neural Networks Are Already Clean' framework.
-Your task is to analyze the provided JSON evidence for a single neuron (including its Positive Pole activating contexts,
- Negative Pole activating contexts, `next_token` forward predictions, SwiGLU `double_negative_samples` where gate<0 and up<0,
- Stratified Quantile Activation Buckets, Direct Vocabulary Logit Attribution, Upstream/Downstream Layer Circuit Connections,
- and any already-verified Crossword Ecology Neighbor Clues) and return a strict JSON object with the following schema:
-{
-  "positive_pole_motif": "Concise description of what excites the positive pole (>0), noting both current-token detection and next-token preparation",
-  "negative_pole_motif": "Concise description of what drives the negative pole (<0)",
-  "unified_verb_hypothesis": "Single sentence explaining how this neuron acts as a differential 'verb' or router separating the Positive Pole from the Negative Pole and routing signals to downstream neurons.",
-  "recursive_offshoots": ["List of related secondary semantic offshoots across quantile bands, upstream drivers, or downstream specializations"],
-  "taxonomy_class": "clean_monosemantic | structured_recursive_mixture | true_polysemantic | dead_or_noisy",
-  "confidence_score": 0.0 to 1.0,
-  "proposed_experiment": {
-    "positive_pole_test_tokens": ["tokens expected to strongly trigger the +Pole"],
-    "negative_pole_test_tokens": ["tokens expected to strongly trigger the -Pole"],
-    "expected_promoted_tokens": ["vocabulary tokens expected to drop when +Pole is zero-ablated"],
-    "expected_suppressed_tokens": ["vocabulary tokens expected to rise when clamped to -Pole"],
-    "expected_excited_dst_neurons": [integer indices of downstream neurons expected to drop when +Pole is zero-ablated],
-    "expected_inhibited_dst_neurons": [integer indices of downstream neurons expected to rise when +Pole is zero-ablated],
-    "blind_maximum_prompt": "Synthetic test prompt predicted to drive this neuron near its maximum positive activation",
-    "near_miss_test_tokens": ["related secondary/boundary tokens expected to produce moderate activation below the peak"],
-    "distant_control_tokens": ["unrelated or opposite-pole control tokens expected to produce <= 0 activation"]
-  }
-}"""
-
-    def __init__(
-        self,
-        injector: NeuralInjector,
-        llm_client: Optional[LLMClientProtocol] = None,
-    ):
+    def __init__(self, injector: "NeuralInjector", llm_client: Optional[LLMClientProtocol] = None,
+                 test_writer_client: Optional[LLMClientProtocol] = None, max_attempts: int = 3,
+                 strong_fraction: float = PAPER_STRONG_FRACTION):
         self.injector = injector
-        self.llm_client: Any = llm_client or HeuristicSynthesisClient()
+        self.llm_client = llm_client
+        self.test_writer_client = test_writer_client or llm_client
+        self.max_attempts = max_attempts
+        self.strong_fraction = strong_fraction
+        self.prompt_log: List[Dict[str, str]] = []  # every (role, system, user) sent, for auditability
+
+    # ------------------------------------------------------------------
+    # LLM plumbing
+    # ------------------------------------------------------------------
+    def _call(self, client: Optional[LLMClientProtocol], role: str, system: str, user: str, schema: Type[BaseModel]) -> BaseModel:
+        if client is None:
+            raise RuntimeError(
+                "No LLM client configured. Explanations need an explainer model: pass "
+                "OpenAICompatibleClient(...) (works with OpenAI, Ollama, vLLM, ...) or CallableLLMClient(fn)."
+            )
+        last_err = ""
+        for _ in range(self.max_attempts):
+            prompt = user if not last_err else f"{user}\n\nYour previous answer was invalid: {last_err}\nReturn corrected JSON only."
+            self.prompt_log.append({"role": role, "system": system, "user": prompt})
+            raw = client.complete_json(system, prompt)
+            try:
+                return schema.model_validate(raw)
+            except ValidationError as exc:
+                last_err = str(exc)[:2000]
+        raise RuntimeError(f"{role} did not return valid {schema.__name__} after {self.max_attempts} attempts: {last_err}")
+
+    # ------------------------------------------------------------------
+    # Evidence
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_sample(s: ActivationSample, max_context_chars: Optional[int]) -> Dict[str, Any]:
+        ctx = s.context_str
+        if ctx is not None and max_context_chars is not None and len(ctx) > max_context_chars:
+            ctx = "..." + ctx[-max_context_chars:]
+        return {
+            "activation": round(s.activation_value, 5),
+            "share_of_pole_extreme": s.fraction_of_pole_extreme,
+            "sign_regime": s.sign_regime,
+            "token": s.token_str,
+            "next_token": s.next_token_str,
+            "window": s.window_str,
+            "context": ctx,
+        }
 
     @staticmethod
-    def _resolve_token_ids(
-        tokens: List[str],
-        tok_to_id: Dict[str, int],
-        tokenizer: Optional[Any] = None,
-    ) -> List[int]:
-        """
-        Resolves token strings into vocabulary IDs, handling BPE/SentencePiece prefixes
-        ('Ġ', '▁', leading spaces), class_<id> labels, and HuggingFace tokenizer fallback.
-        """
-        resolved: List[int] = []
-        for t in tokens:
-            if not t:
-                continue
-            if t in tok_to_id:
-                resolved.append(tok_to_id[t])
-                continue
-            stripped = t.strip()
-            for candidate in (stripped, f"Ġ{stripped}", f"▁{stripped}", f" {stripped}"):
-                if candidate in tok_to_id:
-                    resolved.append(tok_to_id[candidate])
-                    break
-            else:
-                if stripped.startswith(("class_", "token_")) and stripped.split("_")[-1].isdigit():
-                    resolved.append(int(stripped.split("_")[-1]))
-                elif tokenizer is not None and hasattr(tokenizer, "encode"):
-                    enc_ids = tokenizer.encode(stripped, add_special_tokens=False)
-                    if enc_ids:
-                        resolved.extend(int(i) for i in enc_ids)
-        return list(dict.fromkeys(resolved))
+    def _describe_top(samples: List[ActivationSample]) -> Dict[str, Any]:
+        toks = [s.token_str for s in samples if s.token_str is not None]
+        nxt = [s.next_token_str for s in samples if s.next_token_str is not None]
+        return {
+            "examples": len(samples),
+            "distinct_focal_tokens": len(set(toks)),
+            "distinct_next_tokens": len(set(nxt)),
+            "punctuation_focal_share": (sum(is_punctuation_token(t) for t in toks) / len(toks)) if toks else 0.0,
+        }
 
-    @classmethod
-    def _encode_context_or_tokens(
-        cls,
-        test_tokens: List[str],
-        tok_to_id: Dict[str, int],
-        device: torch.device,
-        fallback_context: Optional[str] = None,
-        tokenizer: Optional[Any] = None,
-    ) -> torch.Tensor:
-        """
-        Builds a 2D input_ids tensor `[1, seq_len]` from `test_tokens`, falling back to
-        encoding `fallback_context` when subword lookup would otherwise collapse to `[0]`.
-        """
-        ids = cls._resolve_token_ids(test_tokens, tok_to_id, tokenizer=tokenizer)
-        if not ids and fallback_context:
-            if tokenizer is not None and hasattr(tokenizer, "encode"):
-                ids = tokenizer.encode(fallback_context, add_special_tokens=False)
-            else:
-                words = [w.strip() for w in fallback_context.split() if w.strip()]
-                ids = cls._resolve_token_ids(words, tok_to_id, tokenizer=None)
-        if not ids:
-            ids = [0]
-        return torch.tensor([ids], dtype=torch.long, device=device)
+    def build_evidence_payload(self, profile: NeuronPoleProfile, circuits: Optional[Dict[str, Any]] = None,
+                               neighbors: Optional[List[EcologyNeighborContext]] = None,
+                               steering: Optional[Dict[str, str]] = None,
+                               max_context_chars: Optional[int] = None) -> Dict[str, Any]:
+        def _bands(bands: List[ActivationBand]) -> List[Dict[str, Any]]:
+            return [
+                {
+                    "share_of_extreme": [b.lower_fraction, b.upper_fraction],
+                    "count": b.count,
+                    "regime_counts": b.regime_counts,
+                    "examples": [self._fmt_sample(s, max_context_chars) for s in b.samples],
+                }
+                for b in bands
+            ]
 
-    @staticmethod
-    def build_evidence_payload(
-        profile: NeuronPoleProfile,
-        circuit: Optional[CircuitGraph] = None,
-        ecology_neighbors: Optional[List[EcologyNeighborContext]] = None,
-        upstream_circuit: Optional[CircuitGraph] = None,
-        negative_circuit: Optional[CircuitGraph] = None,
-    ) -> Dict[str, Any]:
-        """
-        Serializes a NeuronPoleProfile (including forward next-token clues, SwiGLU
-        double-negative route diagnostics, pole-specific selectivities, and stratified
-        quantile buckets), optional downstream & upstream CircuitGraphs, and optional
-        Crossword Ecology Neighbor contexts into a compact agent JSON payload.
-        """
-        def _fmt_sample(s: Any) -> Dict[str, Any]:
-            return {
-                "activation": round(s.activation_value, 4),
-                "token": s.token_str,
-                "next_token": s.next_token_str,
-                "window": s.window_str,
-                "context": s.context_str,
-                "is_double_negative_route": s.is_double_negative_route,
-            }
-
-        def _fmt_buckets(buckets: Dict[str, List[Any]]) -> Dict[str, List[Dict[str, Any]]]:
-            return {
-                band: [_fmt_sample(s) for s in samples[:4]]
-                for band, samples in buckets.items()
-            }
+        def _moments(m) -> Dict[str, Any]:
+            return {"count": m.count, "rate": m.rate, "mean": m.mean, "std": m.std,
+                    "skewness": m.skewness, "excess_kurtosis": m.excess_kurtosis, "extreme": m.extreme}
 
         payload: Dict[str, Any] = {
-            "neuron_profile": {
-                "layer_name": profile.layer_name,
-                "neuron_idx": profile.neuron_idx,
-                "mean": round(profile.mean, 4),
-                "std": round(profile.std, 4),
-                "max_val": round(profile.max_val, 4),
-                "min_val": round(profile.min_val, 4),
-                "positive_firing_rate": round(profile.positive_firing_rate, 4),
-                "negative_firing_rate": round(profile.negative_firing_rate, 4),
-                "pole_selectivity_score": round(profile.pole_selectivity_score, 3),
-                "pos_pole_selectivity_score": round(profile.pos_pole_selectivity_score, 3),
-                "pos_taxonomy_class": profile.pos_taxonomy_class.value,
-                "pos_sparsity_prior": profile.pos_sparsity_prior.value,
-                "neg_pole_selectivity_score": round(profile.neg_pole_selectivity_score, 3),
-                "neg_taxonomy_class": profile.neg_taxonomy_class.value,
-                "neg_sparsity_prior": profile.neg_sparsity_prior.value,
-                "lexical_selectivity_r2": round(profile.lexical_selectivity_r2, 4),
-                "inferred_firing_motif": profile.inferred_firing_motif,
-                "double_negative_positive_rate": round(profile.double_negative_positive_rate, 4),
-                "swiglu_sign_regime_rates": profile.swiglu_sign_regime_rates,
-                "double_negative_band_rates": profile.double_negative_band_rates,
-                "double_negative_samples": [_fmt_sample(s) for s in profile.double_negative_samples[:4]],
-                "top_positive_samples": [_fmt_sample(s) for s in profile.top_positive_samples],
-                "top_negative_samples": [_fmt_sample(s) for s in profile.top_negative_samples],
-                "positive_quantile_buckets": _fmt_buckets(profile.positive_quantile_buckets),
-                "negative_quantile_buckets": _fmt_buckets(profile.negative_quantile_buckets),
-                "top_promoted_tokens": profile.top_promoted_tokens,
-                "top_suppressed_tokens": profile.top_suppressed_tokens,
-            }
+            "neuron": {"layer": profile.layer_name, "index": profile.neuron_idx,
+                       "tokens_observed": profile.tokens_observed, "gated_mlp": profile.gated},
+            "positive_pole": {
+                "moments": _moments(profile.positive_pole),
+                "top_examples_all_regimes": [self._fmt_sample(s, max_context_chars) for s in profile.top_positive_samples],
+                "top_summary": self._describe_top(profile.top_positive_samples),
+                "bands": _bands(profile.positive_bands),
+            },
+            "negative_pole": {
+                "moments": _moments(profile.negative_pole),
+                "top_examples_all_regimes": [self._fmt_sample(s, max_context_chars) for s in profile.top_negative_samples],
+                "top_summary": self._describe_top(profile.top_negative_samples),
+                "bands": _bands(profile.negative_bands),
+            },
+            "sign_regimes": {
+                r: {"moments": _moments(profile.regime_moments[r]),
+                    "top_examples": [self._fmt_sample(s, max_context_chars) for s in profile.regime_top_samples.get(r, [])]}
+                for r in profile.regime_moments
+            },
+            "double_negative_share_of_positive_activations": profile.double_negative_positive_rate,
+            "direct_logit_attribution": {
+                "promoted": [[t, round(v, 5)] for t, v in profile.top_promoted_tokens],
+                "suppressed": [[t, round(v, 5)] for t, v in profile.top_suppressed_tokens],
+            },
         }
-        if circuit is not None:
-            payload["downstream_circuit"] = circuit.to_agent_payload()
-        if negative_circuit is not None:
-            payload["negative_downstream_circuit"] = negative_circuit.to_agent_payload()
-        if upstream_circuit is not None:
-            payload["upstream_circuit"] = upstream_circuit.to_incoming_agent_payload()
-        if ecology_neighbors:
-            payload["ecology_neighbors"] = [
-                {
-                    "layer_name": n.layer_name,
-                    "neuron_idx": n.neuron_idx,
-                    "direction": n.direction,
-                    "role": n.role,
-                    "mean_causal_delta": n.mean_causal_delta,
-                    "positive_pole_motif": n.positive_pole_motif,
-                    "negative_pole_motif": n.negative_pole_motif,
-                    "unified_verb_hypothesis": n.unified_verb_hypothesis,
-                    "confidence_score": n.confidence_score,
-                }
-                for n in ecology_neighbors
-            ]
+        if circuits:
+            payload["circuits"] = circuits
+        if neighbors:
+            payload["explained_neighbours"] = [n.__dict__ for n in neighbors]
+        if steering:
+            payload["steering_continuations"] = steering
         return payload
 
-    def generate_hypothesis(
-        self,
-        profile: NeuronPoleProfile,
-        circuit: Optional[CircuitGraph] = None,
-        ecology_neighbors: Optional[List[EcologyNeighborContext]] = None,
-        upstream_circuit: Optional[CircuitGraph] = None,
-        negative_circuit: Optional[CircuitGraph] = None,
-    ) -> BipolarVerbHypothesis:
-        """Calls the LLM agent to synthesize a BipolarVerbHypothesis and verification plan."""
-        evidence = self.build_evidence_payload(
-            profile,
-            circuit,
-            ecology_neighbors,
-            upstream_circuit=upstream_circuit,
-            negative_circuit=negative_circuit,
-        )
-        user_prompt_str = json.dumps(evidence, indent=2)
+    # ------------------------------------------------------------------
+    # Measurement
+    # ------------------------------------------------------------------
+    def _default_encode(self, tokenizer: Any) -> EncodeFn:
+        device = next(self.injector.model.parameters()).device
 
-        sig = inspect.signature(self.llm_client.complete_json)
-        params = [
-            p
-            for p in sig.parameters.values()
-            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        ]
-        if len(params) == 1:
-            raw_resp = self.llm_client.complete_json(user_prompt_str)
-        else:
-            raw_resp = self.llm_client.complete_json(self.SYSTEM_PROMPT, user_prompt_str)
+        def enc(text: str) -> Tuple[torch.Tensor, List[str]]:
+            ids = tokenizer(text, return_tensors="pt")["input_ids"].to(device)
+            toks = [tokenizer.decode([i]) for i in ids[0].tolist()]
+            return ids, toks
 
-        exp_dict = raw_resp.get("proposed_experiment", {})
-        exp_spec = VerificationExperimentSpec(
-            positive_pole_test_tokens=exp_dict.get("positive_pole_test_tokens", []),
-            negative_pole_test_tokens=exp_dict.get("negative_pole_test_tokens", []),
-            expected_promoted_tokens=exp_dict.get("expected_promoted_tokens", []),
-            expected_suppressed_tokens=exp_dict.get("expected_suppressed_tokens", []),
-            expected_excited_dst_neurons=exp_dict.get("expected_excited_dst_neurons", []),
-            expected_inhibited_dst_neurons=exp_dict.get("expected_inhibited_dst_neurons", []),
-            blind_maximum_prompt=exp_dict.get("blind_maximum_prompt"),
-            near_miss_test_tokens=exp_dict.get("near_miss_test_tokens", []),
-            distant_control_tokens=exp_dict.get("distant_control_tokens", []),
-        )
-
-        tax_str = raw_resp.get("taxonomy_class", NeuronTaxonomy.UNVERIFIED.value)
-        try:
-            taxonomy = NeuronTaxonomy(tax_str)
-        except ValueError:
-            taxonomy = NeuronTaxonomy.UNVERIFIED
-
-        return BipolarVerbHypothesis(
-            layer_name=profile.layer_name,
-            neuron_idx=profile.neuron_idx,
-            positive_pole_motif=raw_resp.get("positive_pole_motif", ""),
-            negative_pole_motif=raw_resp.get("negative_pole_motif", ""),
-            unified_verb_hypothesis=raw_resp.get("unified_verb_hypothesis", ""),
-            recursive_offshoots=raw_resp.get("recursive_offshoots", []),
-            taxonomy_class=taxonomy,
-            confidence_score=float(raw_resp.get("confidence_score", 0.5)),
-            proposed_experiment=exp_spec,
-        )
-
-    def generate_blind_experiment(
-        self,
-        hypothesis: BipolarVerbHypothesis,
-        tok_to_id: Dict[str, int],
-        profile: Optional[NeuronPoleProfile] = None,
-    ) -> VerificationExperimentSpec:
-        """
-        Step 2 of Cammarata's 2-Step Blind Verification Protocol ('How Do We Know Explanations Are Right?'):
-        Constructs a held-out / blind experimental test specification from the hypothesis prose and
-        predicted output vocabulary without memorizing the single peak audit token (`top_positive_samples[0]`
-        / `top_negative_samples[0]`). By combining held-out secondary motif tokens with the neuron's
-        predicted promoted/suppressed output tokens, random-init neurons (whose input and output weights
-        are independent) fail to generalize while true semantic routers pass cleanly.
-        """
-        exp = hypothesis.proposed_experiment
-        if profile is None or not tok_to_id:
-            return exp
-
-        top1_pos = (
-            profile.top_positive_samples[0].token_str
-            if profile.top_positive_samples
-            else None
-        )
-        top1_neg = (
-            profile.top_negative_samples[0].token_str
-            if profile.top_negative_samples
-            else None
-        )
-
-        # Hold out the single top-1 memorizing token when other positive/promoted candidates exist
-        held_out_pos = [t for t in exp.positive_pole_test_tokens if t and t != top1_pos]
-        if not held_out_pos:
-            for t in exp.expected_promoted_tokens[:2]:
-                if t and t != top1_pos and t not in held_out_pos:
-                    held_out_pos.append(t)
-        blind_pos = held_out_pos if held_out_pos else list(exp.positive_pole_test_tokens)
-
-        held_out_neg = [t for t in exp.negative_pole_test_tokens if t and t != top1_neg]
-        if not held_out_neg:
-            for t in exp.expected_suppressed_tokens[:2]:
-                if t and t != top1_neg and t not in held_out_neg:
-                    held_out_neg.append(t)
-        blind_neg = held_out_neg if held_out_neg else list(exp.negative_pole_test_tokens)
-
-        blind_max = " ".join(blind_pos[:3]) if blind_pos else exp.blind_maximum_prompt
-
-        return VerificationExperimentSpec(
-            positive_pole_test_tokens=blind_pos,
-            negative_pole_test_tokens=blind_neg,
-            expected_promoted_tokens=list(exp.expected_promoted_tokens),
-            expected_suppressed_tokens=list(exp.expected_suppressed_tokens),
-            expected_excited_dst_neurons=list(exp.expected_excited_dst_neurons),
-            expected_inhibited_dst_neurons=list(exp.expected_inhibited_dst_neurons),
-            blind_maximum_prompt=blind_max,
-            near_miss_test_tokens=list(exp.near_miss_test_tokens),
-            distant_control_tokens=list(exp.distant_control_tokens),
-        )
-
-    @staticmethod
-    def _pearson_corr(xs: List[float], ys: List[float]) -> float:
-        if len(xs) != len(ys) or len(xs) < 2:
-            return 0.0
-        mx = sum(xs) / len(xs)
-        my = sum(ys) / len(ys)
-        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-        den_x = sum((x - mx) ** 2 for x in xs)
-        den_y = sum((y - my) ** 2 for y in ys)
-        den = math.sqrt(den_x * den_y)
-        return float(num / den) if den > 1e-12 else 0.0
-
-    @staticmethod
-    def _compute_branch_relatedness(profile: Optional[NeuronPoleProfile]) -> float:
-        """
-        Measures structural / contextual relatedness across quantile bands
-        (`peak_trunk`, `secondary_branch`, `tertiary_offshoot`) to distinguish
-        recursive offshoots (`STRUCTURED_RECURSIVE_MIXTURE`) from unrelated collisions.
-        """
-        if profile is None:
-            return 0.0
-        b = profile.positive_quantile_buckets
-        peak = b.get("peak_trunk", [])
-        sec = b.get("secondary_branch", [])
-        tert = b.get("tertiary_offshoot", [])
-        if not peak or (not sec and not tert):
-            return 1.0 if peak else 0.0
-
-        peak_next = {s.next_token_str for s in peak if s.next_token_str and s.next_token_str != "<eos>"}
-        peak_words = {
-            w
-            for s in peak
-            if s.context_str
-            for w in s.context_str.split()
-        }
-        offshoot_samples = sec + tert
-        off_next = {
-            s.next_token_str for s in offshoot_samples if s.next_token_str and s.next_token_str != "<eos>"
-        }
-        off_words = {
-            w
-            for s in offshoot_samples
-            if s.context_str
-            for w in s.context_str.split()
-        }
-
-        next_overlap = (
-            len(peak_next & off_next) / max(len(peak_next | off_next), 1)
-            if (peak_next and off_next)
-            else 0.0
-        )
-        word_overlap = (
-            len(peak_words & off_words) / max(len(peak_words | off_words), 1)
-            if (peak_words and off_words)
-            else 0.0
-        )
-        return round(float(max(next_overlap, word_overlap, float(profile.lexical_selectivity_r2))), 4)
+        return enc
 
     @torch.no_grad()
-    def verify_hypothesis(
-        self,
-        hypothesis: BipolarVerbHypothesis,
-        tok_to_id: Dict[str, int],
-        dst_layer: Optional[str] = None,
-        profile: Optional[NeuronPoleProfile] = None,
-        tokenizer: Optional[Any] = None,
-        circuit_inputs: Optional[Any] = None,
-    ) -> VerificationReport:
+    def measure_texts(self, layer_name: str, neuron_idx: int, texts: Sequence[str], pole: PoleType,
+                      corpus_extreme: float, encode_fn: EncodeFn, forward_fn: Callable = default_forward,
+                      specs: Optional[List[InterventionSpec]] = None) -> List[TextActivation]:
+        """Peak response of one pole of the neuron inside each text, as a share of the pole's corpus extreme."""
+        hs = HookSet(self.injector.model)
+        site = hs.site(layer_name)
+        got: Dict[str, torch.Tensor] = {}
+        hs.add_capture(layer_name, lambda a, g, r: got.update(a=a.detach().float(), g=(g.detach().float() if g is not None else None)),
+                       need_gate=site.gated)
+        sign = 1.0 if pole == PoleType.POSITIVE else -1.0
+        ext = abs(corpus_extreme)
+        out: List[TextActivation] = []
+        for text in texts:
+            ids, toks = encode_fn(text)
+            got.clear()
+            with self.injector.temporary_interventions(specs or []), hs.active():
+                forward_fn(self.injector.model, ids)
+            col = flat_neuron_view(got["a"], site.is_conv2d)[:, neuron_idx]
+            signed = col * sign
+            p = int(signed.argmax())
+            peak = float(col[p])
+            share = max(0.0, sign * peak) / ext if ext > 0 else 0.0
+            regime = None
+            if got.get("g") is not None and peak != 0:
+                gneg = float(flat_neuron_view(got["g"], site.is_conv2d)[p, neuron_idx]) < 0
+                regime = ("--" if gneg else "++") if peak > 0 else ("-+" if gneg else "+-")
+            out.append(TextActivation(text=text, peak_activation=peak, share_of_corpus_extreme=share,
+                                      strong=share >= self.strong_fraction,
+                                      peak_token=toks[p] if p < len(toks) else None, peak_position=p,
+                                      peak_sign_regime=regime))
+        return out
+
+    def verify_pole(self, layer_name: str, neuron_idx: int, suite: BlindTestSuite, corpus_extreme: float,
+                    encode_fn: EncodeFn, forward_fn: Callable = default_forward) -> PoleVerificationReport:
+        m = lambda texts: self.measure_texts(layer_name, neuron_idx, texts, suite.pole, corpus_extreme, encode_fn, forward_fn)
+        bm = m([suite.blind_maximum])[0]
+        pos, nm, dist = m(suite.positive_examples), m(suite.near_misses), m(suite.distant_examples)
+        ps, ns, ds = sum(t.strong for t in pos), sum(t.strong for t in nm), sum(t.strong for t in dist)
+        outcome = FalsificationOutcome.WON if ps > ns else (FalsificationOutcome.TIED if ps == ns else FalsificationOutcome.LOST)
+        return PoleVerificationReport(pole=suite.pole, corpus_extreme=corpus_extreme, strong_fraction=self.strong_fraction,
+                                      blind_maximum=bm, positive_controls=pos, near_misses=nm, distant=dist,
+                                      positive_strong_count=ps, near_miss_strong_count=ns, distant_strong_count=ds,
+                                      outcome=outcome)
+
+    def write_test_suite(self, pole: PoleType, explanation: str) -> BlindTestSuite:
+        """Agent 2: receives nothing but the explanation text of one pole."""
+        user = json.dumps({"explanation_of_what_drives_the_neuron": explanation})
+        r: TestSuiteResponse = self._call(self.test_writer_client, "test_writer", TEST_WRITER_SYSTEM_PROMPT, user, TestSuiteResponse)  # type: ignore[assignment]
+        return BlindTestSuite(pole=pole, explanation=explanation, blind_maximum=r.blind_maximum,
+                              positive_examples=list(r.positive_examples), near_misses=list(r.near_misses),
+                              distant_concept=r.distant_concept, distant_examples=list(r.distant_examples))
+
+    # ------------------------------------------------------------------
+    # Causal checks and steering
+    # ------------------------------------------------------------------
+    def steering_continuations(self, layer_name: str, neuron_idx: int, profile: NeuronPoleProfile,
+                               prompts: Sequence[str], n_tokens: int, encode_fn: EncodeFn,
+                               decode_fn: Callable[[List[int]], str]) -> Dict[str, str]:
+        """Greedy continuations with the neuron clamped to its corpus max and to its corpus min at every position."""
+        out: Dict[str, str] = {}
+        for pi, prompt in enumerate(prompts):
+            ids, _ = encode_fn(prompt)
+            for label, value in (("clean", None), ("neuron_at_corpus_max", profile.max_val), ("neuron_at_corpus_min", profile.min_val)):
+                if value is None:
+                    fac = None
+                else:
+                    spec = InterventionSpec(layer_name, [neuron_idx], InterventionMode.HARD_CLAMP, PoleType.BOTH, float(value))
+
+                    def fac(_c, spec=spec):
+                        from .interventions import InterventionKernel
+                        return {layer_name: lambda a, g: InterventionKernel.apply(a, [spec], gate=g)}
+                gen = self.injector._greedy_generate(ids, n_tokens, fac)
+                out[f"prompt{pi}:{label}"] = prompt + decode_fn(gen)
+        return out
+
+    @torch.no_grad()
+    def causal_checks(self, layer_name: str, neuron_idx: int, texts: Sequence[str], encode_fn: EncodeFn,
+                      n_controls: int, seed: int, forward_fn: Callable = default_forward) -> CausalCheckReport:
+        """Zero-ablation KL of the neuron on the texts vs zero-ablation KL of random neurons of the same layer."""
+        n = HookSet(self.injector.model).site(layer_name).num_neurons
+        rng = random.Random(seed * 7919 + neuron_idx)
+        controls = rng.sample([i for i in range(n) if i != neuron_idx], k=min(n_controls, n - 1))
+
+        def kl_of(idx: int) -> float:
+            vals = []
+            for t in texts:
+                ids, _ = encode_fn(t)
+                vals.append(self.injector.measure_ablation_kl_divergence(layer_name, idx, ids, forward_fn=forward_fn))
+            return sum(vals) / len(vals)
+
+        target = kl_of(neuron_idx)
+        ctrl = [kl_of(c) for c in controls]
+        pct = sum(c < target for c in ctrl) / len(ctrl) if ctrl else float("nan")
+        return CausalCheckReport(target_ablation_kl=target, control_ablation_kls=ctrl, target_kl_percentile_among_controls=pct)
+
+    # ------------------------------------------------------------------
+    # Bundles
+    # ------------------------------------------------------------------
+    def run_bundle_blind_maximum(self, layer_name: str, neuron_idx: int, src_layer: str, profile: NeuronPoleProfile,
+                                 main_explanation: str, pole: PoleType, encode_fn: EncodeFn,
+                                 forward_fn: Callable = default_forward, max_bundles: int = 6,
+                                 top_k_upstream: int = 24) -> List[BundleBlindMaximumResult]:
         """
-        Executes the agent's proposed contrastive, falsification, and surgical ablation
-        experiments directly on the model via NeuralInjector to empirically score the hypothesis:
-          1. Contrastive Pole Excitation & Effect Size Check: Runs positive vs. negative test tokens
-             WITHOUT leaking `.max()`/`.min()` over training sentences, verifying sign separation,
-             standardized Cohen's d, and share of corpus maximum (`>= 30%`).
-          2. Falsification Protocol ('Win / Tie / Lose'): Tests blind-maximum / near-miss / distant-control
-             inputs and computes held-out binned activation simulation correlation.
-          3. Surgical Zero-Ablation & Native-Scale Pole-Flip Check: Measures target logit shifts
-             AND compares full-output ablation KL against a random-neuron control baseline in the same layer.
-          4. Downstream Circuit Match: Verifies predicted downstream neuron shifts exceed a meaningful
-             causal effect threshold (`> 0.05`).
+        'We then run a blind maximum for each bundle, ablating all the others, and compare it against
+        the strongest corpus example under the same ablation.'
         """
-        model = self.injector.model
-        was_training = model.training
-        model.eval()
-        try:
-            device = next(model.parameters()).device
-            layer_name = hypothesis.layer_name
-            neuron_idx = hypothesis.neuron_idx
-            exp = self.generate_blind_experiment(hypothesis, tok_to_id, profile=profile)
+        samples = profile.top_positive_samples if pole == PoleType.POSITIVE else profile.top_negative_samples
+        texts = list(dict.fromkeys(s.context_str for s in samples if s.context_str))
+        if len(texts) < 2:
+            raise ValueError("Bundle analysis needs at least two distinct activating contexts with text.")
+        contexts = [encode_fn(t)[0] for t in texts]
+        bundles = self.injector.cluster_incoming_attribution_bundles(src_layer, layer_name, neuron_idx, contexts, pole,
+                                                                     forward_fn, top_k_upstream=top_k_upstream,
+                                                                     max_bundles=max_bundles, context_labels=texts)
+        src_tracker = self.injector.get_stats_tracker(src_layer)
+        ext = profile.pole_extreme(pole)
+        results = []
+        for b in bundles:
+            others = sorted({n for o in bundles if o.bundle_id != b.bundle_id for n in o.upstream_neurons})
+            ablate = [InterventionSpec(src_layer, others, InterventionMode.ZERO_ABLATE)] if others else []
+            up_info = []
+            if src_tracker is not None:
+                for u in b.upstream_neurons[:8]:
+                    p = src_tracker.export_profile(u, samples_per_band=0)
+                    up_info.append({"neuron": u, "top_positive": [s.window_str for s in p.top_positive_samples[:5]],
+                                    "top_negative": [s.window_str for s in p.top_negative_samples[:5]]})
+            user = json.dumps({"target_explanation": main_explanation, "contexts_this_bundle_drives_most": b.driving_contexts,
+                               "upstream_neurons": up_info})
+            be: BundleExplanationResponse = self._call(self.llm_client, "bundle_explainer", BUNDLE_EXPLAINER_SYSTEM_PROMPT, user, BundleExplanationResponse)  # type: ignore[assignment]
+            bm: BlindMaximumResponse = self._call(self.test_writer_client, "bundle_test_writer", BUNDLE_BLIND_MAX_SYSTEM_PROMPT,
+                                                  json.dumps({"description": be.explanation}), BlindMaximumResponse)  # type: ignore[assignment]
+            blind = self.measure_texts(layer_name, neuron_idx, [bm.blind_maximum], pole, ext, encode_fn, forward_fn, ablate)[0]
+            corpus = self.measure_texts(layer_name, neuron_idx, texts, pole, ext, encode_fn, forward_fn, ablate)
+            best = max(corpus, key=lambda t: t.share_of_corpus_extreme)
+            rel: RelatednessResponse = self._call(self.llm_client, "relatedness", RELATEDNESS_SYSTEM_PROMPT,
+                                                  json.dumps({"description_a": main_explanation, "description_b": be.explanation}),
+                                                  RelatednessResponse)  # type: ignore[assignment]
+            ratio = (blind.share_of_corpus_extreme / best.share_of_corpus_extreme) if best.share_of_corpus_extreme > 0 else float("nan")
+            results.append(BundleBlindMaximumResult(
+                bundle_id=b.bundle_id, upstream_neurons=b.upstream_neurons, bundle_explanation=be.explanation,
+                blind_maximum=bm.blind_maximum, blind_max_activation_under_ablation=blind.peak_activation,
+                best_corpus_activation_under_ablation=best.peak_activation, ratio_to_corpus_under_ablation=ratio,
+                related_to_main_explanation=rel.related,
+            ))
+        return results
 
-            # Non-tokenized Vision / continuous tensor fallback if circuit_inputs is a float tensor (e.g. [B, C, H, W])
-            is_continuous_input = (
-                not tok_to_id
-                and isinstance(circuit_inputs, torch.Tensor)
-                and circuit_inputs.is_floating_point()
-            )
-            if is_continuous_input:
-                pos_input = circuit_inputs.to(device)
-                neg_input = -circuit_inputs.to(device)
-            else:
-                pos_fallback_ctx = None
-                neg_fallback_ctx = None
-                if profile and profile.top_positive_samples:
-                    top0_p_ctx = profile.top_positive_samples[0].context_str
-                    held_p_ctxs = [
-                        s.context_str
-                        for s in profile.top_positive_samples[1:]
-                        if s.context_str and s.context_str != top0_p_ctx
-                    ]
-                    pos_fallback_ctx = held_p_ctxs[0] if held_p_ctxs else top0_p_ctx
-                if profile and profile.top_negative_samples:
-                    top0_n_ctx = profile.top_negative_samples[0].context_str
-                    held_n_ctxs = [
-                        s.context_str
-                        for s in profile.top_negative_samples[1:]
-                        if s.context_str and s.context_str != top0_n_ctx
-                    ]
-                    neg_fallback_ctx = held_n_ctxs[0] if held_n_ctxs else top0_n_ctx
-
-                using_sentence_ctx = False
-                if (
-                    tokenizer is not None
-                    and hasattr(tokenizer, "encode")
-                    and pos_fallback_ctx
-                    and neg_fallback_ctx
-                ):
-                    p_ids = tokenizer.encode(pos_fallback_ctx, add_special_tokens=False) or [0]
-                    n_ids = tokenizer.encode(neg_fallback_ctx, add_special_tokens=False) or [0]
-                    pos_input = torch.tensor([p_ids], dtype=torch.long, device=device)
-                    neg_input = torch.tensor([n_ids], dtype=torch.long, device=device)
-                    using_sentence_ctx = pos_input.shape[-1] > 4 and neg_input.shape[-1] > 4
-                else:
-                    pos_input = self._encode_context_or_tokens(
-                        exp.positive_pole_test_tokens,
-                        tok_to_id,
-                        device=device,
-                        fallback_context=pos_fallback_ctx,
-                        tokenizer=tokenizer,
-                    )
-                    neg_input = self._encode_context_or_tokens(
-                        exp.negative_pole_test_tokens,
-                        tok_to_id,
-                        device=device,
-                        fallback_context=neg_fallback_ctx,
-                        tokenizer=tokenizer,
-                    )
-            if is_continuous_input:
-                using_sentence_ctx = False
-
-            prom_ids = self._resolve_token_ids(
-                exp.expected_promoted_tokens, tok_to_id, tokenizer=tokenizer
-            )
-            supp_ids = self._resolve_token_ids(
-                exp.expected_suppressed_tokens, tok_to_id, tokenizer=tokenizer
-            )
-
-            # Helper to capture single neuron activation on an input tensor
-            mod, hook_target, num_neurons = LayerDiscovery.resolve_module(model, layer_name)
-            is_conv2d = isinstance(mod, nn.Conv2d)
-            captured_acts: List[torch.Tensor] = []
-
-            def _cap_pre(_m: nn.Module, inp: Tuple[Any, ...]):
-                if inp and isinstance(inp[0], torch.Tensor):
-                    captured_acts.append(inp[0].detach())
-
-            def _cap_fwd(_m: nn.Module, _inp: Tuple[Any, ...], out: Any):
-                t = out[0] if isinstance(out, tuple) else out
-                if isinstance(t, torch.Tensor):
-                    captured_acts.append(t.detach())
-
-            def _extract_neuron_act(act_tensor: torch.Tensor) -> torch.Tensor:
-                if is_conv2d and act_tensor.ndim == 4:
-                    return act_tensor[:, neuron_idx, :, :].float()
-                return act_tensor[..., neuron_idx].float()
-
-            near_miss_mean = 0.0
-            distant_ctrl_mean = 0.0
-            blind_max_val = 0.0
-            pos_focal_idx = 0
-            neg_focal_idx = 0
-
-            h = (
-                mod.register_forward_pre_hook(_cap_pre)
-                if hook_target == "input"
-                else mod.register_forward_hook(_cap_fwd)
-            )
-            try:
-                with self.injector.without_interventions():
-                    clean_pos_out = model(pos_input)
-                    clean_pos_logits = (
-                        clean_pos_out.logits
-                        if hasattr(clean_pos_out, "logits")
-                        else clean_pos_out
-                    ).float()
-                    pos_act_tensor = _extract_neuron_act(captured_acts[-1])
-
-                    clean_neg_out = model(neg_input)
-                    clean_neg_logits = (
-                        clean_neg_out.logits
-                        if hasattr(clean_neg_out, "logits")
-                        else clean_neg_out
-                    ).float()
-                    neg_act_tensor = _extract_neuron_act(captured_acts[-1])
-
-                    if using_sentence_ctx:
-                        pos_seq = pos_act_tensor.reshape(-1)
-                        neg_seq = neg_act_tensor.reshape(-1)
-                        pos_focal_idx = int(pos_seq.argmax().item())
-                        neg_focal_idx = int(neg_seq.argmin().item())
-                        pos_act_mean = float(pos_seq[pos_focal_idx].item())
-                        neg_act_mean = float(neg_seq[neg_focal_idx].item())
-
-                        # In-context near-miss test: splice near-miss token into focal position AND
-                        # blend with a boundary/mixed prefix so both single-token detectors and
-                        # contextual routers experience a genuine intermediate counterfactual context.
-                        nm_vals: List[float] = []
-                        nm_tok_ids = self._resolve_token_ids(
-                            exp.near_miss_test_tokens, tok_to_id, tokenizer=tokenizer
-                        )
-                        if pos_input.shape[-1] > 1:
-                            spliced = pos_input.clone()
-                            rep_id = (
-                                nm_tok_ids[0]
-                                if nm_tok_ids
-                                else int(neg_input[0, neg_focal_idx].item())
-                            )
-                            spliced[0, pos_focal_idx] = rep_id
-                            model(spliced)
-                            spliced_seq = _extract_neuron_act(captured_acts[-1]).reshape(-1)
-                            nm_vals.append(float(spliced_seq[pos_focal_idx].item()))
-
-                        # Boundary context mixing negative prefix with positive focal window
-                        neg_half = neg_input[:, : max(1, neg_input.shape[-1] // 2)]
-                        pos_win_end = min(pos_input.shape[-1], pos_focal_idx + 1)
-                        pos_win_start = max(0, pos_focal_idx - 3)
-                        hybrid_in = torch.cat(
-                            [neg_half, pos_input[:, pos_win_start:pos_win_end]], dim=-1
-                        )
-                        model(hybrid_in)
-                        hybrid_seq = _extract_neuron_act(captured_acts[-1]).reshape(-1)
-                        nm_vals.append(float(hybrid_seq[-1].item()))
-                        near_miss_mean = sum(nm_vals) / len(nm_vals)
-
-                        # In-context distant-control test on negative sentence context
-                        dc_tok_ids = self._resolve_token_ids(
-                            exp.distant_control_tokens, tok_to_id, tokenizer=tokenizer
-                        )
-                        if dc_tok_ids and neg_input.shape[-1] > 1:
-                            dc_spliced = neg_input.clone()
-                            dc_spliced[0, neg_focal_idx] = dc_tok_ids[0]
-                            model(dc_spliced)
-                            dc_seq = _extract_neuron_act(captured_acts[-1]).reshape(-1)
-                            distant_ctrl_mean = float(
-                                min(dc_seq[neg_focal_idx].item(), neg_act_mean)
-                            )
-                        else:
-                            distant_ctrl_mean = neg_act_mean
-
-                        blind_max_val = pos_act_mean
-                    else:
-                        pos_act_mean = float(pos_act_tensor.mean().item())
-                        neg_act_mean = float(neg_act_tensor.mean().item())
-
-                        if not is_continuous_input and tok_to_id:
-                            if exp.near_miss_test_tokens:
-                                nm_in = self._encode_context_or_tokens(
-                                    exp.near_miss_test_tokens,
-                                    tok_to_id,
-                                    device=device,
-                                    tokenizer=tokenizer,
-                                )
-                                model(nm_in)
-                                near_miss_mean = float(
-                                    _extract_neuron_act(captured_acts[-1]).mean().item()
-                                )
-                            else:
-                                near_miss_mean = 0.5 * (pos_act_mean + neg_act_mean)
-
-                            if exp.distant_control_tokens:
-                                dc_in = self._encode_context_or_tokens(
-                                    exp.distant_control_tokens,
-                                    tok_to_id,
-                                    device=device,
-                                    tokenizer=tokenizer,
-                                )
-                                model(dc_in)
-                                distant_ctrl_mean = float(
-                                    _extract_neuron_act(captured_acts[-1]).mean().item()
-                                )
-                            else:
-                                distant_ctrl_mean = neg_act_mean
-
-                            if exp.blind_maximum_prompt:
-                                bm_in = self._encode_context_or_tokens(
-                                    exp.blind_maximum_prompt.split(),
-                                    tok_to_id,
-                                    device=device,
-                                    fallback_context=exp.blind_maximum_prompt,
-                                    tokenizer=tokenizer,
-                                )
-                                model(bm_in)
-                                blind_max_val = float(
-                                    _extract_neuron_act(captured_acts[-1]).max().item()
-                                )
-                            else:
-                                blind_max_val = pos_act_mean
-                        else:
-                            near_miss_mean = 0.0
-                            distant_ctrl_mean = neg_act_mean
-                            blind_max_val = pos_act_mean
-            finally:
-                h.remove()
-
-            prof_std = max(float(profile.std), 1e-6) if profile is not None else max(abs(pos_act_mean - neg_act_mean) * 0.5, 1e-6)
-            prof_max = max(float(profile.max_val), 1e-6) if (profile is not None and profile.max_val > 0) else max(pos_act_mean, 1e-6)
-            prof_min = float(profile.min_val) if (profile is not None and profile.min_val < 0) else min(neg_act_mean, -1e-3)
-
-            pole_sep_d = float((pos_act_mean - neg_act_mean) / prof_std)
-            pos_share_max = float(pos_act_mean / prof_max) if pos_act_mean > 0 else 0.0
-            blind_max_ratio = float(blind_max_val / prof_max) if blind_max_val > 0 else 0.0
-
-            pole_separation_passed = (
-                (pos_act_mean > 0.0)
-                and (neg_act_mean < 0.0)
-                and (pole_sep_d >= 0.75)
-                and (pos_share_max >= 0.25 or is_continuous_input)
-            )
-
-            # Falsification outcome ('won' | 'tied' | 'lost') & held-out simulation correlation
-            if (
-                pole_separation_passed
-                and pos_act_mean > near_miss_mean
-                and near_miss_mean > distant_ctrl_mean
-                and pos_share_max >= 0.30
-            ):
-                falsification_outcome = "won"
-            elif pole_separation_passed and pos_act_mean > distant_ctrl_mean:
-                falsification_outcome = "tied"
-            else:
-                falsification_outcome = "lost"
-
-            sim_corr = self._pearson_corr(
-                [1.0, 0.25, -1.0],
-                [pos_act_mean, near_miss_mean, distant_ctrl_mean],
-            )
-            branch_rel = self._compute_branch_relatedness(profile)
-
-            # Test 2: Zero-Ablation on Positive Input (Set neuron = 0.0)
-            ablate_spec = InterventionSpec(
-                layer_name=layer_name,
-                neuron_indices=[neuron_idx],
-                mode=InterventionMode.ZERO_ABLATE,
-                pole=PoleType.BOTH,
-                value=0.0,
-            )
-            with self.injector.temporary_interventions([ablate_spec]):
-                zero_pos_out = model(pos_input)
-                zero_pos_logits = (
-                    zero_pos_out.logits if hasattr(zero_pos_out, "logits") else zero_pos_out
-                ).float()
-
-            # Compute full-distribution KL divergence for target neuron vs random control neurons
-            clean_lp = F.log_softmax(clean_pos_logits, dim=-1)
-            clean_p = clean_lp.exp()
-            zero_lp = F.log_softmax(zero_pos_logits, dim=-1)
-            per_pos_kl = (clean_p * (clean_lp - zero_lp)).sum(dim=-1)
-            if using_sentence_ctx and per_pos_kl.ndim >= 2:
-                target_kl = float(
-                    max(per_pos_kl[0, pos_focal_idx].item(), per_pos_kl.max().item())
-                )
-            else:
-                target_kl = float(per_pos_kl.mean().item())
-
-            other_candidates = [i for i in range(num_neurons) if i != neuron_idx]
-            control_kls: List[float] = []
-            tracker = self.injector.get_stats_tracker(layer_name)
-            # Sample up to 3 control neurons across the layer and evaluate each on its OWN peak activating input
-            # (peak-matched null baseline) so random neurons do not look falsely specific on their own peak tokens.
-            if other_candidates:
-                stride_c = max(1, len(other_candidates) // 3)
-                sampled_controls = other_candidates[::stride_c][:3]
-                for c_idx in sampled_controls:
-                    c_input = pos_input
-                    c_clean_lp = clean_lp
-                    c_clean_p = clean_p
-                    if (
-                        not using_sentence_ctx
-                        and not is_continuous_input
-                        and tok_to_id
-                        and tracker is not None
-                        and tracker.pos_heaps.get(c_idx)
-                    ):
-                        c_top_toks = list(
-                            dict.fromkeys(
-                                item[2].token_str
-                                for item in sorted(
-                                    tracker.pos_heaps[c_idx], key=lambda x: x[0], reverse=True
-                                )[:3]
-                                if item[2].token_str
-                            )
-                        )
-                        if c_top_toks:
-                            c_input = self._encode_context_or_tokens(
-                                c_top_toks, tok_to_id, device=device, tokenizer=tokenizer
-                            )
-                            with self.injector.without_interventions():
-                                c_base_out = model(c_input)
-                                c_base_logits = (
-                                    c_base_out.logits
-                                    if hasattr(c_base_out, "logits")
-                                    else c_base_out
-                                ).float()
-                                c_clean_lp = F.log_softmax(c_base_logits, dim=-1)
-                                c_clean_p = c_clean_lp.exp()
-
-                    c_spec = InterventionSpec(
-                        layer_name=layer_name,
-                        neuron_indices=[c_idx],
-                        mode=InterventionMode.ZERO_ABLATE,
-                        pole=PoleType.BOTH,
-                        value=0.0,
-                    )
-                    with self.injector.temporary_interventions([c_spec]):
-                        c_out = model(c_input)
-                        c_logits = (c_out.logits if hasattr(c_out, "logits") else c_out).float()
-                        c_lp = F.log_softmax(c_logits, dim=-1)
-                        c_per_pos = (c_clean_p * (c_clean_lp - c_lp)).sum(dim=-1)
-                        if using_sentence_ctx and c_per_pos.ndim >= 2:
-                            c_kl = float(c_per_pos[0, pos_focal_idx].item())
-                        else:
-                            c_kl = float(c_per_pos.mean().item())
-                        control_kls.append(c_kl)
-            random_ctrl_kl = (
-                sorted(control_kls)[len(control_kls) // 2] if control_kls else 0.0
-            )
-            kl_vs_random_ratio = target_kl / max(random_ctrl_kl, 1e-15) if target_kl > 0 else 0.0
-
-            # Test 3A: Native-Scale Pole-Flip Clamping on Positive Input
-            # Clamps to the neuron's native negative scale (never an arbitrary out-of-distribution -5.0 on tiny noise)
-            clamp_neg_val = (
-                min(prof_min, -1.5 * prof_std)
-                if profile is not None
-                else min(neg_act_mean * 1.5, -abs(pos_act_mean))
-            )
-            clamp_spec = InterventionSpec(
-                layer_name=layer_name,
-                neuron_indices=[neuron_idx],
-                mode=InterventionMode.HARD_CLAMP,
-                pole=PoleType.BOTH,
-                value=clamp_neg_val,
-            )
-            with self.injector.temporary_interventions([clamp_spec]):
-                flip_pos_out = model(pos_input)
-                flip_pos_logits = (
-                    flip_pos_out.logits if hasattr(flip_pos_out, "logits") else flip_pos_out
-                ).float()
-
-            # Test 3B: Positive Neural Injection on Negative Input
-            # Injects the neuron's native positive peak onto the negative/neutral held-out context
-            clamp_pos_val = (
-                max(prof_max, 1.5 * prof_std)
-                if profile is not None
-                else max(pos_act_mean * 1.5, abs(neg_act_mean))
-            )
-            inject_pos_spec = InterventionSpec(
-                layer_name=layer_name,
-                neuron_indices=[neuron_idx],
-                mode=InterventionMode.HARD_CLAMP,
-                pole=PoleType.BOTH,
-                value=clamp_pos_val,
-            )
-            with self.injector.temporary_interventions([inject_pos_spec]):
-                inject_neg_out = model(neg_input)
-                inject_neg_logits = (
-                    inject_neg_out.logits
-                    if hasattr(inject_neg_out, "logits")
-                    else inject_neg_out
-                ).float()
-
-            # Compute logit shifts on expected promoted & suppressed tokens and normalize by vocabulary logit_std
-            logit_std = float(clean_pos_logits.std(dim=-1).mean().clamp(min=1e-12).item())
-            neg_logit_std = float(clean_neg_logits.std(dim=-1).mean().clamp(min=1e-12).item())
-            if prom_ids:
-                if using_sentence_ctx and clean_pos_logits.ndim == 3:
-                    pos_drops = (
-                        clean_pos_logits[:, :, prom_ids] - zero_pos_logits[:, :, prom_ids]
-                    ).mean(dim=-1)
-                    logit_drop = float(
-                        max(pos_drops[0, pos_focal_idx].item(), pos_drops.max().item())
-                    )
-                    neg_boosts = (
-                        inject_neg_logits[:, :, prom_ids] - clean_neg_logits[:, :, prom_ids]
-                    ).mean(dim=-1)
-                    pos_inject_boost = float(
-                        max(neg_boosts[0, neg_focal_idx].item(), neg_boosts.max().item())
-                    )
-                else:
-                    clean_prom = clean_pos_logits[..., prom_ids].mean().item()
-                    zero_prom = zero_pos_logits[..., prom_ids].mean().item()
-                    logit_drop = float(clean_prom - zero_prom)
-                    clean_neg_prom = clean_neg_logits[..., prom_ids].mean().item()
-                    inj_neg_prom = inject_neg_logits[..., prom_ids].mean().item()
-                    pos_inject_boost = float(inj_neg_prom - clean_neg_prom)
-            else:
-                logit_drop = 0.0
-                pos_inject_boost = 0.0
-
-            if supp_ids:
-                if using_sentence_ctx and clean_pos_logits.ndim == 3:
-                    supp_shifts = (
-                        flip_pos_logits[:, :, supp_ids] - clean_pos_logits[:, :, supp_ids]
-                    ).mean(dim=-1)
-                    pole_flip_shift = float(
-                        max(supp_shifts[0, pos_focal_idx].item(), supp_shifts.max().item())
-                    )
-                else:
-                    clean_supp = clean_pos_logits[..., supp_ids].mean().item()
-                    flip_supp = flip_pos_logits[..., supp_ids].mean().item()
-                    pole_flip_shift = float(flip_supp - clean_supp)
-            else:
-                pole_flip_shift = 0.0
-
-            z_logit_drop = logit_drop / logit_std
-            z_pole_flip = pole_flip_shift / logit_std
-            z_pos_inject = pos_inject_boost / neg_logit_std
-
-            # Test 4: Verify downstream circuit predictions if `dst_layer` is provided
-            has_circuit_test = bool(
-                dst_layer is not None
-                and (exp.expected_excited_dst_neurons or exp.expected_inhibited_dst_neurons)
-            )
-            circuit_match_ratio = 0.0
-            if has_circuit_test and dst_layer is not None:
-                traced = self.injector.trace_circuit(
-                    src_layer=layer_name,
-                    dst_layer=dst_layer,
-                    src_neuron=neuron_idx,
-                    inputs=pos_input,
-                    src_pole=PoleType.POSITIVE,
-                    compute_jacobian=False,
-                    top_k=32,
-                )
-                edge_map = {e.dst_neuron: e for e in traced.edges}
-                clean_mags = sorted(abs(e.clean_dst_mean) for e in traced.edges)
-                median_clean_mag = (
-                    clean_mags[len(clean_mags) // 2] if clean_mags else 1.0
-                )
-                matches = 0
-                total_expected = len(exp.expected_excited_dst_neurons) + len(
-                    exp.expected_inhibited_dst_neurons
-                )
-                for dst_n in exp.expected_excited_dst_neurons:
-                    e_obj = edge_map.get(dst_n)
-                    if e_obj is not None:
-                        thresh = max(
-                            0.02 * abs(e_obj.clean_dst_mean),
-                            0.02 * median_clean_mag,
-                            1e-6,
-                        )
-                        if e_obj.mean_causal_delta > thresh:
-                            matches += 1
-                for dst_n in exp.expected_inhibited_dst_neurons:
-                    e_obj = edge_map.get(dst_n)
-                    if e_obj is not None:
-                        thresh = max(
-                            0.02 * abs(e_obj.clean_dst_mean),
-                            0.02 * median_clean_mag,
-                            1e-6,
-                        )
-                        if e_obj.mean_causal_delta < -thresh:
-                            matches += 1
-                circuit_match_ratio = matches / max(total_expected, 1)
-
-            # Compute scale-invariant empirical verification score in [0.0, 1.0]
-            # Requires genuine causal specificity above the peak-matched random-neuron null
-            causal_specific = (
-                (kl_vs_random_ratio >= 2.0)
-                if other_candidates
-                else (
-                    abs(z_logit_drop) >= 0.05
-                    or abs(z_pole_flip) >= 0.05
-                    or abs(z_pos_inject) >= 0.05
-                )
-            )
-            if not causal_specific and falsification_outcome == "won":
-                falsification_outcome = "tied"
-
-            score = 0.0
-            if pole_separation_passed and causal_specific:
-                score += 0.35 if has_circuit_test else 0.45
-            elif pole_separation_passed:
-                score += 0.20
-            if causal_specific and (z_logit_drop > 0.02 or z_pos_inject > 0.02):
-                score += 0.25 if has_circuit_test else 0.30
-            if causal_specific and (z_pole_flip > 0.02 or z_pos_inject > 0.05):
-                score += 0.20 if has_circuit_test else 0.25
-            if has_circuit_test:
-                score += 0.20 * circuit_match_ratio
-
-            score = round(min(max(score, 0.0), 1.0), 3)
-
-            summary = (
-                f"Pole Separation: {'PASS' if pole_separation_passed else 'FAIL'} "
-                f"(+Test Act={pos_act_mean:+.3f}, -Test Act={neg_act_mean:+.3f}, d={pole_sep_d:.2f}, Falsification={falsification_outcome.upper()}) | "
-                f"Zero-Ablation Promoted Logit Drop={logit_drop:+.4f} (KL={target_kl:.4f} vs Null={random_ctrl_kl:.4f}) | "
-                f"Positive-Inject Promoted Boost={pos_inject_boost:+.4f} | "
-                f"Negative-Clamp Opposite Pole Boost={pole_flip_shift:+.4f} | "
-                f"Downstream Circuit Match={circuit_match_ratio * 100:.1f}%"
-            )
-
-            report = VerificationReport(
-                positive_test_mean_activation=round(pos_act_mean, 4),
-                negative_test_mean_activation=round(neg_act_mean, 4),
-                pole_separation_passed=pole_separation_passed,
-                zero_ablation_target_logit_drop=round(logit_drop, 4),
-                pole_flip_target_logit_shift=round(pole_flip_shift, 4),
-                downstream_circuit_match_ratio=round(circuit_match_ratio, 4),
-                empirical_verification_score=score,
-                summary_notes=summary,
-                standardized_pole_separation_d=round(pole_sep_d, 4),
-                positive_share_of_corpus_max=round(pos_share_max, 4),
-                blind_max_ratio_to_corpus_max=round(blind_max_ratio, 4),
-                near_miss_mean_activation=round(near_miss_mean, 4),
-                distant_control_mean_activation=round(distant_ctrl_mean, 4),
-                falsification_outcome=falsification_outcome,
-                random_neuron_control_kl=round(random_ctrl_kl, 6),
-                target_neuron_ablation_kl=round(target_kl, 6),
-                causal_kl_vs_random_ratio=round(kl_vs_random_ratio, 4),
-                held_out_simulation_correlation=round(sim_corr, 4),
-                branch_relatedness_score=round(branch_rel, 4),
-                positive_injection_target_logit_boost=round(pos_inject_boost, 4),
-            )
-            hypothesis.verification_report = report
-            return report
-        finally:
-            if was_training:
-                model.train()
-
+    # ------------------------------------------------------------------
+    # End to end
+    # ------------------------------------------------------------------
     def explain_and_verify(
         self,
         layer_name: str,
         neuron_idx: int,
-        tok_to_id: Dict[str, int],
-        idx_to_token: Dict[int, str],
-        unembed_weight: Optional[torch.Tensor] = None,
-        dst_layer: Optional[str] = None,
-        circuit_inputs: Optional[Any] = None,
         tokenizer: Optional[Any] = None,
+        encode_fn: Optional[EncodeFn] = None,
+        decode_fn: Optional[Callable[[List[int]], str]] = None,
+        unembed_weight: Optional[torch.Tensor] = None,
+        idx_to_token: Optional[Dict[int, str]] = None,
+        dst_layer: Optional[str] = None,
         src_layer: Optional[str] = None,
+        circuit_inputs: Optional[Any] = None,
+        steering_prompts: Optional[Sequence[str]] = None,
+        steering_tokens: int = 24,
+        n_control_neurons: int = 8,
+        run_bundles: bool = False,
+        bundle_src_layer: Optional[str] = None,
+        max_context_chars: Optional[int] = None,
+        forward_fn: Callable = default_forward,
+        seed: int = 0,
     ) -> BipolarVerbHypothesis:
+        inj = self.injector
+        if encode_fn is None:
+            if tokenizer is None:
+                raise ValueError("Testing explanations needs `tokenizer` or `encode_fn` to turn texts into inputs.")
+            encode_fn = self._default_encode(tokenizer)
+        if decode_fn is None and tokenizer is not None:
+            decode_fn = lambda ids: tokenizer.decode(ids)
+        if unembed_weight is None and hasattr(inj.model, "get_output_embeddings"):
+            emb = inj.model.get_output_embeddings()
+            unembed_weight = emb.weight if emb is not None else None
+        if idx_to_token is None and tokenizer is not None and unembed_weight is not None:
+            idx_to_token = _LazyVocab(tokenizer)
+        profile = inj.get_neuron_profile(layer_name, neuron_idx, unembed_weight=unembed_weight, idx_to_token=idx_to_token)
+
+        circuits: Dict[str, Any] = {}
+        if circuit_inputs is not None:
+            if dst_layer is not None:
+                for pole in (PoleType.POSITIVE, PoleType.NEGATIVE):
+                    try:
+                        g = inj.trace_circuit(layer_name, dst_layer, neuron_idx, circuit_inputs, src_pole=pole, compute_jacobian=False)
+                        circuits[f"downstream_from_{pole.value}_pole"] = g.to_agent_payload()
+                    except ValueError:
+                        pass
+            if src_layer is not None:
+                for pole in (PoleType.POSITIVE, PoleType.NEGATIVE):
+                    try:
+                        g = inj.trace_incoming_circuit(src_layer, layer_name, neuron_idx, circuit_inputs, dst_pole=pole)
+                        circuits[f"upstream_into_{pole.value}_pole"] = g.to_incoming_agent_payload()
+                    except (ValueError, NotImplementedError):
+                        pass
+
+        steering: Dict[str, str] = {}
+        if steering_prompts and decode_fn is not None:
+            steering = self.steering_continuations(layer_name, neuron_idx, profile, steering_prompts, steering_tokens, encode_fn, decode_fn)
+
+        neighbors = inj.ecology_map.get_neighbor_contexts(layer_name, neuron_idx)
+        evidence = self.build_evidence_payload(profile, circuits, neighbors, steering, max_context_chars)
+        ex: ExplanationResponse = self._call(self.llm_client, "explainer", EXPLAINER_SYSTEM_PROMPT, json.dumps(evidence), ExplanationResponse)  # type: ignore[assignment]
+
+        hyp = BipolarVerbHypothesis(
+            layer_name=layer_name, neuron_idx=neuron_idx,
+            positive_pole_motif=ex.positive_pole_explanation, negative_pole_motif=ex.negative_pole_explanation,
+            unified_verb_hypothesis=ex.unified_explanation, recursive_offshoots=list(ex.recursive_offshoots),
+            pos_taxonomy=ex.positive_pole_taxonomy, neg_taxonomy=ex.negative_pole_taxonomy,
+            confidence_score=ex.confidence, neighbor_clues_used=len(neighbors),
+        )
+
+        for pole, text, tax, ext in (
+            (PoleType.POSITIVE, ex.positive_pole_explanation, ex.positive_pole_taxonomy, profile.max_val),
+            (PoleType.NEGATIVE, ex.negative_pole_explanation, ex.negative_pole_taxonomy, profile.min_val),
+        ):
+            if not text.strip() or tax in (NeuronTaxonomy.NOT_YET_UNDERSTOOD, NeuronTaxonomy.UNEXPLAINED) or ext == 0.0:
+                continue
+            suite = self.write_test_suite(pole, text)
+            hyp.test_suites[pole.value] = suite
+            hyp.verification[pole.value] = self.verify_pole(layer_name, neuron_idx, suite, ext, encode_fn, forward_fn)
+
+        pos_suite = hyp.test_suites.get(PoleType.POSITIVE.value) or hyp.test_suites.get(PoleType.NEGATIVE.value)
+        if pos_suite is not None and n_control_neurons > 0:
+            hyp.causal_checks = self.causal_checks(layer_name, neuron_idx, pos_suite.positive_examples, encode_fn,
+                                                   n_control_neurons, seed, forward_fn)
+            hyp.causal_checks.steering_generations = steering
+
+        if run_bundles:
+            src = bundle_src_layer or src_layer
+            if src is None:
+                raise ValueError("run_bundles needs `bundle_src_layer` (or `src_layer`).")
+            for pole, text in ((PoleType.POSITIVE, ex.positive_pole_explanation), (PoleType.NEGATIVE, ex.negative_pole_explanation)):
+                if pole.value in hyp.verification:
+                    hyp.bundle_results.extend(
+                        self.run_bundle_blind_maximum(layer_name, neuron_idx, src, profile, text, pole, encode_fn, forward_fn)
+                    )
+        inj.ecology_map.register_hypothesis(hyp)
+        return hyp
+
+    # ------------------------------------------------------------------
+    # Crossword
+    # ------------------------------------------------------------------
+    def solve_circuit_ecology(self, seed_neurons: List[Tuple[str, int]], neighbor_layers: List[str],
+                              circuit_inputs_fn: Callable[[str, int], Any], max_pass2_neurons: int = 8,
+                              edges_per_neuron: int = 4, **explain_kwargs: Any) -> LayerEcologySolveReport:
         """
-        Full end-to-end closed-loop agentic workflow:
-          1. Extracts the audited NeuronPoleProfile (+ Direct Logit Attribution + Quantile Buckets).
-          2. Optionally traces the downstream circuit to `dst_layer` (both +Pole and -Pole) and
-             incoming upstream circuit from `src_layer`.
-          3. Queries `self.injector.ecology_map` for already-verified upstream/downstream/sibling neighbor clues.
-          4. Synthesizes a BipolarVerbHypothesis via the LLM Agent and empirically verifies it.
-          5. Demotes unverified/falsified hypotheses so background noise neurons are never labeled
-             `CLEAN_MONOSEMANTIC`, and registers the result into `self.injector.ecology_map`.
+        Pass 1 explains the seed neurons and traces their real circuit edges into `neighbor_layers`
+        (downstream for later layers, upstream for earlier ones) on `circuit_inputs_fn(layer, neuron)`.
+        Pass 2 explains the most strongly connected unexplained neurons, whose evidence then contains
+        the pass-1 explanations of their traced neighbours.
         """
-        profile = self.injector.get_neuron_profile(
-            layer_name=layer_name,
-            neuron_idx=neuron_idx,
-            unembed_weight=unembed_weight,
-            idx_to_token=idx_to_token,
-        )
+        inj = self.injector
+        order = list(inj.list_targetable_layers().keys())
+        report = LayerEcologySolveReport(layer_names=sorted({l for l, _ in seed_neurons} | set(neighbor_layers)),
+                                         pass1_neurons=list(seed_neurons), pass2_neurons=[])
+        for layer, idx in seed_neurons:
+            h = inj.explain_neuron(layer, idx, **explain_kwargs)
+            report.hypotheses[(layer, idx)] = h
+            report.clues_injected[(layer, idx)] = h.neighbor_clues_used
+            inputs = circuit_inputs_fn(layer, idx)
+            for nl in neighbor_layers:
+                if nl == layer or nl not in order or layer not in order:
+                    continue
+                try:
+                    if order.index(nl) > order.index(layer):
+                        inj.trace_circuit(layer, nl, idx, inputs, compute_jacobian=False, top_k=edges_per_neuron)
+                    else:
+                        inj.trace_incoming_circuit(nl, layer, idx, inputs, top_k=edges_per_neuron)
+                except (ValueError, NotImplementedError):
+                    continue
+        cands: Dict[Tuple[str, int], float] = {}
+        for layer, idx in seed_neurons:
+            for l2, i2, d in inj.ecology_map.connected_neurons(layer, idx, edges_per_neuron):
+                if (l2, i2) not in report.hypotheses and inj.is_layer_audited(l2):
+                    cands[(l2, i2)] = max(cands.get((l2, i2), 0.0), abs(d))
+        for key in sorted(cands, key=lambda k: cands[k], reverse=True)[:max_pass2_neurons]:
+            h = inj.explain_neuron(key[0], key[1], **explain_kwargs)
+            report.pass2_neurons.append(key)
+            report.hypotheses[key] = h
+            report.clues_injected[key] = h.neighbor_clues_used
+        return report
 
-        trace_inputs = circuit_inputs
-        if (
-            trace_inputs is None
-            and (dst_layer is not None or src_layer is not None)
-            and profile.top_positive_samples
-        ):
-            device = next(self.injector.model.parameters()).device
-            top0 = profile.top_positive_samples[0]
-            if tokenizer is not None and hasattr(tokenizer, "encode") and top0.context_str:
-                t_ids = tokenizer.encode(top0.context_str, add_special_tokens=False) or [0]
-                trace_inputs = torch.tensor([t_ids], dtype=torch.long, device=device)
-            elif tok_to_id:
-                tok_cands = [s.token_str for s in profile.top_positive_samples[:3] if s.token_str]
-                trace_inputs = self._encode_context_or_tokens(
-                    tok_cands,
-                    tok_to_id,
-                    device=device,
-                    fallback_context=top0.context_str,
-                    tokenizer=tokenizer,
-                )
 
-        circuit: Optional[CircuitGraph] = None
-        negative_circuit: Optional[CircuitGraph] = None
-        if dst_layer is not None and trace_inputs is not None:
-            circuit = self.injector.trace_circuit(
-                src_layer=layer_name,
-                dst_layer=dst_layer,
-                src_neuron=neuron_idx,
-                inputs=trace_inputs,
-                src_pole=PoleType.POSITIVE,
-                compute_jacobian=True,
-                top_k=8,
-            )
-            if profile.negative_firing_rate > 0.0:
-                negative_circuit = self.injector.trace_circuit(
-                    src_layer=layer_name,
-                    dst_layer=dst_layer,
-                    src_neuron=neuron_idx,
-                    inputs=trace_inputs,
-                    src_pole=PoleType.NEGATIVE,
-                    compute_jacobian=False,
-                    top_k=6,
-                )
+class _LazyVocab(dict):
+    """idx -> decoded token string, decoded on demand."""
 
-        upstream_circuit: Optional[CircuitGraph] = None
-        if src_layer is not None and trace_inputs is not None:
-            upstream_circuit = self.injector.trace_incoming_circuit(
-                src_layer=src_layer,
-                dst_layer=layer_name,
-                dst_neuron=neuron_idx,
-                inputs=trace_inputs,
-                dst_pole=PoleType.POSITIVE,
-                top_k=6,
-            )
+    def __init__(self, tokenizer: Any):
+        super().__init__()
+        self._tok = tokenizer
 
-        neighbors: List[EcologyNeighborContext] = []
-        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
-            neighbors = self.injector.ecology_map.get_neighbor_contexts(layer_name, neuron_idx)
+    def __bool__(self) -> bool:
+        return True
 
-        hypothesis = self.generate_hypothesis(
-            profile,
-            circuit,
-            ecology_neighbors=neighbors,
-            upstream_circuit=upstream_circuit,
-            negative_circuit=negative_circuit,
-        )
-        rep = self.verify_hypothesis(
-            hypothesis,
-            tok_to_id=tok_to_id,
-            dst_layer=dst_layer,
-            profile=profile,
-            tokenizer=tokenizer,
-            circuit_inputs=circuit_inputs,
-        )
-
-        # Calibrate final taxonomy based on empirical verification & branch relatedness
-        if rep.empirical_verification_score < 0.60 or not rep.pole_separation_passed:
-            if rep.target_neuron_ablation_kl < 1e-3 and profile.std < 0.5:
-                hypothesis.taxonomy_class = NeuronTaxonomy.DEAD_OR_NOISY
-            else:
-                hypothesis.taxonomy_class = NeuronTaxonomy.TRUE_POLYSEMANTIC
-        elif (
-            rep.empirical_verification_score >= 0.85
-            and rep.falsification_outcome == "won"
-            and rep.positive_share_of_corpus_max >= 0.45
-        ):
-            hypothesis.taxonomy_class = NeuronTaxonomy.CLEAN_MONOSEMANTIC
-        elif (
-            hypothesis.taxonomy_class
-            in (NeuronTaxonomy.UNVERIFIED, NeuronTaxonomy.TRUE_POLYSEMANTIC)
-            and rep.empirical_verification_score >= 0.65
-            and rep.falsification_outcome == "won"
-        ):
-            if rep.branch_relatedness_score >= 0.25 and len(hypothesis.recursive_offshoots) >= 2:
-                hypothesis.taxonomy_class = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE
-            else:
-                hypothesis.taxonomy_class = NeuronTaxonomy.CLEAN_MONOSEMANTIC
-
-        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
-            self.injector.ecology_map.register_hypothesis(hypothesis)
-        return hypothesis
+    def get(self, key: int, default: Any = None) -> Any:  # type: ignore[override]
+        if key not in self:
+            try:
+                self[key] = self._tok.decode([key])
+            except Exception:
+                return default
+        return super().get(key, default)

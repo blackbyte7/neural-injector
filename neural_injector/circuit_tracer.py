@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+import math
+import random
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.autograd.forward_ad as fwAD
@@ -9,15 +11,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.hooks import RemovableHandle
 
-from .discovery import LayerDiscovery, _SlicedLinearView
+from .discovery import LayerDiscovery
+from .hooks import HookSet, default_forward, extract_logits, flat_neuron_view, valid_position_mask
 from .types import (
     CircuitEdge,
     CircuitGraph,
-    DownstreamReadoutReport,
+    CombinationReadoutReport,
     InterventionMode,
     InterventionSpec,
     PoleType,
-    ResidualSinkEntry,
+    ResidualCoordinateEntry,
     ResidualSinkReport,
     UpstreamAttributionBundle,
 )
@@ -25,13 +28,12 @@ from .types import (
 if TYPE_CHECKING:
     from .injector import NeuralInjector
 
+_ATTN_READER_LEAVES = ("q_proj", "k_proj", "v_proj", "qkv_proj", "c_attn", "query", "key", "value", "query_key_value", "Wqkv")
+_ATTN_NORM_NAMES = ("input_layernorm", "ln_1", "pre_attention_layernorm", "attention_norm", "layernorm_before", "norm1")
+
 
 def _sdpa_math_context():
-    """
-    Context manager forcing PyTorch's scaled_dot_product_attention to use the math backend
-    during Forward-Mode AD (`fwAD.dual_level()`), avoiding FlashAttention / Memory-Efficient
-    fused kernel errors on dual tensors.
-    """
+    """Forward-mode AD through scaled_dot_product_attention needs the math kernel."""
     try:
         if hasattr(torch.nn, "attention") and hasattr(torch.nn.attention, "sdpa_kernel"):
             return torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH)
@@ -40,1827 +42,801 @@ def _sdpa_math_context():
     return nullcontext()
 
 
+def _pole_mask(col: torch.Tensor, pole: PoleType) -> torch.Tensor:
+    if pole == PoleType.POSITIVE:
+        return col > 0
+    if pole == PoleType.NEGATIVE:
+        return col < 0
+    return col != 0
+
+
 class CircuitTracer:
-    """
-    Traces structural and causal neuron-to-neuron circuits across layers (both
-    downstream L_src -> L_dst and incoming upstream L_src -> dst_neuron).
-    Designed around the 'Neural Networks Are Already Clean' paradigm:
-    treats individual neuron poles as interpretable routing units ('verbs')
-    and measures how an upstream pole excites, inhibits, or gates downstream neurons.
+    """Static (virtual weight) and causal (ablation, Jacobian, attribution) neuron-to-neuron tracing."""
 
-    Uses Single-Pass Forward-Mode Automatic Differentiation (`torch.autograd.forward_ad`)
-    to compute exact Jacobians d(A_dst)/d(a_src) across all downstream neurons and layers
-    simultaneously in a single forward pass, and reverse-mode vector-Jacobian products
-    for incoming circuit decomposition and upstream attribution bundle clustering.
-    """
-
-    def __init__(self, injector: NeuralInjector):
+    def __init__(self, injector: "NeuralInjector"):
         self.injector = injector
         self.model = injector.model
 
-    # -------------------------------------------------------------------------
-    # 1. Static Structural Virtual Weights (Downstream & Incoming)
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. Virtual weights
+    # ------------------------------------------------------------------
+    def _dst_norm_scale(self, dst_layer: str, d_model: int, device: torch.device) -> Optional[torch.Tensor]:
+        norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, LayerDiscovery.split_expert_layer_name(dst_layer)[0])
+        return LayerDiscovery.extract_norm_scale(norm, d_model=d_model, device=device)
+
     @torch.no_grad()
-    def compute_virtual_weights(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        src_neuron: int,
-        apply_pre_norm_scaling: bool = True,
-        expert_idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def compute_virtual_weights(self, src_layer: str, dst_layer: str, src_neuron: int,
+                                apply_pre_norm_scaling: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Computes the direct residual-stream virtual weights from `src_neuron` in `src_layer`
-        to all neurons in `dst_layer`.
-
-        Returns three 1D tensors of shape [num_dst_neurons]:
-          - virtual_up:   <W_up^{(dst)}[j, :], W_down^{(src)}[:, src_neuron]>
-          - virtual_gate: <W_gate^{(dst)}[j, :], W_down^{(src)}[:, src_neuron]> (zeros if non-gated MLP)
-          - cos_sim:      Cosine similarity between src write vector and dst read vector
+        Direct-path coupling from src neuron i to every dst neuron j through the residual stream:
+          up:   <W_up_dst[j] ⊙ gamma, W_down_src[:, i]>,  gate: <W_gate_dst[j] ⊙ gamma, W_down_src[:, i]>,
+          cos:  cosine between the write vector and the value read vector.
+        gamma is the destination's pre-MLP norm scale (the norm's data-dependent denominator is ignored).
         """
-        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
-        dst_write_mod, dst_up_mod, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(
-            self.model, dst_layer
-        )
-        _, _, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
-
-        try:
-            device = next(self.model.parameters()).device
-        except StopIteration:
-            device = torch.device("cpu")
-        zeros = torch.zeros(num_dst, dtype=torch.float32, device=device)
-
-        if not hasattr(src_write_mod, "weight"):
-            return zeros, zeros, zeros
-
-        # Extract outgoing vector written into residual stream by src_neuron: shape [d_model]
-        w_src = src_write_mod.weight.detach()
-        if w_src.ndim == 3:
-            # 3D MoE down_proj: [num_experts, d_model, d_mlp]
-            if expert_idx is not None and 0 <= expert_idx < w_src.shape[0]:
-                src_vec = w_src[expert_idx, :, src_neuron].to(dtype=torch.float32)
-            else:
-                src_vec = w_src[:, :, src_neuron].mean(dim=0).to(dtype=torch.float32)
-        elif src_write_mod.__class__.__name__ == "Conv1D":
-            src_vec = w_src[src_neuron, :].to(dtype=torch.float32)
-        else:
-            # Standard Linear down_proj: shape [d_model, d_mlp]
-            if src_neuron < w_src.shape[1]:
-                src_vec = w_src[:, src_neuron].to(dtype=torch.float32)
-            else:
-                src_vec = w_src[src_neuron, :].to(dtype=torch.float32)
-
-        target_device = src_vec.device
-        zeros = zeros.to(target_device)
-
-        # Optionally apply the destination block's pre-MLP RMSNorm / LayerNorm weight scaling gamma
-        # (including Gemma's 1.0 + weight offset via LayerDiscovery.extract_norm_scale)
+        w = LayerDiscovery.neuron_write_vectors(self.model, src_layer)
+        up, gate = LayerDiscovery.neuron_read_vectors(self.model, dst_layer)
+        if w is None or up is None:
+            raise ValueError(f"Virtual weights need a write matrix for '{src_layer}' and read matrix for '{dst_layer}'.")
+        v = w[src_neuron].float()
+        up = up.float().to(v.device)
         if apply_pre_norm_scaling:
-            pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, dst_layer)
-            norm_w = LayerDiscovery.extract_norm_scale(
-                pre_norm,
-                d_model=src_vec.shape[0],
-                device=target_device,
-                dtype=torch.float32,
-            )
-            if norm_w is not None and norm_w.shape == src_vec.shape:
-                src_vec = src_vec * norm_w
-
-        read_mod = dst_up_mod if dst_up_mod is not None else dst_write_mod
-        if read_mod is None or not hasattr(read_mod, "weight"):
-            return zeros, zeros, zeros
-
-        w_up = read_mod.weight.detach().to(device=target_device, dtype=torch.float32)
-        if w_up.ndim == 3:
-            # 3D MoE up_proj: [num_experts, d_mlp, d_model]
-            if expert_idx is not None and 0 <= expert_idx < w_up.shape[0]:
-                w_up = w_up[expert_idx]
-            else:
-                w_up = w_up.mean(dim=0)
-        elif read_mod.__class__.__name__ == "Conv1D":
-            # [d_model, d_mlp] -> transpose to [d_mlp, d_model]
-            w_up = w_up.T
-
-        if w_up.shape[1] != src_vec.shape[0]:
-            return zeros, zeros, zeros
-
-        # Compute dot products and cosine similarities with all downstream neurons
-        virtual_up = torch.mv(w_up, src_vec)
-        src_norm = F.normalize(src_vec.unsqueeze(0), dim=-1).squeeze(0)
-        up_norm = F.normalize(w_up, dim=-1)
-        cos_sim = torch.mv(up_norm, src_norm)
-
-        if dst_gate_mod is not None and hasattr(dst_gate_mod, "weight"):
-            w_gate = dst_gate_mod.weight.detach().to(device=target_device, dtype=torch.float32)
-            if w_gate.ndim == 3:
-                if expert_idx is not None and 0 <= expert_idx < w_gate.shape[0]:
-                    w_gate = w_gate[expert_idx]
-                else:
-                    w_gate = w_gate.mean(dim=0)
-            elif dst_gate_mod.__class__.__name__ == "Conv1D":
-                w_gate = w_gate.T
-            virtual_gate = (
-                torch.mv(w_gate, src_vec) if w_gate.shape[1] == src_vec.shape[0] else zeros
-            )
-        else:
-            virtual_gate = zeros
-
-        return virtual_up, virtual_gate, cos_sim
+            g = self._dst_norm_scale(dst_layer, v.shape[0], v.device)
+            if g is not None:
+                v = v * g
+        vu = up @ v
+        cos = F.normalize(up, dim=-1) @ F.normalize(v, dim=0)
+        vg = gate.float().to(v.device) @ v if gate is not None else torch.zeros_like(vu)
+        return vu, vg, cos
 
     @torch.no_grad()
-    def compute_incoming_virtual_weights(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        dst_neuron: int,
-        apply_pre_norm_scaling: bool = True,
-        expert_idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Computes incoming virtual weights from ALL neurons in `src_layer` into a single
-        target `dst_neuron` in `dst_layer`.
-
-        Returns three 1D tensors of shape [num_src_neurons]:
-          - virtual_up:   <W_up^{(dst)}[dst_neuron, :], W_down^{(src)}[:, i]>
-          - virtual_gate: <W_gate^{(dst)}[dst_neuron, :], W_down^{(src)}[:, i]>
-          - cos_sim:      Cosine similarity between each src write vector and dst_neuron's read vector
-        """
-        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
-        dst_write_mod, dst_up_mod, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(
-            self.model, dst_layer
-        )
-        _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
-
-        try:
-            device = next(self.model.parameters()).device
-        except StopIteration:
-            device = torch.device("cpu")
-        zeros = torch.zeros(num_src, dtype=torch.float32, device=device)
-
-        if not hasattr(src_write_mod, "weight"):
-            return zeros, zeros, zeros
-
-        # Extract all src write columns: shape [d_model, num_src]
-        w_src = src_write_mod.weight.detach()
-        if w_src.ndim == 3:
-            if expert_idx is not None and 0 <= expert_idx < w_src.shape[0]:
-                w_down = w_src[expert_idx].to(dtype=torch.float32)
-            else:
-                w_down = w_src.mean(dim=0).to(dtype=torch.float32)
-        elif src_write_mod.__class__.__name__ == "Conv1D":
-            w_down = w_src.T.to(dtype=torch.float32)
-        else:
-            w_down = w_src.to(dtype=torch.float32)
-
-        target_device = w_down.device
-        zeros = zeros.to(target_device)
-
+    def compute_incoming_virtual_weights(self, src_layer: str, dst_layer: str, dst_neuron: int,
+                                         apply_pre_norm_scaling: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        w = LayerDiscovery.neuron_write_vectors(self.model, src_layer)
+        up, gate = LayerDiscovery.neuron_read_vectors(self.model, dst_layer)
+        if w is None or up is None:
+            raise ValueError("Incoming virtual weights need write/read matrices.")
+        W = w.float()
         if apply_pre_norm_scaling:
-            pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, dst_layer)
-            norm_w = LayerDiscovery.extract_norm_scale(
-                pre_norm,
-                d_model=w_down.shape[0],
-                device=target_device,
-                dtype=torch.float32,
-            )
-            if norm_w is not None and norm_w.shape[0] == w_down.shape[0]:
-                w_down = w_down * norm_w.unsqueeze(1)
+            g = self._dst_norm_scale(dst_layer, W.shape[1], W.device)
+            if g is not None:
+                W = W * g.unsqueeze(0)
+        r = up[dst_neuron].float().to(W.device)
+        vu = W @ r
+        cos = F.normalize(W, dim=-1) @ F.normalize(r, dim=0)
+        vg = W @ gate[dst_neuron].float().to(W.device) if gate is not None else torch.zeros_like(vu)
+        return vu, vg, cos
 
-        read_mod = dst_up_mod if dst_up_mod is not None else dst_write_mod
-        if read_mod is None or not hasattr(read_mod, "weight"):
-            return zeros, zeros, zeros
-
-        w_up = read_mod.weight.detach().to(device=target_device, dtype=torch.float32)
-        if w_up.ndim == 3:
-            if expert_idx is not None and 0 <= expert_idx < w_up.shape[0]:
-                w_up = w_up[expert_idx]
-            else:
-                w_up = w_up.mean(dim=0)
-        elif read_mod.__class__.__name__ == "Conv1D":
-            w_up = w_up.T
-
-        if w_up.shape[1] != w_down.shape[0] or dst_neuron >= w_up.shape[0]:
-            return zeros, zeros, zeros
-
-        dst_up_vec = w_up[dst_neuron, :]  # [d_model]
-        virtual_up = torch.mv(w_down.T, dst_up_vec)
-
-        dst_up_norm = F.normalize(dst_up_vec.unsqueeze(0), dim=-1).squeeze(0)
-        w_down_norm = F.normalize(w_down.T, dim=-1)
-        cos_sim = torch.mv(w_down_norm, dst_up_norm)
-
-        if dst_gate_mod is not None and hasattr(dst_gate_mod, "weight"):
-            w_gate = dst_gate_mod.weight.detach().to(device=target_device, dtype=torch.float32)
-            if w_gate.ndim == 3:
-                if expert_idx is not None and 0 <= expert_idx < w_gate.shape[0]:
-                    w_gate = w_gate[expert_idx]
-                else:
-                    w_gate = w_gate.mean(dim=0)
-            elif dst_gate_mod.__class__.__name__ == "Conv1D":
-                w_gate = w_gate.T
-            if w_gate.shape[1] == w_down.shape[0] and dst_neuron < w_gate.shape[0]:
-                virtual_gate = torch.mv(w_down.T, w_gate[dst_neuron, :])
-            else:
-                virtual_gate = zeros
-        else:
-            virtual_gate = zeros
-
-        return virtual_up, virtual_gate, cos_sim
-
-    # -------------------------------------------------------------------------
-    # 2. Single-Pass Forward-Mode AD Multi-Layer Jacobian Tracer
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 2. Forward-mode AD
+    # ------------------------------------------------------------------
     @torch.no_grad()
-    def trace_forward_ad_all_layers(
-        self,
-        src_layer: str,
-        src_neuron: int,
-        inputs: Any,
-        dst_layers: Optional[List[str]] = None,
-        src_pole: PoleType = PoleType.POSITIVE,
-        active_threshold: float = 1e-5,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        position_mode: str = "all_active",
-    ) -> Dict[str, torch.Tensor]:
+    def trace_forward_ad_all_layers(self, src_layer: str, src_neuron: int, inputs: Any, dst_layers: Optional[List[str]] = None,
+                                    src_pole: PoleType = PoleType.POSITIVE, forward_fn: Optional[Callable] = None,
+                                    position_mode: str = "all_active") -> Dict[str, torch.Tensor]:
         """
-        Attaches a forward-mode autograd dual tangent `tangent = one_hot(src_neuron)`
-        at `src_layer` inside `torch.autograd.forward_ad.dual_level()`.
-        A single forward pass computes the exact Jacobian sensitivity vector
-        `d(A_dst) / d(a_{src_layer, src_neuron})` across EVERY downstream layer and
-        every downstream neuron simultaneously!
-          - `position_mode="all_active"` (default): seeds the tangent across all active positions
-            where `src_neuron` fires in `src_pole`.
-          - `position_mode="focal_token"`: seeds the tangent strictly at the single peak-activating
-            token position `t*`, eliminating cross-token attention JVP mixing.
-        Includes automatic SDPA math-kernel wrapping and reverse-mode autograd fallback.
+        One forward pass with a tangent on the source neuron gives d(A_dst)/d(a_src) for every neuron
+        of every listed downstream layer: mean over the seeded positions of the summed tangent.
+        `position_mode="focal_token"` seeds only the position of the source's strongest pole activation.
         """
-        run_fwd = forward_fn or (lambda m, inp: m(inp))
-        all_discovered = self.injector.list_targetable_layers()
+        run = forward_fn or default_forward
+        all_layers = list(self.injector.list_targetable_layers().keys())
         if dst_layers is None:
-            layer_keys = list(all_discovered.keys())
-            if src_layer in layer_keys:
-                src_pos = layer_keys.index(src_layer)
-                target_dst_layers = layer_keys[src_pos + 1:]
+            dst_layers = all_layers[all_layers.index(src_layer) + 1:] if src_layer in all_layers else []
+        hs = HookSet(self.model)
+        src_site = hs.site(src_layer)
+        if src_site.target == "moe_expert":
+            raise NotImplementedError("Forward-mode AD from routed MoE expert neurons is not supported.")
+        mask_holder: List[torch.Tensor] = []
+        out: Dict[str, torch.Tensor] = {}
+
+        def _seed(act: torch.Tensor, _g: Optional[torch.Tensor]) -> torch.Tensor:
+            flat = flat_neuron_view(act.detach(), src_site.is_conv2d)
+            col = flat[:, src_neuron]
+            if position_mode == "focal_token":
+                score = col if src_pole == PoleType.POSITIVE else (-col if src_pole == PoleType.NEGATIVE else col.abs())
+                m = torch.zeros_like(col, dtype=torch.bool)
+                m[int(score.argmax())] = True
             else:
-                target_dst_layers = [k for k in layer_keys if k != src_layer]
-        else:
-            target_dst_layers = list(dst_layers)
-
-        src_mod, src_target, _ = LayerDiscovery.resolve_module(self.model, src_layer)
-        is_src_conv = isinstance(src_mod, nn.Conv2d)
-
-        active_count_holder: List[int] = [1]
-        active_mask_holder: List[torch.Tensor] = []
-        captured_tangents: Dict[str, torch.Tensor] = {}
-        handles: List[RemovableHandle] = []
-
-        def _make_dual_on_src(t: torch.Tensor) -> torch.Tensor:
-            if not t.is_floating_point():
-                return t
-            if is_src_conv and t.ndim == 4:
-                src_flat = t.permute(0, 2, 3, 1).reshape(-1, t.shape[1])
+                m = _pole_mask(col, src_pole)
+            mask_holder.append(m)
+            tan = torch.zeros_like(flat)
+            tan[m, src_neuron] = 1.0
+            if src_site.is_conv2d and act.ndim == 4:
+                b, c, h, w = act.shape
+                tan = tan.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()
             else:
-                src_flat = t.reshape(-1, t.shape[-1])
-            src_col = src_flat[:, src_neuron].detach()
-            if position_mode == "focal_token" and src_col.numel() > 0:
-                if src_pole == PoleType.POSITIVE:
-                    focal_idx = int(src_col.argmax().item())
-                elif src_pole == PoleType.NEGATIVE:
-                    focal_idx = int(src_col.argmin().item())
-                else:
-                    focal_idx = int(src_col.abs().argmax().item())
-                amask = torch.zeros_like(src_col, dtype=torch.bool)
-                amask[focal_idx] = True
-            else:
-                if src_pole == PoleType.POSITIVE:
-                    amask = src_col > active_threshold
-                elif src_pole == PoleType.NEGATIVE:
-                    amask = src_col < -active_threshold
-                else:
-                    amask = src_col.abs() > active_threshold
-                if not amask.any():
-                    amask = torch.ones_like(src_col, dtype=torch.bool)
+                tan = tan.reshape_as(act)
+            return fwAD.make_dual(act, tan)
 
-            active_mask_holder.append(amask)
-            active_count_holder[0] = max(int(amask.sum().item()), 1)
+        hs.add_modifier(src_layer, _seed)
+        for d in dst_layers:
+            d_site = hs.site(d)
 
-            tangent_flat = torch.zeros_like(src_flat)
-            tangent_flat[amask, src_neuron] = 1.0
-            if is_src_conv and t.ndim == 4:
-                b_dim, c_dim, h_dim, w_dim = t.shape
-                tangent = (
-                    tangent_flat.reshape(b_dim, h_dim, w_dim, c_dim)
-                    .permute(0, 3, 1, 2)
-                    .contiguous()
-                )
-            else:
-                tangent = tangent_flat.reshape_as(t)
-            return fwAD.make_dual(t, tangent)
+            def _read(act: torch.Tensor, _g, _r, name=d, conv=d_site.is_conv2d, n=d_site.num_neurons) -> None:
+                _, tan = fwAD.unpack_dual(act)
+                if tan is None:
+                    out[name] = torch.zeros(n)
+                    return
+                t = flat_neuron_view(tan, conv).float()
+                m = mask_holder[-1] if mask_holder and mask_holder[-1].shape[0] == t.shape[0] else None
+                out[name] = (t[m].sum(0) / max(int(m.sum()), 1)) if m is not None else t.mean(0)
 
-        if src_target == "input":
-            handles.append(
-                src_mod.register_forward_pre_hook(
-                    lambda _m, inp: (
-                        (_make_dual_on_src(inp[0]),) + inp[1:]
-                        if inp and isinstance(inp[0], torch.Tensor)
-                        else inp
-                    )
-                )
-            )
-        else:
-            handles.append(
-                src_mod.register_forward_hook(
-                    lambda _m, _inp, out: (
-                        (_make_dual_on_src(out[0]),) + out[1:]
-                        if isinstance(out, tuple) and isinstance(out[0], torch.Tensor)
-                        else (_make_dual_on_src(out) if isinstance(out, torch.Tensor) else out)
-                    )
-                )
-            )
-
-        for d_layer in target_dst_layers:
-            d_mod, d_target, num_d = LayerDiscovery.resolve_module(self.model, d_layer)
-            is_d_conv = isinstance(d_mod, nn.Conv2d)
-
-            def _make_dst_unpack(lname: str, n_dst: int, conv_flag: bool):
-                def _unpack_tensor(t_out: torch.Tensor) -> None:
-                    _, tang = fwAD.unpack_dual(t_out)
-                    if tang is None:
-                        captured_tangents[lname] = torch.zeros(
-                            n_dst, dtype=torch.float32, device=t_out.device
-                        )
-                        return
-                    if conv_flag and tang.ndim == 4:
-                        dst_tang_flat = tang.permute(0, 2, 3, 1).reshape(-1, n_dst)
-                    else:
-                        dst_tang_flat = tang.reshape(-1, n_dst)
-                    if (
-                        active_mask_holder
-                        and active_mask_holder[-1].shape[0] == dst_tang_flat.shape[0]
-                    ):
-                        d_mask = active_mask_holder[-1].to(dst_tang_flat.device)
-                        jac_vec = (
-                            dst_tang_flat[d_mask].float().sum(dim=0) / active_count_holder[0]
-                        )
-                    else:
-                        jac_vec = dst_tang_flat.float().mean(dim=0)
-                    captured_tangents[lname] = jac_vec.detach()
-
-                return _unpack_tensor
-
-            unpack_fn = _make_dst_unpack(d_layer, num_d, is_d_conv)
-            if d_target == "input":
-                handles.append(
-                    d_mod.register_forward_pre_hook(
-                        lambda _m, inp, u=unpack_fn: (
-                            u(inp[0]) if inp and isinstance(inp[0], torch.Tensor) else None
-                        )
-                    )
-                )
-            else:
-                handles.append(
-                    d_mod.register_forward_hook(
-                        lambda _m, _inp, out, u=unpack_fn: u(
-                            out[0] if isinstance(out, tuple) else out
-                        )
-                    )
-                )
-
-        was_training = self.model.training
+            hs.add_capture(d, _read)
+        was = self.model.training
         self.model.eval()
-        fw_ad_ok = False
         try:
-            with self.injector.without_interventions(), _sdpa_math_context(), fwAD.dual_level():
-                try:
-                    run_fwd(self.model, inputs)
-                    fw_ad_ok = True
-                except RuntimeError:
-                    captured_tangents.clear()
+            with self.injector.clean_forward(), _sdpa_math_context(), fwAD.dual_level(), hs.active():
+                run(self.model, inputs)
         finally:
-            for handle in handles:
-                handle.remove()
-            if was_training:
+            if was:
                 self.model.train()
+        return {k: v.detach().cpu() for k, v in out.items()}
 
-        if not fw_ad_ok:
-            for d_layer in target_dst_layers:
-                g = self.trace_circuit(
-                    src_layer=src_layer,
-                    dst_layer=d_layer,
-                    src_neuron=src_neuron,
-                    inputs=inputs,
-                    forward_fn=run_fwd,
-                    src_pole=src_pole,
-                    compute_jacobian=True,
-                    active_threshold=active_threshold,
-                    top_k=all_discovered[d_layer].num_neurons
-                    if d_layer in all_discovered
-                    else 64,
-                )
-                _, _, num_d = LayerDiscovery.resolve_module(self.model, d_layer)
-                j_vec = torch.zeros(num_d, dtype=torch.float32)
-                for e in g.edges:
-                    if 0 <= e.dst_neuron < num_d:
-                        j_vec[e.dst_neuron] = float(e.jacobian_sensitivity)
-                captured_tangents[d_layer] = j_vec
+    # ------------------------------------------------------------------
+    # 3. Downstream causal tracing
+    # ------------------------------------------------------------------
+    def _gate_up_capture(self, hs: HookSet, layer: str, store: Dict[str, List[torch.Tensor]]) -> bool:
+        """Capture dst gate g and value u (for path decomposition). Returns False if not available."""
+        site = hs.site(layer)
+        if not site.gated or site.target == "moe_expert":
+            return False
+        up_mod, up_kind = LayerDiscovery.up_source(self.model, layer)
+        if up_mod is None:
+            return False
 
-        return captured_tangents
+        def _u(_m, _i, o):
+            t = o[0] if isinstance(o, tuple) else o
+            if up_kind == "second_half":
+                t = t[..., t.shape[-1] // 2:]
+            store.setdefault("u", []).append(t.detach().float())
 
-    # -------------------------------------------------------------------------
-    # 3. Causal Pole-to-Pole Circuit Tracing (Downstream & Incoming Upstream)
-    # -------------------------------------------------------------------------
-    def trace_circuit(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        src_neuron: int,
-        inputs: Any,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        src_pole: PoleType = PoleType.POSITIVE,
-        intervention_mode: InterventionMode = InterventionMode.ZERO_ABLATE,
-        intervention_value: float = 0.0,
-        token_positions: Optional[List[int]] = None,
-        compute_jacobian: bool = True,
-        active_threshold: float = 1e-5,
-        top_k: int = 16,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_mode: str = "all_active",
-    ) -> CircuitGraph:
+        h = up_mod.register_forward_hook(_u)
+        store.setdefault("_handles", []).append(h)  # type: ignore[arg-type]
+        hs.add_capture(layer, lambda a, g, r: store.setdefault("g", []).append(g.detach().float()), need_gate=True)
+        return True
+
+    def trace_circuit(self, src_layer: str, dst_layer: str, src_neuron: int, inputs: Any,
+                      forward_fn: Optional[Callable] = None, src_pole: PoleType = PoleType.POSITIVE,
+                      compute_jacobian: bool = True, top_k: int = 16, attention_mask: Optional[torch.Tensor] = None,
+                      position_mode: str = "all_active") -> CircuitGraph:
         """
-        Traces the causal circuit from `(src_layer, src_neuron, src_pole)` to all neurons in `dst_layer`.
-        Uses single-pass Forward-Mode AD (`torch.autograd.forward_ad`) to compute exact
-        Jacobian sensitivities across all downstream neurons in one forward pass, with
-        automatic fallback to reverse-mode autograd if a custom op does not support dual tensors.
+        Effect of ablating one pole of (src_layer, src_neuron) on every neuron of dst_layer, averaged
+        over the positions where the source pole is active. For gated destinations the measured change
+        is split into the first-order gate path act'(g)u·Δg and value path act(g)·Δu, which decides
+        whether the edge is gating.
         """
-        run_fwd = forward_fn or (lambda m, inp: m(inp))
+        run = forward_fn or default_forward
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
-        src_mod, src_target, _ = LayerDiscovery.resolve_module(self.model, src_layer)
-        dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
-        is_src_conv = isinstance(src_mod, nn.Conv2d)
-        is_dst_conv = isinstance(dst_mod, nn.Conv2d)
-
-        captured_src_primal: List[torch.Tensor] = []
-        captured_dst_primal: List[torch.Tensor] = []
-        captured_dst_tangent: List[Optional[torch.Tensor]] = []
-        active_mask_holder: List[torch.Tensor] = []
-
-        def _compute_src_active_mask(s_col: torch.Tensor) -> torch.Tensor:
-            if attention_mask is not None and attention_mask.numel() == s_col.numel():
-                valid_mask = attention_mask.reshape(-1).to(
-                    device=s_col.device, dtype=torch.bool
-                )
-            else:
-                valid_mask = torch.ones_like(s_col, dtype=torch.bool)
-
-            if position_mode == "focal_token" and s_col.numel() > 0:
-                if src_pole == PoleType.POSITIVE:
-                    masked_col = torch.where(
-                        valid_mask, s_col, torch.full_like(s_col, float("-inf"))
-                    )
-                    focal_idx = int(masked_col.argmax().item())
-                elif src_pole == PoleType.NEGATIVE:
-                    masked_col = torch.where(
-                        valid_mask, s_col, torch.full_like(s_col, float("inf"))
-                    )
-                    focal_idx = int(masked_col.argmin().item())
-                else:
-                    masked_col = torch.where(
-                        valid_mask, s_col.abs(), torch.full_like(s_col, float("-inf"))
-                    )
-                    focal_idx = int(masked_col.argmax().item())
-                amask = torch.zeros_like(s_col, dtype=torch.bool)
-                amask[focal_idx] = True
-                return amask
-
-            if src_pole == PoleType.POSITIVE:
-                amask = (s_col > active_threshold) & valid_mask
-            elif src_pole == PoleType.NEGATIVE:
-                amask = (s_col < -active_threshold) & valid_mask
-            else:
-                amask = (s_col.abs() > active_threshold) & valid_mask
-            if not amask.any():
-                amask = (
-                    valid_mask
-                    if valid_mask.any()
-                    else torch.ones_like(s_col, dtype=torch.bool)
-                )
-            return amask
-
-        def _attach_dual_src(t: torch.Tensor) -> torch.Tensor:
-            primal = t.detach()
-            captured_src_primal.append(primal)
-            if not compute_jacobian or not primal.is_floating_point():
-                return t
-            if is_src_conv and primal.ndim == 4:
-                s_flat = primal.permute(0, 2, 3, 1).reshape(-1, primal.shape[1])
-            else:
-                s_flat = primal.reshape(-1, primal.shape[-1])
-            s_col = s_flat[:, src_neuron]
-            amask = _compute_src_active_mask(s_col)
-            active_mask_holder.append(amask)
-
-            src_tangent_flat = torch.zeros_like(s_flat)
-            src_tangent_flat[amask, src_neuron] = 1.0
-            if is_src_conv and primal.ndim == 4:
-                b_dim, c_dim, h_dim, w_dim = primal.shape
-                tangent = (
-                    src_tangent_flat.reshape(b_dim, h_dim, w_dim, c_dim)
-                    .permute(0, 3, 1, 2)
-                    .contiguous()
-                )
-            else:
-                tangent = src_tangent_flat.reshape_as(primal)
-            return fwAD.make_dual(primal, tangent)
-
-        def _capture_dst_dual(t: torch.Tensor) -> None:
-            primal, tangent = fwAD.unpack_dual(t)
-            captured_dst_primal.append(primal.detach())
-            captured_dst_tangent.append(tangent.detach() if tangent is not None else None)
-
-        h_src = (
-            src_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    (_attach_dual_src(inp[0]),) + inp[1:]
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else inp
-                )
-            )
-            if src_target == "input"
-            else src_mod.register_forward_hook(
-                lambda _m, _inp, out: (
-                    (_attach_dual_src(out[0]),) + out[1:]
-                    if isinstance(out, tuple) and isinstance(out[0], torch.Tensor)
-                    else (_attach_dual_src(out) if isinstance(out, torch.Tensor) else out)
-                )
-            )
-        )
-        h_dst = (
-            dst_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    _capture_dst_dual(inp[0])
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if dst_target == "input"
-            else dst_mod.register_forward_hook(
-                lambda _m, _inp, out: _capture_dst_dual(
-                    out[0] if isinstance(out, tuple) else out
-                )
-            )
-        )
-
-        was_training = self.model.training
+        hs = HookSet(self.model)
+        src_site, dst_site = hs.site(src_layer), hs.site(dst_layer)
+        src_store: List[torch.Tensor] = []
+        dst_clean: List[torch.Tensor] = []
+        hs.add_capture(src_layer, lambda a, g, r: src_store.append(a.detach().float()))
+        hs.add_capture(dst_layer, lambda a, g, r: dst_clean.append(a.detach().float()))
+        gu_clean: Dict[str, List[Any]] = {}
+        has_paths = self._gate_up_capture(hs, dst_layer, gu_clean)
+        was = self.model.training
         self.model.eval()
-        fw_ad_succeeded = False
         try:
-            with (
-                self.injector.without_interventions(),
-                torch.no_grad(),
-                _sdpa_math_context(),
-                fwAD.dual_level(),
-            ):
-                try:
-                    run_fwd(self.model, inputs)
-                    fw_ad_succeeded = True
-                except RuntimeError:
-                    # Fallback if a custom op does not support forward-mode AD dual tensors
-                    captured_src_primal.clear()
-                    captured_dst_primal.clear()
-                    captured_dst_tangent.clear()
-                    active_mask_holder.clear()
+            with torch.no_grad(), self.injector.clean_forward(), hs.active():
+                run(self.model, inputs)
         finally:
-            h_src.remove()
-            h_dst.remove()
-
-        if fw_ad_succeeded and captured_src_primal and captured_dst_primal:
-            src_act = captured_src_primal[-1]
-            dst_act = captured_dst_primal[-1]
-            dst_tang = captured_dst_tangent[-1] if captured_dst_tangent else None
-
-            if is_src_conv and src_act.ndim == 4:
-                src_flat = src_act.permute(0, 2, 3, 1).reshape(-1, src_act.shape[1])
-            else:
-                src_flat = src_act.reshape(-1, src_act.shape[-1])
-
-            if is_dst_conv and dst_act.ndim == 4:
-                dst_flat = dst_act.permute(0, 2, 3, 1).reshape(-1, dst_act.shape[1])
-            else:
-                dst_flat = dst_act.reshape(-1, dst_act.shape[-1])
-
-            if active_mask_holder:
-                active_mask = active_mask_holder[-1]
-            else:
-                src_col = src_flat[:, src_neuron]
-                active_mask = _compute_src_active_mask(src_col)
-
-            if active_mask.shape[0] != dst_flat.shape[0]:
-                dst_active_mask = torch.ones(
-                    dst_flat.shape[0], dtype=torch.bool, device=dst_flat.device
-                )
-            else:
-                dst_active_mask = active_mask.to(dst_flat.device)
-
-            jacobian_vec = torch.zeros(num_dst, dtype=torch.float32, device=dst_flat.device)
-            if compute_jacobian and dst_tang is not None:
-                if is_dst_conv and dst_tang.ndim == 4:
-                    dst_tang_flat = dst_tang.permute(0, 2, 3, 1).reshape(-1, num_dst)
-                else:
-                    dst_tang_flat = dst_tang.reshape(-1, num_dst)
-                n_active = max(int(active_mask.sum().item()), 1)
-                jacobian_vec = dst_tang_flat[dst_active_mask].float().sum(dim=0) / n_active
+            for h in gu_clean.pop("_handles", []):
+                h.remove()
+        src_flat = flat_neuron_view(src_store[-1], src_site.is_conv2d)
+        dst_flat = flat_neuron_view(dst_clean[-1], dst_site.is_conv2d)
+        if src_flat.shape[0] != dst_flat.shape[0]:
+            raise ValueError("Source and destination activations do not share positions.")
+        valid = valid_position_mask(attention_mask, src_flat.shape[0], src_flat.device)
+        col = src_flat[:, src_neuron]
+        if position_mode == "focal_token":
+            score = torch.where(valid, col if src_pole != PoleType.NEGATIVE else -col, torch.full_like(col, float("-inf")))
+            active = torch.zeros_like(valid)
+            active[int(score.argmax())] = True
         else:
-            # Reverse-mode autograd fallback
-            rev_src: List[torch.Tensor] = []
-            rev_dst: List[torch.Tensor] = []
+            active = _pole_mask(col, src_pole) & valid
+        if not bool(active.any()):
+            raise ValueError(f"Source neuron {src_neuron} has no {src_pole.value} activations on these inputs.")
 
-            def _rev_src_pre(_m: nn.Module, inp: Tuple[Any, ...]):
-                if inp and isinstance(inp[0], torch.Tensor):
-                    t = inp[0].detach().clone().requires_grad_(compute_jacobian)
-                    rev_src.append(t)
-                    return (t,) + inp[1:]
-                return inp
+        jac = torch.zeros(dst_site.num_neurons)
+        if compute_jacobian and src_site.target != "moe_expert":
+            jd = self.trace_forward_ad_all_layers(src_layer, src_neuron, inputs, [dst_layer], src_pole, run, position_mode)
+            jac = jd.get(dst_layer, jac)
 
-            def _rev_src_fwd(_m: nn.Module, _inp: Tuple[Any, ...], out: Any):
-                t_orig = out[0] if isinstance(out, tuple) else out
-                if isinstance(t_orig, torch.Tensor):
-                    t = t_orig.detach().clone().requires_grad_(compute_jacobian)
-                    rev_src.append(t)
-                    return (t,) + out[1:] if isinstance(out, tuple) else t
-                return out
+        spec = InterventionSpec(src_layer, [src_neuron], InterventionMode.ZERO_ABLATE, src_pole)
+        hs2 = HookSet(self.model)
+        dst_abl: List[torch.Tensor] = []
+        hs2.add_capture(dst_layer, lambda a, g, r: dst_abl.append(a.detach().float()))
+        gu_abl: Dict[str, List[Any]] = {}
+        if has_paths:
+            self._gate_up_capture(hs2, dst_layer, gu_abl)
+        try:
+            with torch.no_grad(), self.injector.temporary_interventions([spec]), hs2.active():
+                run(self.model, inputs)
+        finally:
+            for h in gu_abl.pop("_handles", []):
+                h.remove()
+            if was:
+                self.model.train()
+        abl_flat = flat_neuron_view(dst_abl[-1], dst_site.is_conv2d)
+        delta = dst_flat[active] - abl_flat[active]
+        mean_delta = delta.mean(0)
+        max_idx = delta.abs().argmax(0)
+        max_delta = delta[max_idx, torch.arange(delta.shape[1])]
+        clean_mean = dst_flat[active].mean(0)
+        abl_mean = abl_flat[active].mean(0)
 
-            hr_src = (
-                src_mod.register_forward_pre_hook(_rev_src_pre)
-                if src_target == "input"
-                else src_mod.register_forward_hook(_rev_src_fwd)
-            )
-            hr_dst = (
-                dst_mod.register_forward_pre_hook(
-                    lambda _m, inp: (
-                        rev_dst.append(inp[0])
-                        if inp and isinstance(inp[0], torch.Tensor)
-                        else None
-                    )
-                )
-                if dst_target == "input"
-                else dst_mod.register_forward_hook(
-                    lambda _m, _inp, out: rev_dst.append(
-                        out[0] if isinstance(out, tuple) else out
-                    )
-                )
-            )
-            try:
-                with self.injector.without_interventions(), torch.set_grad_enabled(compute_jacobian):
-                    run_fwd(self.model, inputs)
-            finally:
-                hr_src.remove()
-                hr_dst.remove()
-
-            if not rev_src or not rev_dst:
-                raise RuntimeError(
-                    f"Failed to capture activations for '{src_layer}' or '{dst_layer}'."
-                )
-
-            src_act = rev_src[-1]
-            dst_act = rev_dst[-1]
-            src_flat = (
-                src_act.permute(0, 2, 3, 1).reshape(-1, src_act.shape[1])
-                if (is_src_conv and src_act.ndim == 4)
-                else src_act.reshape(-1, src_act.shape[-1])
-            )
-            dst_flat = (
-                dst_act.permute(0, 2, 3, 1).reshape(-1, dst_act.shape[1])
-                if (is_dst_conv and dst_act.ndim == 4)
-                else dst_act.reshape(-1, dst_act.shape[-1])
-            )
-            src_col = src_flat[:, src_neuron].detach()
-            active_mask = _compute_src_active_mask(src_col)
-            dst_active_mask = (
-                torch.ones(dst_flat.shape[0], dtype=torch.bool, device=dst_flat.device)
-                if active_mask.shape[0] != dst_flat.shape[0]
-                else active_mask.to(dst_flat.device)
-            )
-            jacobian_vec = torch.zeros(num_dst, dtype=torch.float32, device=dst_flat.device)
-            if compute_jacobian and dst_act.requires_grad:
+        gate_term = up_term = None
+        if has_paths and gu_clean.get("g") and gu_clean.get("u") and gu_abl.get("g") and gu_abl.get("u"):
+            act_fn = LayerDiscovery.resolve_mlp_activation(self.model, dst_layer)
+            if act_fn is not None:
+                g0 = flat_neuron_view(gu_clean["g"][-1], False)[active]
+                u0 = flat_neuron_view(gu_clean["u"][-1], False)[active]
+                g1 = flat_neuron_view(gu_abl["g"][-1], False)[active]
+                u1 = flat_neuron_view(gu_abl["u"][-1], False)[active]
                 with torch.enable_grad():
-                    active_dst_sum = dst_flat[dst_active_mask].float().sum(dim=0)
-                    cand_var = dst_flat[dst_active_mask].detach().float().abs().mean(dim=0)
-                    jac_k = min(num_dst, max(top_k * 2, 64))
-                    _, top_jac_indices = torch.topk(cand_var, k=jac_k)
-                    for j_idx in top_jac_indices.tolist():
-                        grad_src = torch.autograd.grad(
-                            outputs=active_dst_sum[j_idx],
-                            inputs=src_act,
-                            retain_graph=True,
-                            allow_unused=True,
-                        )[0]
-                        if grad_src is not None:
-                            g_flat = (
-                                grad_src.permute(0, 2, 3, 1).reshape(-1, grad_src.shape[1])
-                                if (is_src_conv and grad_src.ndim == 4)
-                                else grad_src.reshape(-1, grad_src.shape[-1])
-                            )
-                            jacobian_vec[j_idx] = (
-                                g_flat[active_mask, src_neuron].float().mean().detach()
-                            )
+                    gg = g0.clone().requires_grad_(True)
+                    y = act_fn(gg)
+                    dact = torch.autograd.grad(y.sum(), gg)[0]
+                gate_term = (dact * u0 * (g0 - g1)).mean(0)
+                up_term = (y.detach() * (u0 - u1)).mean(0)
 
-        clean_dst_flat = dst_flat.detach().float().clone()
-
-        # Step 2: Intervened pass (surgically ablate or clamp src_neuron's pole without clearing user specs)
-        captured_dst_ablated: List[torch.Tensor] = []
-        h_dst_ab = (
-            dst_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    captured_dst_ablated.append(inp[0].detach())
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if dst_target == "input"
-            else dst_mod.register_forward_hook(
-                lambda _m, _inp, out: captured_dst_ablated.append(
-                    (out[0] if isinstance(out, tuple) else out).detach()
-                )
-            )
-        )
-
-        trace_spec = InterventionSpec(
-            layer_name=src_layer,
-            neuron_indices=[src_neuron],
-            mode=intervention_mode,
-            pole=src_pole,
-            value=intervention_value,
-            token_positions=token_positions,
-        )
-
-        try:
-            with torch.no_grad(), self.injector.temporary_interventions([trace_spec]):
-                run_fwd(self.model, inputs)
-        finally:
-            h_dst_ab.remove()
-            if was_training:
-                self.model.train()
-
-        raw_ab = captured_dst_ablated[-1]
-        if is_dst_conv and raw_ab.ndim == 4:
-            ablated_dst_flat = raw_ab.permute(0, 2, 3, 1).reshape(-1, num_dst).float()
-        else:
-            ablated_dst_flat = raw_ab.reshape(-1, num_dst).float()
-
-        # Step 3: Compute causal shift Delta = A_clean - A_ablated over active positions
-        delta_active = clean_dst_flat[dst_active_mask] - ablated_dst_flat[dst_active_mask]
-        mean_delta = delta_active.mean(dim=0)
-
-        # Signed max delta (retaining sign of the largest absolute shift per downstream neuron)
-        max_abs_idx = delta_active.abs().argmax(dim=0)
-        max_delta = delta_active[max_abs_idx, torch.arange(num_dst, device=delta_active.device)]
-
-        clean_mean = clean_dst_flat[dst_active_mask].mean(dim=0)
-        ablated_mean = ablated_dst_flat[dst_active_mask].mean(dim=0)
-
-        # Step 4: Combine with static virtual weights
-        v_up, v_gate, cos_sim = self.compute_virtual_weights(src_layer, dst_layer, src_neuron)
-        v_up = v_up.to(device=mean_delta.device, dtype=mean_delta.dtype)
-        v_gate = v_gate.to(device=mean_delta.device, dtype=mean_delta.dtype)
-        cos_sim = cos_sim.to(device=mean_delta.device, dtype=mean_delta.dtype)
-
-        # Select top_k most affected downstream neurons (by absolute mean causal delta + static alignment)
-        ranking_metric = mean_delta.abs() + 1e-4 * v_up.abs()
-        k_select = min(top_k, num_dst)
-        _, top_dst_indices = torch.topk(ranking_metric, k=k_select)
-
-        edges: List[CircuitEdge] = []
-        for dst_idx in top_dst_indices.tolist():
-            c_mean = float(clean_mean[dst_idx].item())
-            m_delta = float(mean_delta[dst_idx].item())
-            dst_pole = PoleType.POSITIVE if c_mean >= 0 else PoleType.NEGATIVE
-
-            edges.append(
-                CircuitEdge(
-                    src_layer=src_layer,
-                    src_neuron=src_neuron,
-                    src_pole=src_pole,
-                    dst_layer=dst_layer,
-                    dst_neuron=dst_idx,
-                    dst_pole_tendency=dst_pole,
-                    mean_causal_delta=m_delta,
-                    max_causal_delta=float(max_delta[dst_idx].item()),
-                    clean_dst_mean=c_mean,
-                    ablated_dst_mean=float(ablated_mean[dst_idx].item()),
-                    jacobian_sensitivity=float(jacobian_vec[dst_idx].item()),
-                    virtual_weight_up=float(v_up[dst_idx].item()),
-                    virtual_weight_gate=float(v_gate[dst_idx].item()),
-                    static_alignment_cos=float(cos_sim[dst_idx].item()),
-                )
-            )
-
-        edges.sort(key=lambda e: abs(e.mean_causal_delta), reverse=True)
-        graph = CircuitGraph(
-            src_layer=src_layer,
-            dst_layer=dst_layer,
-            src_neuron=src_neuron,
-            src_pole=src_pole,
-            edges=edges,
-        )
-        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
-            self.injector.ecology_map.register_circuit_graph(graph)
+        vu, vg, cos = self._safe_virtual(src_layer, dst_layer, src_neuron, dst_site.num_neurons)
+        k = min(top_k, dst_site.num_neurons)
+        top = torch.topk(mean_delta.abs(), k=k).indices.tolist()
+        edges = []
+        for j in top:
+            edges.append(CircuitEdge(
+                src_layer=src_layer, src_neuron=src_neuron, src_pole=src_pole, dst_layer=dst_layer, dst_neuron=j,
+                dst_pole_tendency=PoleType.POSITIVE if float(clean_mean[j]) >= 0 else PoleType.NEGATIVE,
+                mean_causal_delta=float(mean_delta[j]), max_causal_delta=float(max_delta[j]),
+                clean_dst_mean=float(clean_mean[j]), ablated_dst_mean=float(abl_mean[j]),
+                jacobian_sensitivity=float(jac[j]), virtual_weight_up=float(vu[j]), virtual_weight_gate=float(vg[j]),
+                static_alignment_cos=float(cos[j]),
+                gate_path_delta=float(gate_term[j]) if gate_term is not None else None,
+                up_path_delta=float(up_term[j]) if up_term is not None else None,
+            ))
+        graph = CircuitGraph(src_layer, dst_layer, src_neuron, src_pole, edges)
+        self.injector.ecology_map.register_circuit_graph(graph)
         return graph
 
-    def trace_incoming_circuit(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        dst_neuron: int,
-        inputs: Any,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        dst_pole: PoleType = PoleType.POSITIVE,
-        active_threshold: float = 1e-5,
-        top_k: int = 8,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> CircuitGraph:
+    def _safe_virtual(self, src: str, dst: str, i: int, n_dst: int):
+        try:
+            vu, vg, cos = self.compute_virtual_weights(src, dst, i)
+            return vu.cpu(), vg.cpu(), cos.cpu()
+        except ValueError:
+            z = torch.zeros(n_dst)
+            return z, z, z
+
+    # ------------------------------------------------------------------
+    # 4. Upstream attribution and incoming circuits
+    # ------------------------------------------------------------------
+    def _attribution_into(self, src_layer: str, dst_layer: str, dst_neuron: int, inputs: Any, dst_pole: PoleType,
+                          run: Callable, attention_mask: Optional[torch.Tensor], focal: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Traces the incoming upstream circuit from ALL neurons in `src_layer` into a single
-        target `(dst_layer, dst_neuron)` (Cammarata's upstream decomposition of recursive offshoots):
-          1. Computes exact reverse-mode Jacobian sensitivities `d(A_dst[dst_neuron]) / d(a_src)`
-             across all upstream neurons in `src_layer` in a single backward pass.
-          2. Combines first-order attribution `a_src * d(A_dst)/d(a_src)` with incoming virtual
-             weights (`W_up` and `W_gate`) to select the top candidate upstream contributors.
-          3. Runs exact surgical pole-ablation verification on the top candidates to populate
-             `mean_causal_delta` and registers all discovered edges into `self.injector.ecology_map`.
+        Gradient-times-activation attribution of every src neuron into the dst neuron:
+        target = mean of the dst neuron over its active pole positions (or its single strongest
+        position when `focal`), attribution_i = sum_positions a_i * d target / d a_i.
+        Returns (attribution [n_src], jacobian [n_src], src mean over target positions [n_src], target mask).
         """
-        run_fwd = forward_fn or (lambda m, inp: m(inp))
+        hs = HookSet(self.model)
+        src_site, dst_site = hs.site(src_layer), hs.site(dst_layer)
+        if src_site.target == "moe_expert" or dst_site.target == "moe_expert":
+            raise NotImplementedError("Gradient attribution through routed MoE expert rows is not supported.")
+        holder: Dict[str, torch.Tensor] = {}
+
+        def _leaf(act: torch.Tensor, _g) -> torch.Tensor:
+            t = act.detach().clone().requires_grad_(True)
+            holder["src"] = t
+            return t
+
+        hs.add_modifier(src_layer, _leaf)
+        hs.add_capture(dst_layer, lambda a, g, r: holder.__setitem__("dst", a))
+        with torch.enable_grad(), self.injector.clean_forward(), hs.active():
+            run(self.model, inputs)
+            dst = flat_neuron_view(holder["dst"], dst_site.is_conv2d)
+            col = dst[:, dst_neuron]
+            valid = valid_position_mask(attention_mask, col.shape[0], col.device)
+            if focal:
+                score = torch.where(valid, col.detach() if dst_pole != PoleType.NEGATIVE else -col.detach(),
+                                    torch.full_like(col, float("-inf")))
+                m = torch.zeros_like(valid)
+                m[int(score.argmax())] = True
+            else:
+                m = _pole_mask(col.detach(), dst_pole) & valid
+                if not bool(m.any()):
+                    raise ValueError(f"Target neuron {dst_neuron} has no {dst_pole.value} activations on these inputs.")
+            target = col[m].float().mean()
+            grad = torch.autograd.grad(target, holder["src"], allow_unused=True)[0]
+        src = flat_neuron_view(holder["src"].detach().float(), src_site.is_conv2d)
+        g = flat_neuron_view(grad.float(), src_site.is_conv2d) if grad is not None else torch.zeros_like(src)
+        attribution = (src * g).sum(0)
+        jac = g.sum(0)
+        src_mean = src[m].mean(0) if src.shape[0] == m.shape[0] else src.mean(0)
+        return attribution, jac, src_mean, m
+
+    def trace_incoming_circuit(self, src_layer: str, dst_layer: str, dst_neuron: int, inputs: Any,
+                               forward_fn: Optional[Callable] = None, dst_pole: PoleType = PoleType.POSITIVE,
+                               top_k: int = 8, attention_mask: Optional[torch.Tensor] = None) -> CircuitGraph:
+        """
+        Ranks every src neuron by |gradient x activation| attribution into the target pole, then
+        verifies the top `top_k` by ablating each one's active pole and measuring the target's change.
+        """
+        run = forward_fn or default_forward
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
-        src_mod, src_target, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
-        dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
-        is_src_conv = isinstance(src_mod, nn.Conv2d)
-        is_dst_conv = isinstance(dst_mod, nn.Conv2d)
-
-        captured_src: List[torch.Tensor] = []
-        captured_dst: List[torch.Tensor] = []
-
-        def _cap_src_pre(_m: nn.Module, inp: Tuple[Any, ...]):
-            if inp and isinstance(inp[0], torch.Tensor):
-                t = inp[0].detach().clone().requires_grad_(True)
-                captured_src.append(t)
-                return (t,) + inp[1:]
-            return inp
-
-        def _cap_src_fwd(_m: nn.Module, _inp: Tuple[Any, ...], out: Any):
-            t0 = out[0] if isinstance(out, tuple) else out
-            if isinstance(t0, torch.Tensor):
-                t = t0.detach().clone().requires_grad_(True)
-                captured_src.append(t)
-                return (t,) + out[1:] if isinstance(out, tuple) else t
-            return out
-
-        h_src = (
-            src_mod.register_forward_pre_hook(_cap_src_pre)
-            if src_target == "input"
-            else src_mod.register_forward_hook(_cap_src_fwd)
-        )
-        h_dst = (
-            dst_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    captured_dst.append(inp[0])
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if dst_target == "input"
-            else dst_mod.register_forward_hook(
-                lambda _m, _inp, out: captured_dst.append(
-                    out[0] if isinstance(out, tuple) else out
-                )
-            )
-        )
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            with self.injector.without_interventions(), torch.enable_grad():
-                run_fwd(self.model, inputs)
-                src_act = captured_src[-1]
-                dst_act = captured_dst[-1]
-
-                dst_flat = (
-                    dst_act.permute(0, 2, 3, 1).reshape(-1, num_dst)
-                    if (is_dst_conv and dst_act.ndim == 4)
-                    else dst_act.reshape(-1, num_dst)
-                )
-                dst_col = dst_flat[:, dst_neuron]
-                if attention_mask is not None and attention_mask.numel() == dst_col.numel():
-                    valid_dst_mask = attention_mask.reshape(-1).to(
-                        device=dst_col.device, dtype=torch.bool
-                    )
-                else:
-                    valid_dst_mask = torch.ones_like(dst_col, dtype=torch.bool)
-                if dst_pole == PoleType.POSITIVE:
-                    amask = (dst_col.detach() > active_threshold) & valid_dst_mask
-                elif dst_pole == PoleType.NEGATIVE:
-                    amask = (dst_col.detach() < -active_threshold) & valid_dst_mask
-                else:
-                    amask = (dst_col.detach().abs() > active_threshold) & valid_dst_mask
-                if not amask.any():
-                    amask = (
-                        valid_dst_mask
-                        if valid_dst_mask.any()
-                        else torch.ones_like(dst_col, dtype=torch.bool)
-                    )
-
-                target_scalar = dst_col[amask].float().mean()
-                grad_src = torch.autograd.grad(
-                    outputs=target_scalar,
-                    inputs=src_act,
-                    retain_graph=False,
-                    allow_unused=True,
-                )[0]
-        finally:
-            h_src.remove()
-            h_dst.remove()
-
-        src_flat = (
-            src_act.detach().permute(0, 2, 3, 1).reshape(-1, num_src).float()
-            if (is_src_conv and src_act.ndim == 4)
-            else src_act.detach().reshape(-1, num_src).float()
-        )
-        clean_dst_col = dst_col.detach().float()
-        clean_dst_mean = float(clean_dst_col[amask].mean().item())
-
-        src_amask = (
-            amask.to(src_flat.device)
-            if amask.shape[0] == src_flat.shape[0]
-            else torch.ones(src_flat.shape[0], dtype=torch.bool, device=src_flat.device)
-        )
-        src_active_mean = src_flat[src_amask].mean(dim=0)
-
-        if grad_src is not None:
-            g_flat = (
-                grad_src.detach().permute(0, 2, 3, 1).reshape(-1, num_src).float()
-                if (is_src_conv and grad_src.ndim == 4)
-                else grad_src.detach().reshape(-1, num_src).float()
-            )
-            # Note: target_scalar was mean over `amask`, so sum across positions gives mean sensitivity
-            jac_vec = g_flat.sum(dim=0)
-            first_order_attrib = (src_flat * g_flat).sum(dim=0)
-        else:
-            jac_vec = torch.zeros(num_src, dtype=torch.float32, device=src_flat.device)
-            first_order_attrib = torch.zeros(num_src, dtype=torch.float32, device=src_flat.device)
-
-        v_up, v_gate, cos_sim = self.compute_incoming_virtual_weights(
-            src_layer, dst_layer, dst_neuron
-        )
-        v_up = v_up.to(device=src_flat.device)
-        v_gate = v_gate.to(device=src_flat.device)
-        cos_sim = cos_sim.to(device=src_flat.device)
-
-        ranking_score = (
-            first_order_attrib.abs()
-            + 0.1 * (src_active_mean.abs() * (v_up.abs() + v_gate.abs()))
-        )
-        k_select = min(top_k, num_src)
-        _, top_src_indices = torch.topk(ranking_score, k=k_select)
-
-        edges: List[CircuitEdge] = []
-        dst_ab_list: List[torch.Tensor] = []
-        h_dst_ab = (
-            dst_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    dst_ab_list.append(inp[0].detach())
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if dst_target == "input"
-            else dst_mod.register_forward_hook(
-                lambda _m, _inp, out: dst_ab_list.append(
-                    (out[0] if isinstance(out, tuple) else out).detach()
-                )
-            )
-        )
-
-        try:
-            with torch.no_grad():
-                for s_idx in top_src_indices.tolist():
-                    # Determine active pole of s_idx specifically over the active target positions `src_amask`
-                    s_mean = float(src_active_mean[s_idx].item())
-                    s_pole = PoleType.POSITIVE if s_mean >= 0.0 else PoleType.NEGATIVE
-                    spec = InterventionSpec(
-                        layer_name=src_layer,
-                        neuron_indices=[s_idx],
-                        mode=InterventionMode.ZERO_ABLATE,
-                        pole=s_pole,
-                        value=0.0,
-                    )
-                    dst_ab_list.clear()
-                    with self.injector.temporary_interventions([spec]):
-                        run_fwd(self.model, inputs)
-                    ab_raw = dst_ab_list[-1]
-                    ab_flat = (
-                        ab_raw.permute(0, 2, 3, 1).reshape(-1, num_dst).float()
-                        if (is_dst_conv and ab_raw.ndim == 4)
-                        else ab_raw.reshape(-1, num_dst).float()
-                    )
-                    ab_col = ab_flat[:, dst_neuron]
-                    delta_vec = clean_dst_col[amask] - ab_col[amask]
-                    m_delta = float(delta_vec.mean().item())
-                    max_idx = int(delta_vec.abs().argmax().item())
-                    max_delta = float(delta_vec[max_idx].item())
-                    ab_mean = float(ab_col[amask].mean().item())
-
-                    edges.append(
-                        CircuitEdge(
-                            src_layer=src_layer,
-                            src_neuron=s_idx,
-                            src_pole=s_pole,
-                            dst_layer=dst_layer,
-                            dst_neuron=dst_neuron,
-                            dst_pole_tendency=dst_pole,
-                            mean_causal_delta=m_delta,
-                            max_causal_delta=max_delta,
-                            clean_dst_mean=clean_dst_mean,
-                            ablated_dst_mean=ab_mean,
-                            jacobian_sensitivity=float(jac_vec[s_idx].item()),
-                            virtual_weight_up=float(v_up[s_idx].item()),
-                            virtual_weight_gate=float(v_gate[s_idx].item()),
-                            static_alignment_cos=float(cos_sim[s_idx].item()),
-                        )
-                    )
-        finally:
-            h_dst_ab.remove()
-            if was_training:
-                self.model.train()
-
+        attribution, jac, src_mean, m = self._attribution_into(src_layer, dst_layer, dst_neuron, inputs, dst_pole,
+                                                               run, attention_mask, focal=False)
+        vu, vg, cos = (t.cpu() for t in self._safe_incoming(src_layer, dst_layer, dst_neuron, attribution.numel()))
+        top = torch.topk(attribution.abs(), k=min(top_k, attribution.numel())).indices.tolist()
+        hs = HookSet(self.model)
+        dst_site = hs.site(dst_layer)
+        clean: List[torch.Tensor] = []
+        hs.add_capture(dst_layer, lambda a, g, r: clean.append(a.detach().float()))
+        with torch.no_grad(), self.injector.clean_forward(), hs.active():
+            run(self.model, inputs)
+        clean_col = flat_neuron_view(clean[-1], dst_site.is_conv2d)[:, dst_neuron]
+        edges = []
+        for s in top:
+            s_pole = PoleType.POSITIVE if float(src_mean[s]) >= 0 else PoleType.NEGATIVE
+            spec = InterventionSpec(src_layer, [s], InterventionMode.ZERO_ABLATE, s_pole)
+            abl: List[torch.Tensor] = []
+            hs2 = HookSet(self.model)
+            hs2.add_capture(dst_layer, lambda a, g, r: abl.append(a.detach().float()))
+            with torch.no_grad(), self.injector.temporary_interventions([spec]), hs2.active():
+                run(self.model, inputs)
+            ab_col = flat_neuron_view(abl[-1], dst_site.is_conv2d)[:, dst_neuron]
+            d = clean_col[m] - ab_col[m]
+            edges.append(CircuitEdge(
+                src_layer=src_layer, src_neuron=s, src_pole=s_pole, dst_layer=dst_layer, dst_neuron=dst_neuron,
+                dst_pole_tendency=dst_pole, mean_causal_delta=float(d.mean()), max_causal_delta=float(d[d.abs().argmax()]),
+                clean_dst_mean=float(clean_col[m].mean()), ablated_dst_mean=float(ab_col[m].mean()),
+                jacobian_sensitivity=float(jac[s]), virtual_weight_up=float(vu[s]), virtual_weight_gate=float(vg[s]),
+                static_alignment_cos=float(cos[s]),
+            ))
         edges.sort(key=lambda e: abs(e.mean_causal_delta), reverse=True)
-        graph = CircuitGraph(
-            src_layer=src_layer,
-            dst_layer=dst_layer,
-            src_neuron=edges[0].src_neuron if edges else 0,
-            src_pole=dst_pole,
-            edges=edges,
-            dst_neuron=dst_neuron,
-        )
-        if hasattr(self.injector, "ecology_map") and self.injector.ecology_map is not None:
-            self.injector.ecology_map.register_circuit_graph(graph)
+        graph = CircuitGraph(src_layer, dst_layer, edges[0].src_neuron if edges else -1, dst_pole, edges, dst_neuron=dst_neuron)
+        self.injector.ecology_map.register_circuit_graph(graph)
         return graph
 
-    def cluster_incoming_attribution_bundles(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        dst_neuron: int,
-        inputs: Any,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        dst_pole: PoleType = PoleType.POSITIVE,
-        top_k_upstream: int = 12,
-        num_clusters: int = 3,
-    ) -> List[UpstreamAttributionBundle]:
-        """
-        Clusters incoming upstream contributors from `src_layer` into `(dst_layer, dst_neuron)`
-        into functional attribution bundles (Cammarata: 'Understanding Compounds'):
-          - Traces the top `top_k_upstream` incoming edges.
-          - Extracts each upstream contributor's outgoing write direction `W_down[:, s_idx]`
-            weighted by its signed causal attribution, and groups co-aligned upstream contributors
-            via greedy cosine-medoid clustering into `<= num_clusters` coherent functional bundles.
-        """
-        inc_graph = self.trace_incoming_circuit(
-            src_layer=src_layer,
-            dst_layer=dst_layer,
-            dst_neuron=dst_neuron,
-            inputs=inputs,
-            forward_fn=forward_fn,
-            dst_pole=dst_pole,
-            top_k=top_k_upstream,
-        )
-        if not inc_graph.edges:
-            return []
+    def _safe_incoming(self, src: str, dst: str, j: int, n_src: int):
+        try:
+            return self.compute_incoming_virtual_weights(src, dst, j)
+        except ValueError:
+            z = torch.zeros(n_src)
+            return z, z, z
 
-        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
-        w_src = (
-            src_write_mod.weight.detach().float()
-            if hasattr(src_write_mod, "weight") and isinstance(src_write_mod.weight, torch.Tensor)
-            else None
-        )
+    @staticmethod
+    def _spherical_kmeans(X: torch.Tensor, k: int, gen: torch.Generator, n_init: int = 10, iters: int = 100) -> Tuple[torch.Tensor, float]:
+        """Cosine k-means (rows of X are unit vectors). Returns (labels, inertia as 1 - mean cos to centroid)."""
+        n = X.shape[0]
+        best_labels, best_score = None, float("inf")
+        for _ in range(n_init):
+            first = int(torch.randint(n, (1,), generator=gen))
+            cents = [X[first]]
+            for _c in range(1, k):
+                sims = torch.stack([X @ c for c in cents], 1).max(1).values
+                d = torch.clamp(1.0 - sims, min=0.0)
+                probs = d / d.sum() if d.sum() > 0 else torch.full((n,), 1.0 / n)
+                cents.append(X[int(torch.multinomial(probs, 1, generator=gen))])
+            C = torch.stack(cents)
+            labels = torch.zeros(n, dtype=torch.long)
+            for _it in range(iters):
+                new = (X @ C.T).argmax(1)
+                if torch.equal(new, labels) and _it > 0:
+                    break
+                labels = new
+                for c in range(k):
+                    mem = X[labels == c]
+                    if mem.shape[0]:
+                        C[c] = F.normalize(mem.sum(0), dim=0)
+            score = float((1.0 - (X * C[labels]).sum(1)).mean())
+            if score < best_score:
+                best_score, best_labels = score, labels.clone()
+        return best_labels, best_score
 
-        # Build feature vectors per upstream edge: normalized outgoing write vector * sign(mean_causal_delta)
-        edge_vecs: List[torch.Tensor] = []
-        for e in inc_graph.edges:
-            sign = 1.0 if e.mean_causal_delta >= 0.0 else -1.0
-            if w_src is not None:
-                if w_src.ndim == 3:
-                    v = w_src[:, :, e.src_neuron].mean(dim=0)
-                elif src_write_mod.__class__.__name__ == "Conv1D":
-                    v = w_src[e.src_neuron, :]
-                else:
-                    v = (
-                        w_src[:, e.src_neuron]
-                        if e.src_neuron < w_src.shape[1]
-                        else w_src[e.src_neuron, :]
-                    )
-                v_norm = F.normalize(v.unsqueeze(0), dim=-1).squeeze(0) * sign
-            else:
-                v_norm = torch.tensor(
-                    [sign, float(e.virtual_weight_up), float(e.virtual_weight_gate)],
-                    dtype=torch.float32,
-                )
-                v_norm = F.normalize(v_norm.unsqueeze(0), dim=-1).squeeze(0)
-            edge_vecs.append(v_norm.cpu())
-
-        feat_mat = torch.stack(edge_vecs, dim=0)  # [M, d]
-        sim_mat = feat_mat @ feat_mat.T          # [M, M]
-
-        k_clusters = min(max(num_clusters, 1), len(inc_graph.edges))
-        # Select medoid seeds via farthest-point cosine seeding starting from the strongest edge (0)
-        medoids: List[int] = [0]
-        for _ in range(1, k_clusters):
-            max_sim_to_existing = sim_mat[:, medoids].max(dim=1).values
-            next_seed = int(max_sim_to_existing.argmin().item())
-            if next_seed not in medoids:
-                medoids.append(next_seed)
-
-        clusters: Dict[int, List[int]] = {m: [] for m in medoids}
-        for idx in range(len(inc_graph.edges)):
-            best_m = max(medoids, key=lambda m: float(sim_mat[idx, m].item()))
-            clusters[best_m].append(idx)
-
-        tracker = self.injector.get_stats_tracker(src_layer)
-        bundles: List[UpstreamAttributionBundle] = []
-        for b_id, (_, member_indices) in enumerate(clusters.items()):
-            if not member_indices:
+    @staticmethod
+    def _silhouette_cosine(X: torch.Tensor, labels: torch.Tensor) -> float:
+        D = torch.clamp(1.0 - X @ X.T, min=0.0)
+        n = X.shape[0]
+        ks = labels.unique()
+        if len(ks) < 2:
+            return float("nan")
+        s = torch.zeros(n)
+        for i in range(n):
+            same = labels == labels[i]
+            n_same = int(same.sum()) - 1
+            if n_same == 0:
+                s[i] = 0.0
                 continue
-            member_edges = [inc_graph.edges[i] for i in member_indices]
-            up_neurons = [e.src_neuron for e in member_edges]
-            tot_attrib = sum(e.mean_causal_delta for e in member_edges)
-            pos_votes = sum(1 for e in member_edges if e.src_pole == PoleType.POSITIVE)
-            dom_pole = (
-                PoleType.POSITIVE
-                if pos_votes >= (len(member_edges) - pos_votes)
-                else PoleType.NEGATIVE
-            )
+            a = D[i, same].sum() / n_same
+            b = min(float(D[i, labels == c].mean()) for c in ks if c != labels[i])
+            s[i] = (b - a) / max(float(a), b) if max(float(a), b) > 0 else 0.0
+        return float(s.mean())
 
-            if len(member_indices) > 1:
-                sub_sim = sim_mat[member_indices][:, member_indices]
-                n_m = len(member_indices)
-                off_diag_sum = float(sub_sim.sum().item()) - float(n_m)
-                mean_cos = off_diag_sum / max(n_m * (n_m - 1), 1)
-            else:
-                mean_cos = 1.0
+    def cluster_incoming_attribution_bundles(self, src_layer: str, dst_layer: str, dst_neuron: int, contexts: List[Any],
+                                             dst_pole: PoleType = PoleType.POSITIVE, forward_fn: Optional[Callable] = None,
+                                             top_k_upstream: int = 24, max_bundles: int = 6, seed: int = 0,
+                                             context_labels: Optional[List[str]] = None, n_permutations: int = 100,
+                                             alpha: float = 0.05) -> List[UpstreamAttributionBundle]:
+        """
+        'We also cluster the attribution flowing into the neuron': for each of the target's activating
+        contexts, attribute the target's strongest pole activation to every upstream neuron; the
+        `top_k_upstream` neurons by total |attribution| are clustered by their attribution profiles
+        across contexts (cosine k-means, k in [2, max_bundles] chosen by silhouette).
+        The clustering is kept only if its silhouette exceeds the (1 - alpha) quantile of silhouettes
+        obtained after independently permuting every profile across contexts (which destroys shared
+        structure); otherwise all upstream neurons form a single bundle.
+        """
+        run = forward_fn or default_forward
+        if len(contexts) < 3:
+            raise ValueError("Bundle clustering needs at least three activating contexts.")
+        rows = []
+        for ctx in contexts:
+            am = ctx.get("attention_mask") if isinstance(ctx, dict) else None
+            a, _, _, _ = self._attribution_into(src_layer, dst_layer, dst_neuron, ctx, dst_pole, run, am, focal=True)
+            rows.append(a.cpu())
+        A = torch.stack(rows)  # [n_ctx, n_src]
+        total = A.abs().sum(0)
+        top = torch.topk(total, k=min(top_k_upstream, total.numel())).indices
+        P = A[:, top].T  # [M, n_ctx]
+        keep = P.norm(dim=1) > 0
+        top, P = top[keep], P[keep]
+        X = F.normalize(P, dim=1)
+        M = X.shape[0]
+        gen = torch.Generator().manual_seed(seed)
 
-            shared_toks: List[str] = []
-            if tracker is not None:
-                for n_i in up_neurons:
-                    prof_i = tracker.export_profile(n_i)
-                    samples_i = (
-                        prof_i.top_positive_samples
-                        if dom_pole == PoleType.POSITIVE
-                        else prof_i.top_negative_samples
-                    )
-                    for s in samples_i[:3]:
-                        if s.token_str and s.token_str not in shared_toks:
-                            shared_toks.append(s.token_str)
+        def _best(Xm: torch.Tensor) -> Tuple[torch.Tensor, float]:
+            bl, bs = torch.zeros(Xm.shape[0], dtype=torch.long), float("nan")
+            for k in range(2, min(max_bundles, Xm.shape[0] - 1) + 1):
+                labels, _ = self._spherical_kmeans(Xm, k, gen)
+                sil = self._silhouette_cosine(Xm, labels)
+                if math.isfinite(sil) and (not math.isfinite(bs) or sil > bs):
+                    bl, bs = labels, sil
+            return bl, bs
 
-            bundles.append(
-                UpstreamAttributionBundle(
-                    dst_layer=dst_layer,
-                    dst_neuron=dst_neuron,
-                    dst_pole=dst_pole,
-                    src_layer=src_layer,
-                    bundle_id=b_id,
-                    upstream_neurons=up_neurons,
-                    dominant_pole=dom_pole,
-                    total_causal_attribution=round(float(tot_attrib), 5),
-                    mean_pairwise_cosine=round(float(mean_cos), 4),
-                    shared_activating_tokens=shared_toks[:8],
-                )
-            )
-
-        bundles.sort(key=lambda b: abs(b.total_causal_attribution), reverse=True)
-        for new_id, b in enumerate(bundles):
-            b.bundle_id = new_id
+        best_labels, best_sil = _best(X)
+        null_p = float("nan")
+        if math.isfinite(best_sil) and n_permutations > 0:
+            null = []
+            for _ in range(n_permutations):
+                Pp = torch.stack([row[torch.randperm(row.numel(), generator=gen)] for row in P])
+                null.append(_best(F.normalize(Pp, dim=1))[1])
+            null_t = torch.tensor([v for v in null if math.isfinite(v)])
+            null_p = float((null_t >= best_sil).float().mean()) if null_t.numel() else float("nan")
+        if not (math.isfinite(null_p) and null_p < alpha):
+            best_labels = torch.zeros(M, dtype=torch.long)
+        grand = float(total[top].sum()) or 1.0
+        bundles = []
+        for b in best_labels.unique().tolist():
+            idx = (best_labels == b).nonzero().reshape(-1)
+            members = top[idx]
+            Xm = X[idx]
+            mean_cos = float(((Xm @ Xm.T).sum() - len(idx)) / max(len(idx) * (len(idx) - 1), 1)) if len(idx) > 1 else 1.0
+            drive = A[:, members].sum(1) * (1.0 if dst_pole != PoleType.NEGATIVE else -1.0)
+            order = torch.argsort(drive, descending=True).tolist()
+            bundles.append(UpstreamAttributionBundle(
+                dst_layer=dst_layer, dst_neuron=dst_neuron, dst_pole=dst_pole, src_layer=src_layer, bundle_id=b,
+                upstream_neurons=[int(x) for x in members.tolist()],
+                attribution_share=float(total[members].sum()) / grand,
+                mean_within_cosine=mean_cos, silhouette=best_sil if math.isfinite(best_sil) else float('nan'),
+                silhouette_null_p=null_p,
+                driving_context_indices=order[: min(5, len(order))],
+                driving_contexts=[context_labels[i] for i in order[:5]] if context_labels else [],
+            ))
+        bundles.sort(key=lambda x: x.attribution_share, reverse=True)
+        for i, b in enumerate(bundles):
+            b.bundle_id = i
         return bundles
 
+    # ------------------------------------------------------------------
+    # 5. Residual stream sinks
+    # ------------------------------------------------------------------
+    def _norm_for_attention(self, block: nn.Module) -> Optional[nn.Module]:
+        for nm in _ATTN_NORM_NAMES:
+            if hasattr(block, nm):
+                return getattr(block, nm)
+        return None
+
     @torch.no_grad()
-    def audit_residual_stream_sinks(
-        self,
-        src_layer: str,
-        neuron_indices: Optional[List[int]] = None,
-        unembed_weight: Optional[torch.Tensor] = None,
-        sink_cosine_threshold: float = 0.25,
-    ) -> ResidualSinkReport:
+    def audit_residual_stream_sinks(self, residual_site: str, batches: Iterable[Any], forward_fn: Callable = default_forward,
+                                    neuron_layers: Optional[List[str]] = None) -> ResidualSinkReport:
         """
-        Audits neurons in `src_layer` for Residual Stream Sink behavior
-        (Cammarata: 'Finding Clean Circuits — Residual Stream Sinks & Norm Scaling'):
-          - Measures each neuron's outgoing write norm `||W_down[:, i]||_2`
-          - Measures its maximum absolute cosine alignment with all downstream MLP read rows
-            (`up_proj` and `gate_proj`) across subsequent layers (`max_reader_cosine`)
-          - Measures its maximum absolute cosine alignment with the vocabulary unembedding matrix
-            (`unembedding_alignment_cosine`)
-          - Identifies `is_residual_sink_candidate` neurons that write non-trivial norm into the
-            residual stream while remaining nearly orthogonal to downstream feature readers
-            and vocabulary unembedding directions (acting as LayerNorm/RMSNorm variance regulators).
+        'Looking at the Residual Stream': for the residual stream entering module `residual_site`
+        (e.g. a decoder block, or the final norm), compares each coordinate's share of activation mass
+        E[x_d^2] with its share of what downstream readers read, sum over readers of ||W[:, d] * gamma_d||^2
+        (attention q/k/v and MLP gate/up of later blocks, and the unembedding, each with its own norm scale).
         """
-        src_write_mod, _, _ = LayerDiscovery.resolve_mlp_read_write_modules(self.model, src_layer)
-        _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
-        target_indices = (
-            list(neuron_indices) if neuron_indices is not None else list(range(num_src))
-        )
+        mod = self.model.get_submodule(residual_site)
+        sq: Dict[str, Any] = {"sum": None, "n": 0}
+        cur: Dict[str, Any] = {}
 
-        all_discovered = self.injector.list_targetable_layers()
-        layer_keys = list(all_discovered.keys())
-        if src_layer in layer_keys:
-            downstream_layers = layer_keys[layer_keys.index(src_layer) + 1:]
-        else:
-            downstream_layers = [k for k in layer_keys if k != src_layer]
+        def _pre(_m, inp):
+            x = inp[0] if inp and isinstance(inp[0], torch.Tensor) else None
+            if x is None:
+                return
+            flat = x.detach().float().reshape(-1, x.shape[-1])
+            mk = cur.get("mask")
+            if mk is not None and mk.numel() == flat.shape[0]:
+                flat = flat[mk.reshape(-1).bool().to(flat.device)]
+            s = (flat ** 2).sum(0)
+            sq["sum"] = s if sq["sum"] is None else sq["sum"] + s
+            sq["n"] += flat.shape[0]
 
-        if not hasattr(src_write_mod, "weight") or not isinstance(
-            src_write_mod.weight, torch.Tensor
-        ):
-            return ResidualSinkReport(src_layer=src_layer, num_neurons_audited=0)
+        h = mod.register_forward_pre_hook(_pre)
+        try:
+            with self.injector.clean_forward():
+                for b in batches:
+                    cur["mask"] = b.get("attention_mask") if isinstance(b, dict) else None
+                    forward_fn(self.model, b)
+        finally:
+            h.remove()
+        if sq["sum"] is None:
+            raise ValueError(f"No inputs were observed at '{residual_site}'.")
+        mass = sq["sum"].cpu()
+        d_model = mass.numel()
+        mass_share = mass / mass.sum()
 
-        w_src = src_write_mod.weight.detach().float()
-        if w_src.ndim == 3:
-            w_down = w_src.mean(dim=0)
-        elif src_write_mod.__class__.__name__ == "Conv1D":
-            w_down = w_src.T
-        else:
-            w_down = w_src if w_src.shape[1] == num_src else w_src.T
-
-        device = w_down.device
-        sub_down = w_down[:, target_indices]  # [d_model, K]
-        out_norms = torch.norm(sub_down, p=2, dim=0)
-        sub_down_norm = F.normalize(sub_down, dim=0)  # [d_model, K]
-
-        max_reader_cos = torch.zeros(len(target_indices), dtype=torch.float32, device=device)
-
-        for d_layer in downstream_layers:
-            d_write, d_up, d_gate = LayerDiscovery.resolve_mlp_read_write_modules(
-                self.model, d_layer
-            )
-            pre_norm = LayerDiscovery.resolve_pre_mlp_norm(self.model, d_layer)
-            norm_scale = LayerDiscovery.extract_norm_scale(
-                pre_norm, d_model=sub_down.shape[0], device=device, dtype=torch.float32
-            )
-            scaled_write = (
-                F.normalize(sub_down * norm_scale.unsqueeze(1), dim=0)
-                if norm_scale is not None
-                else sub_down_norm
-            )
-
-            for r_mod in (d_up if d_up is not None else d_write, d_gate):
-                if r_mod is None or not hasattr(r_mod, "weight"):
+        order = [n for n, _ in self.model.named_modules() if n]
+        site_pos = order.index(residual_site)
+        read = torch.zeros(d_model)
+        # MLP readers of later layers
+        for name in self.injector.list_targetable_layers():
+            base = LayerDiscovery.split_expert_layer_name(name)[0]
+            if base not in order or order.index(base) <= site_pos:
+                continue
+            up, gate = LayerDiscovery.neuron_read_vectors(self.model, name)
+            g = self._dst_norm_scale(name, d_model, torch.device("cpu"))
+            for Wr in (up, gate):
+                if Wr is not None and Wr.shape[1] == d_model:
+                    Wf = Wr.float().cpu() * (g.cpu() if g is not None else 1.0)
+                    read += (Wf ** 2).sum(0)
+        # attention readers of later blocks
+        for name, m in self.model.named_modules():
+            if not name or order.index(name) <= site_pos or name.split(".")[-1] not in _ATTN_READER_LEAVES:
+                continue
+            w = getattr(m, "weight", None)
+            if not isinstance(w, torch.Tensor) or w.ndim != 2:
+                continue
+            Wf = w.detach().float().cpu()
+            if m.__class__.__name__ == "Conv1D":
+                Wf = Wf.T
+            if Wf.shape[1] != d_model:
+                continue
+            parts = name.split(".")
+            gamma = None
+            for depth in range(len(parts) - 1, 0, -1):
+                blk = self.model.get_submodule(".".join(parts[:depth]))
+                nm = self._norm_for_attention(blk)
+                if nm is not None:
+                    gamma = LayerDiscovery.extract_norm_scale(nm, d_model=d_model, device=torch.device("cpu"))
+                    break
+            read += ((Wf * (gamma if gamma is not None else 1.0)) ** 2).sum(0)
+        # unembedding
+        emb = self.model.get_output_embeddings() if hasattr(self.model, "get_output_embeddings") else None
+        if emb is not None and isinstance(getattr(emb, "weight", None), torch.Tensor) and emb.weight.shape[1] == d_model:
+            fn = LayerDiscovery.resolve_final_norm(self.model)
+            gamma = LayerDiscovery.extract_norm_scale(fn, d_model=d_model, device=torch.device("cpu"))
+            read += ((emb.weight.detach().float().cpu() * (gamma if gamma is not None else 1.0)) ** 2).sum(0)
+        read_share = read / read.sum() if read.sum() > 0 else read
+        uniform = 1.0 / d_model
+        entries = []
+        sinks = []
+        for d in torch.argsort(mass_share, descending=True).tolist():
+            cand = float(mass_share[d]) > uniform and float(read_share[d]) < uniform
+            if cand:
+                sinks.append(d)
+            entries.append(ResidualCoordinateEntry(d, float(mass_share[d]), float(read_share[d]), cand))
+        write_share: Dict[int, float] = {}
+        if neuron_layers and sinks:
+            for nl in neuron_layers:
+                W = LayerDiscovery.neuron_write_vectors(self.model, nl)
+                if W is None:
                     continue
-                rw = r_mod.weight.detach().to(device=device, dtype=torch.float32)
-                if rw.ndim == 3:
-                    rw = rw.mean(dim=0)
-                elif r_mod.__class__.__name__ == "Conv1D":
-                    rw = rw.T
-                if rw.shape[1] == scaled_write.shape[0]:
-                    rw_norm = F.normalize(rw, dim=-1)  # [num_d, d_model]
-                    cos_mat = (rw_norm @ scaled_write).abs()  # [num_d, K]
-                    if cos_mat.numel() > 0:
-                        max_reader_cos = torch.maximum(max_reader_cos, cos_mat.max(dim=0).values)
+                Wf = W.float().cpu()
+                share = (Wf[:, sinks] ** 2).sum(1) / torch.clamp((Wf ** 2).sum(1), min=1e-30)
+                for i, v in enumerate(share.tolist()):
+                    write_share[i] = max(write_share.get(i, 0.0), v)
+        return ResidualSinkReport(residual_site, d_model, int(sq["n"]), entries, sinks, write_share)
 
-            # Also check downstream Attention Q/K/V readers in the same transformer block
-            block_prefix = (
-                d_layer.split(".mlp")[0]
-                if ".mlp" in d_layer
-                else (d_layer.rsplit(".", 1)[0] if "." in d_layer else "")
-            )
-            if block_prefix:
-                try:
-                    block_mod = self.model.get_submodule(block_prefix)
-                except Exception:
-                    block_mod = None
-                if block_mod is not None:
-                    attn_norm = (
-                        getattr(block_mod, "input_layernorm", None)
-                        or getattr(block_mod, "ln_1", None)
-                        or getattr(block_mod, "pre_attention_layernorm", None)
-                    )
-                    attn_scale = LayerDiscovery.extract_norm_scale(
-                        attn_norm, d_model=sub_down.shape[0], device=device, dtype=torch.float32
-                    )
-                    scaled_attn_write = (
-                        F.normalize(sub_down * attn_scale.unsqueeze(1), dim=0)
-                        if attn_scale is not None
-                        else sub_down_norm
-                    )
-                    attn_proj_names = {
-                        "q_proj",
-                        "k_proj",
-                        "v_proj",
-                        "qkv_proj",
-                        "c_attn",
-                        "query",
-                        "key",
-                        "value",
-                    }
-                    for sub_name, sub_m in block_mod.named_modules():
-                        leaf = sub_name.split(".")[-1]
-                        if leaf in attn_proj_names and hasattr(sub_m, "weight"):
-                            aw = sub_m.weight.detach().to(device=device, dtype=torch.float32)
-                            if sub_m.__class__.__name__ == "Conv1D":
-                                aw = aw.T
-                            elif aw.shape[1] != scaled_attn_write.shape[0] and aw.shape[0] == scaled_attn_write.shape[0]:
-                                aw = aw.T
-                            if aw.ndim == 2 and aw.shape[1] == scaled_attn_write.shape[0]:
-                                aw_norm = F.normalize(aw, dim=-1)
-                                acos_mat = (aw_norm @ scaled_attn_write).abs()
-                                if acos_mat.numel() > 0:
-                                    max_reader_cos = torch.maximum(
-                                        max_reader_cos, acos_mat.max(dim=0).values
-                                    )
+    # ------------------------------------------------------------------
+    # 6. 'Nothing reads that combination'
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def verify_combination_readout(self, src_layer: str, src_neurons: List[int], coefficients: Optional[List[float]] = None,
+                                   dst_layers: Optional[List[str]] = None, null_samples: int = 1000, seed: int = 0,
+                                   alpha: float = 0.05, causal_inputs: Any = None,
+                                   forward_fn: Optional[Callable] = None) -> CombinationReadoutReport:
+        """
+        For a hypothesised hidden combination c of src neurons, measures the largest |cosine| between
+        sum_i c_i W_down[:, i] and any downstream reader row (value and gate rows of `dst_layers`,
+        norm-scaled), and compares it with (a) the best single constituent and (b) the same statistic
+        for `null_samples` random neuron sets of the same size and coefficients. The combination is
+        'read' only if it beats both its constituents and the (1 - alpha) quantile of the null.
+        """
+        coeffs = coefficients or [1.0] * len(src_neurons)
+        if len(coeffs) != len(src_neurons):
+            raise ValueError("coefficients must align with src_neurons")
+        W = LayerDiscovery.neuron_write_vectors(self.model, src_layer)
+        if W is None:
+            raise ValueError(f"'{src_layer}' has no residual write matrix.")
+        W = W.float().cpu()
+        layers = list(self.injector.list_targetable_layers().keys())
+        if dst_layers is None:
+            dst_layers = layers[layers.index(src_layer) + 1:] if src_layer in layers else []
+        readers: List[Tuple[str, str, torch.Tensor]] = []
+        for d in dst_layers:
+            up, gate = LayerDiscovery.neuron_read_vectors(self.model, d)
+            g = self._dst_norm_scale(d, W.shape[1], torch.device("cpu"))
+            for kind, R in (("up", up), ("gate", gate)):
+                if R is not None:
+                    Rf = R.float().cpu() * (g.cpu() if g is not None else 1.0)
+                    readers.append((d, kind, F.normalize(Rf, dim=1)))
+        if not readers:
+            raise ValueError("No downstream readers found.")
 
-        unembed_cos = torch.zeros(len(target_indices), dtype=torch.float32, device=device)
-        if unembed_weight is not None:
-            u_w = unembed_weight.detach().to(device=device, dtype=torch.float32)
-            if u_w.shape[1] != sub_down.shape[0] and u_w.shape[0] == sub_down.shape[0]:
-                u_w = u_w.T
-            if u_w.shape[1] == sub_down.shape[0]:
-                final_norm = LayerDiscovery.resolve_final_norm(self.model)
-                f_scale = LayerDiscovery.extract_norm_scale(
-                    final_norm, d_model=sub_down.shape[0], device=device, dtype=torch.float32
-                )
-                scaled_final = (
-                    F.normalize(sub_down * f_scale.unsqueeze(1), dim=0)
-                    if f_scale is not None
-                    else sub_down_norm
-                )
-                u_norm = F.normalize(u_w, dim=-1)
-                u_mat = (u_norm @ scaled_final).abs()
-                if u_mat.numel() > 0:
-                    unembed_cos = u_mat.max(dim=0).values
+        def _max_cos(vec: torch.Tensor) -> Tuple[float, Tuple[str, int, str]]:
+            v = F.normalize(vec, dim=0)
+            best, where = -1.0, ("", -1, "")
+            for d, kind, R in readers:
+                c = (R @ v).abs()
+                j = int(c.argmax())
+                if float(c[j]) > best:
+                    best, where = float(c[j]), (d, j, kind)
+            return best, where
 
-        entries: List[ResidualSinkEntry] = []
-        sink_indices: List[int] = []
+        ct = torch.tensor(coeffs, dtype=torch.float32)
+        comb = (W[src_neurons] * ct.unsqueeze(1)).sum(0)
+        obs, where = _max_cos(comb)
+        single = max(_max_cos(W[i])[0] for i in src_neurons)
+        rng = random.Random(seed)
+        pool = list(range(W.shape[0]))
+        null = []
+        for _ in range(null_samples):
+            idx = rng.sample(pool, k=len(src_neurons))
+            null.append(_max_cos((W[idx] * ct.unsqueeze(1)).sum(0))[0])
+        null_t = torch.tensor(null)
+        q = float(torch.quantile(null_t, 1.0 - alpha)) if null else float("nan")
+        pct = float((null_t < obs).float().mean()) if null else float("nan")
 
-        out_norms_cpu = out_norms.cpu().tolist()
-        reader_cos_cpu = max_reader_cos.cpu().tolist()
-        unembed_cos_cpu = unembed_cos.cpu().tolist()
+        causal = None
+        if causal_inputs is not None and where[1] >= 0:
+            run = forward_fn or default_forward
+            dl, j, _ = where
+            hs_site = HookSet(self.model).site(dl)
 
-        for local_i, n_idx in enumerate(target_indices):
-            w_n = float(out_norms_cpu[local_i])
-            r_c = float(reader_cos_cpu[local_i])
-            u_c = float(unembed_cos_cpu[local_i])
-            max_eff = max(r_c, u_c)
-            null_frac = max(0.0, 1.0 - max_eff)
-            is_sink = (
-                w_n > 1e-4
-                and r_c < sink_cosine_threshold
-                and (u_c < sink_cosine_threshold if unembed_weight is not None else True)
-            )
-            if is_sink:
-                sink_indices.append(n_idx)
-            entries.append(
-                ResidualSinkEntry(
-                    neuron_idx=n_idx,
-                    outgoing_weight_norm=round(w_n, 4),
-                    max_reader_cosine=round(r_c, 4),
-                    unembedding_alignment_cosine=round(u_c, 4),
-                    sink_null_fraction=round(null_frac, 4),
-                    is_residual_sink_candidate=is_sink,
-                )
-            )
+            def _read_dst(specs):
+                hs = HookSet(self.model)
+                got: List[torch.Tensor] = []
+                hs.add_capture(dl, lambda a, g, r: got.append(a.detach().float()))
+                with self.injector.temporary_interventions(specs), hs.active():
+                    run(self.model, causal_inputs)
+                return flat_neuron_view(got[-1], hs_site.is_conv2d)[:, j]
 
-        return ResidualSinkReport(
-            src_layer=src_layer,
-            num_neurons_audited=len(target_indices),
-            sink_candidate_indices=sink_indices,
-            entries=entries,
+            base = _read_dst([])
+            joint = _read_dst([InterventionSpec(src_layer, list(src_neurons), InterventionMode.ZERO_ABLATE)])
+            indiv = sum((base - _read_dst([InterventionSpec(src_layer, [i], InterventionMode.ZERO_ABLATE)])) for i in src_neurons)
+            causal = {
+                "reader_mean_clean": float(base.mean()),
+                "joint_ablation_delta": float((base - joint).mean()),
+                "sum_individual_ablation_deltas": float(indiv.mean()),
+                "interaction": float(((base - joint) - indiv).mean()),
+            }
+        return CombinationReadoutReport(
+            src_layer=src_layer, dst_layers=dst_layers, src_neurons=list(src_neurons), coefficients=list(coeffs),
+            combination_max_reader_cosine=obs, best_reader=where, best_single_constituent_cosine=single,
+            null_samples=null_samples, null_mean=float(null_t.mean()) if null else float("nan"), null_p95=q,
+            combination_percentile_in_null=pct, reads_combination_beyond_constituents=bool(obs > single and obs > q),
+            causal_interaction=causal,
         )
 
-    # -------------------------------------------------------------------------
-    # 4. Multi-Hop Circuit Subgraph Tracing (L_0 -> L_1 -> ... -> L_n)
-    # -------------------------------------------------------------------------
-    def trace_multi_hop(
-        self,
-        layer_sequence: List[str],
-        root_neuron: int,
-        root_pole: PoleType,
-        inputs: Any,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        beam_width: int = 3,
-    ) -> List[CircuitGraph]:
+    # ------------------------------------------------------------------
+    # 7. Direct vs indirect effect ('Memorization and Composition')
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def decompose_direct_vs_indirect_effect(self, layer_name: str, neuron_idx: int, inputs: Any, target_token_id: int,
+                                            downstream_layer: Optional[str] = None,
+                                            rescue_downstream_neurons: Optional[List[int]] = None,
+                                            pole: PoleType = PoleType.BOTH, forward_fn: Optional[Callable] = None,
+                                            position: int = -1) -> Dict[str, float]:
         """
-        Traces a multi-layer cascade starting from `(layer_sequence[0], root_neuron, root_pole)`
-        and expanding the top `beam_width` downstream neurons at each subsequent layer.
+        Probability of `target_token_id` at `position` when the neuron is
+          * untouched (clean),
+          * fully ablated (total effect),
+          * removed only from the direct path to the unembedding: its write a_i * W_down[:, i] is
+            subtracted from the final residual stream while every downstream layer sees the clean
+            value (direct effect),
+          * ablated while the listed downstream neurons are restored to their clean values (rescue).
         """
+        run = forward_fn or default_forward
+        hs = HookSet(self.model)
+        site = hs.site(layer_name)
+        if site.target != "input":
+            raise NotImplementedError("Direct-path removal needs a down-projection (input-hooked) neuron layer.")
+        W = LayerDiscovery.neuron_write_vectors(self.model, layer_name)
+        cap: List[torch.Tensor] = []
+        hs.add_capture(layer_name, lambda a, g, r: cap.append(a.detach()))
+        rescue_clean: List[torch.Tensor] = []
+        if downstream_layer and rescue_downstream_neurons:
+            hs.add_capture(downstream_layer, lambda a, g, r: rescue_clean.append(a.detach().clone()))
+
+        def _prob(logits: torch.Tensor) -> float:
+            return float(F.softmax(logits.float(), dim=-1)[0, position, target_token_id])
+
+        with self.injector.clean_forward(), hs.active():
+            p_clean = _prob(extract_logits(run(self.model, inputs)))
+        a = cap[-1][..., neuron_idx].float()
+        if pole == PoleType.POSITIVE:
+            a = torch.clamp(a, min=0.0)
+        elif pole == PoleType.NEGATIVE:
+            a = torch.clamp(a, max=0.0)
+        abl = InterventionSpec(layer_name, [neuron_idx], InterventionMode.ZERO_ABLATE, pole)
+        with self.injector.temporary_interventions([abl]):
+            p_total = _prob(extract_logits(run(self.model, inputs)))
+
+        final = LayerDiscovery.resolve_final_norm(self.model)
+        target_mod = final if final is not None else (self.model.get_output_embeddings() if hasattr(self.model, "get_output_embeddings") else None)
+        if target_mod is None:
+            raise ValueError("Cannot locate the final norm or unembedding to remove the direct path.")
+        w = W[neuron_idx].to(cap[-1].device)
+
+        def _remove_direct(_m, inp):
+            x = inp[0]
+            contrib = a.to(x.dtype).unsqueeze(-1) * w.to(x.dtype)
+            return (x - contrib,) + tuple(inp[1:])
+
+        h = target_mod.register_forward_pre_hook(_remove_direct)
+        try:
+            with self.injector.clean_forward():
+                p_direct = _prob(extract_logits(run(self.model, inputs)))
+        finally:
+            h.remove()
+
+        out = {
+            "clean_target_prob": p_clean,
+            "total_ablated_target_prob": p_total,
+            "direct_path_removed_target_prob": p_direct,
+            "total_effect": p_clean - p_total,
+            "direct_effect": p_clean - p_direct,
+        }
+        if rescue_clean:
+            idx = torch.as_tensor(rescue_downstream_neurons, dtype=torch.long)
+            ref = rescue_clean[-1]
+            hs2 = HookSet(self.model)
+
+            def _patch(act, _g):
+                act = act.clone()
+                ii = idx.to(act.device)
+                act[..., ii] = ref[..., ii].to(act.dtype)
+                return act
+
+            hs2.add_modifier(downstream_layer, _patch)
+            with self.injector.temporary_interventions([abl]), hs2.active():
+                p_rescued = _prob(extract_logits(run(self.model, inputs)))
+            out["rescued_target_prob"] = p_rescued
+            denom = p_clean - p_total
+            out["rescued_fraction_of_total_effect"] = (p_rescued - p_total) / denom if denom != 0 else float("nan")
+        return out
+
+    # ------------------------------------------------------------------
+    # 8. Multi-hop
+    # ------------------------------------------------------------------
+    def trace_multi_hop(self, layer_sequence: List[str], root_neuron: int, root_pole: PoleType, inputs: Any,
+                        forward_fn: Optional[Callable] = None, beam_width: int = 3) -> List[CircuitGraph]:
         if len(layer_sequence) < 2:
             raise ValueError("`layer_sequence` must contain at least 2 layers.")
-
         graphs: List[CircuitGraph] = []
-        current_front: List[Tuple[int, PoleType]] = [(root_neuron, root_pole)]
-
+        front: List[Tuple[int, PoleType]] = [(root_neuron, root_pole)]
         for hop in range(len(layer_sequence) - 1):
-            src_layer = layer_sequence[hop]
-            dst_layer = layer_sequence[hop + 1]
-            next_front: List[Tuple[int, PoleType]] = []
-
-            for neuron_idx, pole in current_front:
-                graph = self.trace_circuit(
-                    src_layer=src_layer,
-                    dst_layer=dst_layer,
-                    src_neuron=neuron_idx,
-                    inputs=inputs,
-                    forward_fn=forward_fn,
-                    src_pole=pole,
-                    top_k=beam_width * 2,
-                )
-                graphs.append(graph)
-                for edge in graph.edges[:beam_width]:
-                    next_front.append((edge.dst_neuron, edge.dst_pole_tendency))
-
-            # Deduplicate next frontier while preserving order
-            seen = set()
-            dedup_front = []
-            for item in next_front:
-                if item not in seen:
-                    seen.add(item)
-                    dedup_front.append(item)
-            current_front = dedup_front[:beam_width]
-
+            nxt: List[Tuple[int, PoleType]] = []
+            for n, p in front:
+                try:
+                    g = self.trace_circuit(layer_sequence[hop], layer_sequence[hop + 1], n, inputs, forward_fn, p,
+                                           compute_jacobian=False, top_k=beam_width)
+                except ValueError:
+                    continue
+                graphs.append(g)
+                nxt.extend((e.dst_neuron, e.dst_pole_tendency) for e in g.edges[:beam_width])
+            front = list(dict.fromkeys(nxt))[:beam_width]
         return graphs
-
-    # -------------------------------------------------------------------------
-    # 5. Auditing Superposition Hiding Places ("Nothing Reads That Combination")
-    # -------------------------------------------------------------------------
-    @torch.no_grad()
-    def verify_downstream_readout(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        src_neurons: List[int],
-        inputs: Any,
-        weak_threshold: Optional[Union[float, List[float]]] = None,
-        std_multiplier: Optional[float] = 0.75,
-        percentile: Optional[float] = None,
-        readout_tolerance: float = 0.05,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> DownstreamReadoutReport:
-        """
-        Tests Cammarata's 'Nothing Reads That Combination' hypothesis
-        ('Where Could Superposition Hide?'):
-        Evaluates whether weak/secondary cross-activations across a group of neurons
-        `src_neurons` in `src_layer` actually cross the gating/activation threshold of
-        any downstream neuron in `dst_layer` or alter the model's output distribution,
-        and compares the effect against a random-neuron-set null baseline of the same size.
-        """
-        run_fwd = forward_fn or (lambda m, inp: m(inp))
-        if attention_mask is None and isinstance(inputs, dict):
-            attention_mask = inputs.get("attention_mask")
-        _, _, num_src = LayerDiscovery.resolve_module(self.model, src_layer)
-        dst_mod, dst_target, num_dst = LayerDiscovery.resolve_module(self.model, dst_layer)
-        _, _, dst_gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(self.model, dst_layer)
-
-        tracker = self.injector.get_stats_tracker(src_layer)
-        if isinstance(weak_threshold, list):
-            applied_thresholds = [float(x) for x in weak_threshold]
-            scalar_val = applied_thresholds[0] if applied_thresholds else 0.0
-            per_neuron_vals: Optional[List[float]] = applied_thresholds
-        elif isinstance(weak_threshold, (int, float)):
-            scalar_val = float(weak_threshold)
-            applied_thresholds = [scalar_val] * len(src_neurons)
-            per_neuron_vals = None
-        elif tracker is not None:
-            applied_thresholds = tracker.compute_adaptive_thresholds(
-                src_neurons, std_multiplier=std_multiplier, percentile=percentile
-            )
-            scalar_val = applied_thresholds[0] if applied_thresholds else 0.5
-            per_neuron_vals = applied_thresholds
-        else:
-            scalar_val = 0.5
-            applied_thresholds = [0.5] * len(src_neurons)
-            per_neuron_vals = None
-
-        captured_dst: List[torch.Tensor] = []
-        captured_gate: List[torch.Tensor] = []
-
-        h_dst = (
-            dst_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    captured_dst.append(inp[0].detach().float())
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if dst_target == "input"
-            else dst_mod.register_forward_hook(
-                lambda _m, _inp, out: captured_dst.append(
-                    (out[0] if isinstance(out, tuple) else out).detach().float()
-                )
-            )
-        )
-
-        h_gate = None
-        if dst_gate_mod is not None and isinstance(dst_gate_mod, nn.Module) and not isinstance(
-            dst_gate_mod, _SlicedLinearView
-        ):
-            h_gate = dst_gate_mod.register_forward_hook(
-                lambda _m, _inp, out: captured_gate.append(
-                    (out[0] if isinstance(out, tuple) else out).detach().float()
-                )
-            )
-
-        def _extract_logits(out_obj: Any) -> Optional[torch.Tensor]:
-            t = out_obj.logits if hasattr(out_obj, "logits") else out_obj
-            if isinstance(t, tuple) and t and isinstance(t[0], torch.Tensor):
-                t = t[0]
-            return t.detach().float() if isinstance(t, torch.Tensor) and t.is_floating_point() else None
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            with self.injector.without_interventions():
-                clean_out = run_fwd(self.model, inputs)
-            clean_logits = _extract_logits(clean_out)
-            clean_dst = captured_dst[-1].reshape(-1, num_dst)
-            clean_gate = captured_gate[-1].reshape(-1, num_dst) if captured_gate else None
-
-            valid_pos_mask: Optional[torch.Tensor] = None
-            if attention_mask is not None and attention_mask.numel() == clean_dst.shape[0]:
-                m_flat = attention_mask.reshape(-1).to(
-                    device=clean_dst.device, dtype=torch.bool
-                )
-                if m_flat.any():
-                    valid_pos_mask = m_flat
-                    clean_dst = clean_dst[valid_pos_mask]
-                    if clean_gate is not None and clean_gate.shape[0] == m_flat.numel():
-                        clean_gate = clean_gate[valid_pos_mask]
-
-            prune_spec = InterventionSpec(
-                layer_name=src_layer,
-                neuron_indices=list(src_neurons),
-                mode=InterventionMode.WEAK_PRUNE,
-                pole=PoleType.BOTH,
-                value=scalar_val,
-                per_neuron_values=per_neuron_vals,
-            )
-            with self.injector.temporary_interventions([prune_spec]):
-                pruned_out = run_fwd(self.model, inputs)
-            pruned_logits = _extract_logits(pruned_out)
-            pruned_dst = captured_dst[-1].reshape(-1, num_dst)
-            if valid_pos_mask is not None and pruned_dst.shape[0] == valid_pos_mask.numel():
-                pruned_dst = pruned_dst[valid_pos_mask]
-            pruned_gate = (
-                captured_gate[-1].reshape(-1, num_dst)
-                if (captured_gate and len(captured_gate) >= 2)
-                else None
-            )
-            if (
-                pruned_gate is not None
-                and valid_pos_mask is not None
-                and pruned_gate.shape[0] == valid_pos_mask.numel()
-            ):
-                pruned_gate = pruned_gate[valid_pos_mask]
-
-            # Random-neuron-set null baseline of the same subset size k
-            other_pool = [i for i in range(num_src) if i not in set(src_neurons)]
-            k_null = min(len(src_neurons), len(other_pool))
-            null_max_shift = 0.0
-            null_kl = 0.0
-            if k_null > 0:
-                null_indices = other_pool[:k_null]
-                if tracker is not None and weak_threshold is None:
-                    null_vals = tracker.compute_adaptive_thresholds(
-                        null_indices, std_multiplier=std_multiplier, percentile=percentile
-                    )
-                    null_scalar = null_vals[0] if null_vals else scalar_val
-                else:
-                    null_vals = [scalar_val] * k_null
-                    null_scalar = scalar_val
-                null_spec = InterventionSpec(
-                    layer_name=src_layer,
-                    neuron_indices=null_indices,
-                    mode=InterventionMode.WEAK_PRUNE,
-                    pole=PoleType.BOTH,
-                    value=null_scalar,
-                    per_neuron_values=null_vals,
-                )
-                with self.injector.temporary_interventions([null_spec]):
-                    null_out = run_fwd(self.model, inputs)
-                null_logits = _extract_logits(null_out)
-                null_dst = captured_dst[-1].reshape(-1, num_dst)
-                if valid_pos_mask is not None and null_dst.shape[0] == valid_pos_mask.numel():
-                    null_dst = null_dst[valid_pos_mask]
-                null_diff = (clean_dst - null_dst).abs()
-                null_max_shift = (
-                    float(null_diff.max().item()) if null_diff.numel() > 0 else 0.0
-                )
-                if clean_logits is not None and null_logits is not None and clean_logits.shape == null_logits.shape:
-                    c_lp = F.log_softmax(clean_logits, dim=-1)
-                    n_lp = F.log_softmax(null_logits, dim=-1)
-                    tok_kl = (c_lp.exp() * (c_lp - n_lp)).sum(dim=-1)
-                    if valid_pos_mask is not None and tok_kl.numel() == valid_pos_mask.numel():
-                        null_kl = float(tok_kl.reshape(-1)[valid_pos_mask].mean().item())
-                    else:
-                        null_kl = float(tok_kl.mean().item())
-        finally:
-            h_dst.remove()
-            if h_gate is not None:
-                h_gate.remove()
-            if was_training:
-                self.model.train()
-
-        dst_diff = (clean_dst - pruned_dst).abs()
-        per_dst_max_shift = dst_diff.max(dim=0).values
-        max_act_shift = float(per_dst_max_shift.max().item()) if per_dst_max_shift.numel() > 0 else 0.0
-        mean_act_shift = float(dst_diff.mean().item()) if dst_diff.numel() > 0 else 0.0
-
-        dst_scale = torch.clamp(clean_dst.std(dim=0, unbiased=False), min=1e-2)
-        rel_max_shift = (
-            float((per_dst_max_shift / dst_scale).max().item())
-            if per_dst_max_shift.numel() > 0
-            else 0.0
-        )
-
-        if clean_gate is not None and pruned_gate is not None:
-            gate_diff = (clean_gate - pruned_gate).abs()
-            max_gate_shift = float(gate_diff.max().item())
-            mean_gate_shift = float(gate_diff.mean().item())
-            gate_flips = (clean_gate > 0) != (pruned_gate > 0)
-            gate_flip_rate = float(gate_flips.float().mean().item()) if gate_flips.numel() > 0 else 0.0
-        else:
-            max_gate_shift = 0.0
-            mean_gate_shift = 0.0
-            gate_flip_rate = 0.0
-
-        out_kl = 0.0
-        if clean_logits is not None and pruned_logits is not None and clean_logits.shape == pruned_logits.shape:
-            c_lp = F.log_softmax(clean_logits, dim=-1)
-            p_lp = F.log_softmax(pruned_logits, dim=-1)
-            tok_kl = (c_lp.exp() * (c_lp - p_lp)).sum(dim=-1)
-            if valid_pos_mask is not None and tok_kl.numel() == valid_pos_mask.numel():
-                out_kl = float(tok_kl.reshape(-1)[valid_pos_mask].mean().item())
-            else:
-                out_kl = float(tok_kl.mean().item())
-
-        affected_dst = torch.nonzero(per_dst_max_shift > readout_tolerance, as_tuple=False).squeeze(-1)
-        affected_list = (
-            [int(affected_dst.item())]
-            if affected_dst.ndim == 0 and affected_dst.numel() == 1
-            else [int(i) for i in affected_dst.tolist()]
-        )
-        eff_vs_null = max_act_shift / max(null_max_shift, 1e-6) if max_act_shift > 0 else 0.0
-
-        return DownstreamReadoutReport(
-            src_layer=src_layer,
-            dst_layer=dst_layer,
-            src_neurons=list(src_neurons),
-            applied_thresholds=[round(float(t), 5) for t in applied_thresholds],
-            max_downstream_activation_shift=round(max_act_shift, 5),
-            mean_downstream_activation_shift=round(mean_act_shift, 5),
-            max_downstream_gate_shift=round(max_gate_shift, 5),
-            mean_downstream_gate_shift=round(mean_gate_shift, 5),
-            readout_tolerance=readout_tolerance,
-            affected_downstream_neurons=affected_list,
-            is_benign_spillover=(len(affected_list) == 0),
-            output_kl_divergence=round(out_kl, 6),
-            null_baseline_max_shift=round(null_max_shift, 5),
-            null_baseline_kl=round(null_kl, 6),
-            effect_vs_null_ratio=round(eff_vs_null, 4),
-            downstream_gate_flip_rate=round(gate_flip_rate, 5),
-            relative_max_activation_shift=round(rel_max_shift, 5),
-        )
-
-    @torch.no_grad()
-    def decompose_direct_vs_indirect_effect(
-        self,
-        layer_name: str,
-        neuron_idx: int,
-        inputs: Any,
-        target_token_id: int,
-        downstream_layer: str,
-        rescue_downstream_neurons: List[int],
-        pole: PoleType = PoleType.BOTH,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, float]:
-        """
-        Decomposes a neuron's total causal effect on `target_token_id` into:
-          1. Direct (unmediated) effect at the unembedding, and
-          2. Indirect effect mediated through `rescue_downstream_neurons` in `downstream_layer`
-        (Cammarata's Poe 'dreary' direct-vs-indirect mediation experiment).
-        """
-        run_fwd = forward_fn or (lambda m, inp: m(inp))
-        if attention_mask is None and isinstance(inputs, dict):
-            attention_mask = inputs.get("attention_mask")
-        dst_mod, dst_target, _ = LayerDiscovery.resolve_module(self.model, downstream_layer)
-
-        captured_clean_dst: List[torch.Tensor] = []
-
-        h_cap = (
-            dst_mod.register_forward_pre_hook(
-                lambda _m, inp: (
-                    captured_clean_dst.append(inp[0].detach().clone())
-                    if inp and isinstance(inp[0], torch.Tensor)
-                    else None
-                )
-            )
-            if dst_target == "input"
-            else dst_mod.register_forward_hook(
-                lambda _m, _inp, out: captured_clean_dst.append(
-                    (out[0] if isinstance(out, tuple) else out).detach().clone()
-                )
-            )
-        )
-
-        def _extract_logits(out_obj: Any) -> torch.Tensor:
-            t = out_obj.logits if hasattr(out_obj, "logits") else out_obj
-            if isinstance(t, tuple) and t and isinstance(t[0], torch.Tensor):
-                t = t[0]
-            return t.detach().float()
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            with self.injector.without_interventions():
-                clean_out = run_fwd(self.model, inputs)
-            clean_logits = _extract_logits(clean_out)
-            clean_dst_tensor = captured_clean_dst[-1]
-        finally:
-            h_cap.remove()
-
-        ablate_spec = InterventionSpec(
-            layer_name=layer_name,
-            neuron_indices=[neuron_idx],
-            mode=InterventionMode.ZERO_ABLATE,
-            pole=pole,
-            value=0.0,
-        )
-
-        try:
-            with self.injector.temporary_interventions([ablate_spec]):
-                ablated_out = run_fwd(self.model, inputs)
-            ablated_logits = _extract_logits(ablated_out)
-
-            rescue_idx_t = torch.as_tensor(
-                rescue_downstream_neurons, dtype=torch.long, device=clean_dst_tensor.device
-            )
-
-            def _patch_pre(_m: nn.Module, inp: Tuple[Any, ...]) -> Tuple[Any, ...]:
-                if inp and isinstance(inp[0], torch.Tensor):
-                    patched = inp[0].clone()
-                    patched[..., rescue_idx_t] = clean_dst_tensor[..., rescue_idx_t].to(
-                        device=patched.device, dtype=patched.dtype
-                    )
-                    return (patched,) + inp[1:]
-                return inp
-
-            def _patch_post(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> Any:
-                t0 = out[0] if isinstance(out, tuple) else out
-                if isinstance(t0, torch.Tensor):
-                    patched = t0.clone()
-                    patched[..., rescue_idx_t] = clean_dst_tensor[..., rescue_idx_t].to(
-                        device=patched.device, dtype=patched.dtype
-                    )
-                    return (patched,) + out[1:] if isinstance(out, tuple) else patched
-                return out
-
-            h_rescue = (
-                dst_mod.register_forward_pre_hook(_patch_pre)
-                if dst_target == "input"
-                else dst_mod.register_forward_hook(_patch_post)
-            )
-            try:
-                with self.injector.temporary_interventions([ablate_spec]):
-                    rescued_out = run_fwd(self.model, inputs)
-                rescued_logits = _extract_logits(rescued_out)
-            finally:
-                h_rescue.remove()
-        finally:
-            if was_training:
-                self.model.train()
-
-        clean_probs = F.softmax(clean_logits, dim=-1)[..., target_token_id]
-        ablated_probs = F.softmax(ablated_logits, dim=-1)[..., target_token_id]
-        rescued_probs = F.softmax(rescued_logits, dim=-1)[..., target_token_id]
-
-        if attention_mask is not None and attention_mask.numel() == clean_probs.numel():
-            m_flat = attention_mask.reshape(-1).to(device=clean_probs.device, dtype=torch.bool)
-            if m_flat.any():
-                clean_probs = clean_probs.reshape(-1)[m_flat]
-                ablated_probs = ablated_probs.reshape(-1)[m_flat]
-                rescued_probs = rescued_probs.reshape(-1)[m_flat]
-
-        c_p = float(clean_probs.mean().item())
-        a_p = float(ablated_probs.mean().item())
-        r_p = float(rescued_probs.mean().item())
-
-        total_drop = max(0.0, c_p - a_p)
-        indirect_recovered = max(0.0, r_p - a_p)
-        direct_remaining = max(0.0, c_p - r_p)
-        denom = max(total_drop, 1e-8)
-
-        return {
-            "clean_target_prob": round(c_p, 6),
-            "total_ablated_target_prob": round(a_p, 6),
-            "rescued_target_prob": round(r_p, 6),
-            "total_ablation_prob_drop": round(total_drop, 6),
-            "indirect_mediated_prob_effect": round(indirect_recovered, 6),
-            "direct_unmediated_prob_effect": round(direct_remaining, 6),
-            "indirect_mediated_share": round(min(1.0, indirect_recovered / denom), 4),
-            "direct_unmediated_share": round(min(1.0, direct_remaining / denom), 4),
-        }

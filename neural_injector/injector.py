@@ -2,36 +2,45 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import math
 from pathlib import Path
+import random
 import threading
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.hooks import RemovableHandle
 
 from .analyzer import (
+    DEFAULT_BAND_EDGES,
     CheckpointEvolutionTracker,
     ContrastivePoleFinder,
     LogitLensAttributor,
     StreamingLayerStats,
 )
 from .circuit_tracer import CircuitTracer
-from .discovery import LayerDescriptor, LayerDiscovery, _SlicedLinearView
+from .discovery import LayerDescriptor, LayerDiscovery
 from .explainer import CircuitEcologyMap, LLMClientProtocol, NeuronExplainerAgent
 from .exporter import SteeringExporter
-from .interventions import AblationMaskOptimizer, InterventionKernel
+from .hooks import HookSet, default_forward, extract_logits, flat_neuron_view, resolve_site, valid_position_mask
+from .interventions import AblationMaskOptimizer, InterventionKernel, build_intervention_hookset
 from .types import (
     BipolarVerbHypothesis,
     CircuitGraph,
+    CombinationReadoutReport,
     ContrastiveDiscoveryReport,
     ContrastiveNeuronMatch,
-    DownstreamReadoutReport,
+    ExplanationAuditSummary,
+    ExtremeCullReport,
+    FalsificationOutcome,
     GateConditionSpec,
+    InterventionEffectReport,
     InterventionMode,
     InterventionSpec,
-    LayerCleanlinessReport,
     LayerEcologySolveReport,
+    LayerScanReport,
     NeuronEvolutionReport,
     NeuronPoleProfile,
     NeuronTaxonomy,
@@ -42,28 +51,15 @@ from .types import (
     UpstreamAttributionBundle,
 )
 
+# A modifier factory receives a counter dict and returns {layer_name: modifier(act, gate) -> act}
+ModifierFactory = Callable[[Dict[str, int]], Dict[str, Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]]]
+
 
 class NeuralInjector:
     """
-    Universal Neural Network Analyzer, Surgical Activation Injector, Circuit Tracer,
-    and Automated Agentic Neuron Explainer.
-
-    Implements the full suite of algorithms from 'Neural Networks Are Already Clean'
-    (Cammarata / Goodfire, Oct 2026) plus production hardening and frontier capabilities:
-      - Direct native-basis neuron inspection (Pre-DownProj SwiGLU/MLP hooks, Conv2d, Linear, 3D MoE)
-      - Pole-specific conditional moments (M1+, M2+, M4+ and M1-, M2-, M4-) & Stratified Quantile Buckets
-      - SwiGLU 4-quadrant sign regimes & Double-Negative Route detection (`gate < 0` and `up < 0` yielding `silu(gate)*up > 0`)
-      - Forward next-token context (`next_token_str` & `window_str`) for next-token preparer neurons
-      - Downstream & Upstream (`trace_incoming_circuit`) causal circuit tracing & attribution bundle clustering
-      - Residual Stream Sink auditing (`audit_residual_stream_sinks`)
-      - Crossword / Circuit Ecology propagation store (`CircuitEcologyMap` & `solve_layer_ecology`)
-      - Native per-neuron adaptive thresholds (`std_multiplier` / unbiased Algorithm R `percentile`)
-      - Superposition readout auditing (`verify_downstream_readout`) with random-neuron null baseline
-      - Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) multi-layer Jacobian tracing
-      - Closed-loop dynamic concept gating (`CONDITIONAL_GATE`) with KV-cache latching (`sticky_on_decode`)
-      - Contrastive Pole Discovery (`discover_contrastive_neurons`)
-      - Cross-checkpoint Recursive Growth tracking (`track_checkpoint_evolution`)
-      - Multi-neuron synergistic group ablation (`find_synergistic_ablation_set`)
+    Native-basis neuron auditing, surgical intervention, circuit tracing and explanation testing
+    following 'Neural Networks Are Already Clean' (Cammarata, Goodfire 2026), plus weight folding
+    and export of verified steering interventions.
     """
 
     def __init__(
@@ -73,6 +69,7 @@ class NeuralInjector:
         llm_client: Optional[LLMClientProtocol] = None,
         tokenizer: Optional[Any] = None,
         allowed_workspace_dir: Optional[Union[str, Path]] = None,
+        test_writer_client: Optional[LLMClientProtocol] = None,
     ):
         self.model = model
         try:
@@ -83,212 +80,175 @@ class NeuralInjector:
         self.tokenizer = tokenizer
         self.allowed_workspace_dir = allowed_workspace_dir
         self._lock = threading.RLock()
+        self.discovered_layers: Dict[str, LayerDescriptor] = LayerDiscovery.discover_neuron_layers(model)
 
-        self.discovered_layers: Dict[str, LayerDescriptor] = LayerDiscovery.discover_neuron_layers(
-            model
-        )
-
-        # Active surgical interventions keyed by layer_name
         self._interventions: Dict[str, List[InterventionSpec]] = {}
-        self._active_handles: List[RemovableHandle] = []
+        self._hookset: Optional[HookSet] = None
+        self._extra_handles: List[RemovableHandle] = []
         self._latched_masks: Dict[int, torch.Tensor] = {}
-
-        # Streaming bipolar neuron statistics keyed by layer_name
+        self._modification_counter: Optional[Dict[str, int]] = None
         self._stats_trackers: Dict[str, StreamingLayerStats] = {}
 
-        # Persistent Crossword / Circuit Ecology store & sub-engines
         self.ecology_map = CircuitEcologyMap()
         self.tracer = CircuitTracer(self)
-        self.explainer = NeuronExplainerAgent(self, llm_client=llm_client)
+        self.explainer = NeuronExplainerAgent(self, llm_client=llm_client, test_writer_client=test_writer_client)
         self.ablation_optimizer = AblationMaskOptimizer(self)
 
     # -------------------------------------------------------------------------
-    # 1. Layer Discovery & Public State Inspection
+    # 1. Discovery and state
     # -------------------------------------------------------------------------
     def list_targetable_layers(self, include_all_linear: bool = False) -> Dict[str, LayerDescriptor]:
-        """Returns all targetable neuron layers discovered in the model."""
         if include_all_linear:
             return LayerDiscovery.discover_neuron_layers(self.model, include_all_linear=True)
         return self.discovered_layers
 
     def is_layer_audited(self, layer_name: str) -> bool:
-        """Returns True if streaming statistics have been collected for `layer_name`."""
         return layer_name in self._stats_trackers
 
     def get_stats_tracker(self, layer_name: str) -> Optional[StreamingLayerStats]:
-        """Public accessor returning the audited StreamingLayerStats for `layer_name`, if available."""
         return self._stats_trackers.get(layer_name)
+
+    def neuron_write_vectors(self, layer_name: str) -> Optional[torch.Tensor]:
+        return LayerDiscovery.neuron_write_vectors(self.model, layer_name)
+
+    def _require_tracker(self, layer_name: str) -> StreamingLayerStats:
+        if layer_name not in self._stats_trackers:
+            raise KeyError(f"Layer '{layer_name}' has not been audited yet. Call `audit_layers` first.")
+        return self._stats_trackers[layer_name]
 
     @property
     def active_intervention_count(self) -> int:
-        """Returns the total number of registered InterventionSpecs across all layers."""
         with self._lock:
-            return sum(len(specs) for specs in self._interventions.values())
+            return sum(len(v) for v in self._interventions.values())
 
     @property
     def active_hook_count(self) -> int:
-        """Returns the number of currently attached PyTorch forward hooks."""
         with self._lock:
-            return len(self._active_handles)
+            n = len(self._hookset._handles) if self._hookset is not None else 0
+            return n + len(self._extra_handles)
 
     def get_active_interventions(self) -> List[InterventionSpec]:
-        """Returns a flat list of all registered InterventionSpecs."""
         with self._lock:
-            return [spec for specs in self._interventions.values() for spec in specs]
+            return [s for specs in self._interventions.values() for s in specs]
 
     def reset_latched_gates(self) -> None:
-        """Clears any latched KV-cache masks accumulated by `sticky_on_decode` conditional gates."""
         with self._lock:
             self._latched_masks.clear()
 
+    def _module_order(self) -> List[str]:
+        return [n for n, _ in self.model.named_modules() if n]
+
     def _validate_detector_layer_order(self, detector_layer: str, target_layer: str) -> None:
-        """
-        Ensures `detector_layer` executes before or at the same module as `target_layer`
-        so cross-layer conditional gate masks are never missing or stale.
-        """
         if detector_layer == target_layer:
             return
-        module_order = [name for name, _ in self.model.named_modules() if name]
-        if detector_layer in module_order and target_layer in module_order:
-            det_pos = module_order.index(detector_layer)
-            tgt_pos = module_order.index(target_layer)
-            if det_pos > tgt_pos:
-                raise ValueError(
-                    f"Invalid CONDITIONAL_GATE: detector_layer '{detector_layer}' executes after "
-                    f"target_layer '{target_layer}'. The detector must be upstream of or in the same layer as the target."
-                )
+        order = self._module_order()
+        d_base, _ = LayerDiscovery.split_expert_layer_name(detector_layer)
+        t_base, _ = LayerDiscovery.split_expert_layer_name(target_layer)
+        if d_base in order and t_base in order and order.index(d_base) > order.index(t_base):
+            raise ValueError(
+                f"Invalid CONDITIONAL_GATE: detector '{detector_layer}' executes after target '{target_layer}'."
+            )
 
     # -------------------------------------------------------------------------
-    # 2. Surgical Neuron Manipulation (Zero-Ablate, Clamp, Steer, Prune, Gate)
+    # 2. Interventions
     # -------------------------------------------------------------------------
     def add_intervention(self, spec: InterventionSpec) -> None:
-        """Registers a surgical intervention specification on a target layer."""
         with self._lock:
+            site = resolve_site(self.model, spec.layer_name)
+            for i in spec.neuron_indices:
+                if not 0 <= int(i) < site.num_neurons:
+                    raise ValueError(f"Neuron {i} out of range for '{spec.layer_name}' ({site.num_neurons} neurons).")
+            if spec.needs_gate_signal and not site.gated:
+                raise ValueError(f"{spec.mode.value} needs a gated MLP, but '{spec.layer_name}' has no gate projection.")
+            if spec.mode == InterventionMode.EXTREME_CULL and spec.condition_signal not in ("gate", "activation"):
+                raise ValueError("condition_signal must be 'gate' or 'activation'")
+            if site.target == "moe_expert" and (spec.token_positions is not None or spec.gate_condition is not None):
+                raise ValueError("token_positions and conditional gates are not defined for routed MoE expert rows.")
             if spec.gate_condition is not None:
-                self._validate_detector_layer_order(
-                    spec.gate_condition.detector_layer, spec.layer_name
-                )
-            if spec.layer_name not in self._interventions:
-                self._interventions[spec.layer_name] = []
-            self._interventions[spec.layer_name].append(spec)
+                self._validate_detector_layer_order(spec.gate_condition.detector_layer, spec.layer_name)
+            self._interventions.setdefault(spec.layer_name, []).append(spec)
 
-    def zero_ablate(
-        self,
-        layer_name: str,
-        neuron_indices: Union[int, List[int]],
-        pole: PoleType = PoleType.BOTH,
-        token_positions: Optional[List[int]] = None,
-    ) -> InterventionSpec:
-        """
-        Directly sets the specified neuron(s) to 0.0 during forward passes.
-        Can target the entire neuron (PoleType.BOTH) or only its Positive/Negative pole.
-        """
-        indices = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
-        spec = InterventionSpec(
-            layer_name=layer_name,
-            neuron_indices=indices,
-            mode=InterventionMode.ZERO_ABLATE,
-            pole=pole,
-            value=0.0,
-            token_positions=token_positions,
-        )
+    def zero_ablate(self, layer_name: str, neuron_indices: Union[int, List[int]], pole: PoleType = PoleType.BOTH,
+                    token_positions: Optional[List[int]] = None) -> InterventionSpec:
+        idx = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
+        spec = InterventionSpec(layer_name, idx, InterventionMode.ZERO_ABLATE, pole, 0.0, token_positions=token_positions)
         self.add_intervention(spec)
         return spec
 
-    def clamp_neurons(
-        self,
-        layer_name: str,
-        neuron_indices: Union[int, List[int]],
-        value: float,
-        pole: PoleType = PoleType.BOTH,
-        token_positions: Optional[List[int]] = None,
-        per_neuron_values: Optional[List[float]] = None,
-    ) -> InterventionSpec:
-        """Forces target neuron(s) to fire at a constant scalar `value` or `per_neuron_values`."""
-        indices = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
-        spec = InterventionSpec(
-            layer_name=layer_name,
-            neuron_indices=indices,
-            mode=InterventionMode.HARD_CLAMP,
-            pole=pole,
-            value=value,
-            per_neuron_values=per_neuron_values,
-            token_positions=token_positions,
-        )
+    def clamp_neurons(self, layer_name: str, neuron_indices: Union[int, List[int]], value: float,
+                      pole: PoleType = PoleType.BOTH, token_positions: Optional[List[int]] = None,
+                      per_neuron_values: Optional[List[float]] = None) -> InterventionSpec:
+        idx = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
+        spec = InterventionSpec(layer_name, idx, InterventionMode.HARD_CLAMP, pole, value,
+                                per_neuron_values=per_neuron_values, token_positions=token_positions)
         self.add_intervention(spec)
         return spec
 
-    def steer_neurons(
-        self,
-        layer_name: str,
-        neuron_indices: Union[int, List[int]],
-        delta: Optional[float] = None,
-        scale: Optional[float] = None,
-        pole: PoleType = PoleType.BOTH,
-        per_neuron_values: Optional[List[float]] = None,
-    ) -> InterventionSpec:
-        """Amplifies, dampens, or shifts target neuron activations toward a desired pole."""
-        indices = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
-        if scale is not None:
-            mode = InterventionMode.SCALE
-            val = scale
-        else:
-            mode = InterventionMode.ADDITIVE_STEER
-            val = delta if delta is not None else 1.0
-
-        spec = InterventionSpec(
-            layer_name=layer_name,
-            neuron_indices=indices,
-            mode=mode,
-            pole=pole,
-            value=val,
-            per_neuron_values=per_neuron_values,
-        )
+    def steer_neurons(self, layer_name: str, neuron_indices: Union[int, List[int]], delta: Optional[float] = None,
+                      scale: Optional[float] = None, pole: PoleType = PoleType.BOTH,
+                      per_neuron_values: Optional[List[float]] = None,
+                      token_positions: Optional[List[int]] = None) -> InterventionSpec:
+        """ADDITIVE_STEER by `delta` (or per-neuron deltas) or SCALE by `scale`; exactly one is required."""
+        if (delta is None) == (scale is None) and per_neuron_values is None:
+            raise ValueError("Specify exactly one of `delta` or `scale` (or `per_neuron_values` with a mode).")
+        idx = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
+        mode = InterventionMode.SCALE if scale is not None else InterventionMode.ADDITIVE_STEER
+        val = float(scale if scale is not None else (delta if delta is not None else 0.0))
+        spec = InterventionSpec(layer_name, idx, mode, pole, val, per_neuron_values=per_neuron_values,
+                                token_positions=token_positions)
         self.add_intervention(spec)
         return spec
 
     def prune_weak_activations(
         self,
         layer_name: str,
-        neuron_indices: Union[int, List[int]],
-        threshold: Optional[Union[float, List[float]]] = None,
-        std_multiplier: Optional[float] = None,
+        neuron_indices: Optional[Union[int, List[int]]] = None,
+        threshold: Optional[float] = None,
+        fraction_of_extreme: Optional[float] = None,
         percentile: Optional[float] = None,
+        std_multiplier: Optional[float] = None,
         pole: PoleType = PoleType.BOTH,
-    ) -> InterventionSpec:
+    ) -> List[InterventionSpec]:
         """
-        Tests Cammarata's 'Do Weak Activations Matter?' hypothesis by zeroing out
-        activations below a scalar `threshold` OR native per-neuron adaptive thresholds
-        computed from each neuron's audited distribution via `std_multiplier` or `percentile`
-        ('Finding Clean Circuits' — Respecting Native Activation Ranges & Percentiles).
+        'Do Weak Activations Matter?': zero activations whose magnitude is below a threshold.
+        Exactly one rule: an absolute `threshold`, or per-neuron rules from the audit
+        (`fraction_of_extreme` of each pole's own extreme, within-pole `percentile`, or `std_multiplier`).
+        Per-neuron rules create one spec per pole, since the two poles have different scales.
         """
-        indices = [neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices)
-        per_neuron_vals: Optional[List[float]] = None
-
-        if isinstance(threshold, list):
-            per_neuron_vals = [float(x) for x in threshold]
-            scalar_val = per_neuron_vals[0] if per_neuron_vals else 0.0
-        elif threshold is not None and std_multiplier is None and percentile is None:
-            scalar_val = float(threshold)
-        elif self.is_layer_audited(layer_name):
-            tracker = self._stats_trackers[layer_name]
-            per_neuron_vals = tracker.compute_adaptive_thresholds(
-                indices, std_multiplier=std_multiplier, percentile=percentile, pole=pole
-            )
-            scalar_val = per_neuron_vals[0] if per_neuron_vals else 0.0
+        n = resolve_site(self.model, layer_name).num_neurons
+        idx = list(range(n)) if neuron_indices is None else ([neuron_indices] if isinstance(neuron_indices, int) else list(neuron_indices))
+        rules = [x is not None for x in (threshold, fraction_of_extreme, percentile, std_multiplier)]
+        if sum(rules) != 1:
+            raise ValueError("Specify exactly one of threshold, fraction_of_extreme, percentile, std_multiplier.")
+        poles = [PoleType.POSITIVE, PoleType.NEGATIVE] if pole == PoleType.BOTH else [pole]
+        specs: List[InterventionSpec] = []
+        if threshold is not None:
+            for p in poles:
+                specs.append(InterventionSpec(layer_name, idx, InterventionMode.WEAK_PRUNE, p, float(threshold)))
         else:
-            scalar_val = float(threshold) if threshold is not None else 1.0
+            tr = self._require_tracker(layer_name)
+            for p in poles:
+                vals = tr.compute_thresholds(idx, p, fraction_of_extreme=fraction_of_extreme,
+                                             percentile=percentile, std_multiplier=std_multiplier)
+                specs.append(InterventionSpec(layer_name, idx, InterventionMode.WEAK_PRUNE, p, 0.0, per_neuron_values=vals))
+        for s in specs:
+            self.add_intervention(s)
+        return specs
 
-        spec = InterventionSpec(
-            layer_name=layer_name,
-            neuron_indices=indices,
-            mode=InterventionMode.WEAK_PRUNE,
-            pole=pole,
-            value=scalar_val,
-            per_neuron_values=per_neuron_vals,
-        )
-        self.add_intervention(spec)
-        return spec
+    def ablate_double_negative_regime(self, layer_names: Optional[List[str]] = None) -> List[InterventionSpec]:
+        """
+        Zero every activation in the -- regime (g < 0, u < 0) of the given gated layers, or of every
+        gated layer in the model ('Ablating them across the whole network ups most benchmarks,
+        but lowers some reasoning ones').
+        """
+        names = layer_names or [n for n in self.discovered_layers if resolve_site(self.model, n).gated]
+        specs = []
+        for name in names:
+            n = resolve_site(self.model, name).num_neurons
+            spec = InterventionSpec(name, list(range(n)), InterventionMode.DOUBLE_NEGATIVE_ABLATE, PoleType.POSITIVE)
+            self.add_intervention(spec)
+            specs.append(spec)
+        return specs
 
     def add_conditional_gate(
         self,
@@ -298,6 +258,7 @@ class NeuralInjector:
         detector_neuron: int,
         detector_pole: PoleType = PoleType.POSITIVE,
         threshold: Optional[float] = None,
+        detector_fraction_of_extreme: Optional[float] = None,
         detector_percentile: Optional[float] = None,
         action_mode: InterventionMode = InterventionMode.ADDITIVE_STEER,
         value: float = 0.0,
@@ -305,207 +266,53 @@ class NeuralInjector:
         sequence_scope: str = "token_wise",
         sticky_on_decode: bool = True,
     ) -> InterventionSpec:
-        """
-        Registers a Closed-Loop Dynamic Concept Gate (`CONDITIONAL_GATE`):
-        Only applies `action_mode` (with `value`) to `target_neurons` in `target_layer`
-        when `detector_neuron` in `detector_layer` fires on `detector_pole` above `threshold`
-        (or above its audited `detector_percentile`).
-
-        When `sequence_scope="any_token"` and `sticky_on_decode=True`, a trigger during
-        prompt prefill (`seq_len > 1`) latches the gate open across subsequent `seq_len == 1`
-        KV-cached decoding steps.
-        """
-        self._validate_detector_layer_order(detector_layer, target_layer)
-        indices = [target_neurons] if isinstance(target_neurons, int) else list(target_neurons)
+        """Closed-loop gate: `action_mode` on the targets only where the detector neuron fires beyond a threshold."""
+        rules = [x is not None for x in (threshold, detector_fraction_of_extreme, detector_percentile)]
+        if sum(rules) != 1:
+            raise ValueError("Specify exactly one of threshold, detector_fraction_of_extreme, detector_percentile.")
+        if detector_pole == PoleType.BOTH and threshold is None:
+            raise ValueError("A data-derived detector threshold needs a single detector pole.")
         if threshold is not None:
-            resolved_thresh = float(threshold)
-        elif detector_percentile is not None and self.is_layer_audited(detector_layer):
-            resolved_thresh = self._stats_trackers[detector_layer].compute_adaptive_thresholds(
-                [detector_neuron], percentile=detector_percentile, pole=detector_pole
-            )[0]
-        elif self.is_layer_audited(detector_layer):
-            resolved_thresh = self._stats_trackers[detector_layer].compute_adaptive_thresholds(
-                [detector_neuron], std_multiplier=1.0, pole=detector_pole
-            )[0]
+            thr = float(threshold)
         else:
-            resolved_thresh = 0.5
-
-        cond = GateConditionSpec(
-            detector_layer=detector_layer,
-            detector_neuron=detector_neuron,
-            detector_pole=detector_pole,
-            threshold=resolved_thresh,
-            action_mode=action_mode,
-            sequence_scope=sequence_scope,
-            sticky_on_decode=sticky_on_decode,
-        )
-        spec = InterventionSpec(
-            layer_name=target_layer,
-            neuron_indices=indices,
-            mode=InterventionMode.CONDITIONAL_GATE,
-            pole=target_pole,
-            value=value,
-            gate_condition=cond,
-        )
+            thr = self._require_tracker(detector_layer).compute_thresholds(
+                [detector_neuron], detector_pole, fraction_of_extreme=detector_fraction_of_extreme,
+                percentile=detector_percentile,
+            )[0]
+        idx = [target_neurons] if isinstance(target_neurons, int) else list(target_neurons)
+        cond = GateConditionSpec(detector_layer, detector_neuron, thr, detector_pole, action_mode, sequence_scope, sticky_on_decode)
+        spec = InterventionSpec(target_layer, idx, InterventionMode.CONDITIONAL_GATE, target_pole, value, gate_condition=cond)
         self.add_intervention(spec)
         return spec
 
     def clear_interventions(self) -> None:
-        """Removes all registered interventions and detaches hooks."""
         with self._lock:
             self.detach_hooks()
             self._interventions.clear()
             self._latched_masks.clear()
 
     def attach_hooks(self) -> None:
-        """
-        Attaches PyTorch pre-hooks or forward-hooks for all registered interventions,
-        including upstream detector hooks for any cross-layer `CONDITIONAL_GATE` specs.
-        """
         with self._lock:
             self.detach_hooks()
-            conditional_masks: Dict[int, torch.Tensor] = {}
-            latched_masks = self._latched_masks
-
-            # Reset per-pass conditional_masks at the start of every forward pass on the root model
-            self._active_handles.append(
-                self.model.register_forward_pre_hook(lambda _m, _inp: conditional_masks.clear())
-            )
-
-            # 1. Register detector hooks first so upstream detector masks are populated before target hooks fire
-            for layer_name, specs in self._interventions.items():
-                for spec in specs:
-                    if not spec.enabled or spec.gate_condition is None:
-                        continue
-                    det_layer = spec.gate_condition.detector_layer
-                    if det_layer == layer_name:
-                        continue
-                    det_mod, det_target, _ = LayerDiscovery.resolve_module(self.model, det_layer)
-                    is_det_conv = isinstance(det_mod, nn.Conv2d)
-
-                    def _make_det_pre(s_obj: InterventionSpec, conv_f: bool):
-                        def _det_pre(_mod: nn.Module, inputs: Tuple[Any, ...]) -> None:
-                            if inputs and isinstance(inputs[0], torch.Tensor) and s_obj.gate_condition:
-                                conditional_masks[id(s_obj)] = (
-                                    InterventionKernel.compute_detector_mask(
-                                        inputs[0].detach(),
-                                        s_obj.gate_condition,
-                                        is_conv2d=conv_f,
-                                        latched_masks=latched_masks,
-                                        spec_id=id(s_obj),
-                                    )
-                                )
-
-                        return _det_pre
-
-                    def _make_det_fwd(s_obj: InterventionSpec, conv_f: bool):
-                        def _det_fwd(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
-                            if LayerDiscovery.is_moe_param_container(_mod):
-                                act, _, _, _ = LayerDiscovery.forward_moe_param_container(_mod, _inputs)
-                            else:
-                                act = output[0] if isinstance(output, tuple) else output
-                            if isinstance(act, torch.Tensor) and s_obj.gate_condition:
-                                conditional_masks[id(s_obj)] = (
-                                    InterventionKernel.compute_detector_mask(
-                                        act.detach(),
-                                        s_obj.gate_condition,
-                                        is_conv2d=conv_f,
-                                        latched_masks=latched_masks,
-                                        spec_id=id(s_obj),
-                                    )
-                                )
-
-                        return _det_fwd
-
-                    if det_target == "input":
-                        self._active_handles.append(
-                            det_mod.register_forward_pre_hook(_make_det_pre(spec, is_det_conv))
-                        )
-                    else:
-                        self._active_handles.append(
-                            det_mod.register_forward_hook(_make_det_fwd(spec, is_det_conv))
-                        )
-
-            # 2. Register target intervention hooks
-            for layer_name, specs in self._interventions.items():
-                if not specs:
-                    continue
-                module, hook_target, _ = LayerDiscovery.resolve_module(self.model, layer_name)
-                is_conv2d = isinstance(module, nn.Conv2d)
-
-                if hook_target == "input":
-
-                    def _make_pre_hook(layer_specs: List[InterventionSpec], conv_flag: bool):
-                        def _pre_hook(_mod: nn.Module, inputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
-                            if not inputs or not isinstance(inputs[0], torch.Tensor):
-                                return inputs
-                            modified = InterventionKernel.apply(
-                                inputs[0],
-                                layer_specs,
-                                is_conv2d=conv_flag,
-                                conditional_masks=conditional_masks,
-                                latched_masks=latched_masks,
-                            )
-                            return (modified,) + inputs[1:]
-
-                        return _pre_hook
-
-                    handle = module.register_forward_pre_hook(_make_pre_hook(specs, is_conv2d))
-                else:
-
-                    def _make_fwd_hook(layer_specs: List[InterventionSpec], conv_flag: bool):
-                        def _fwd_hook(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> Any:
-                            if LayerDiscovery.is_moe_param_container(_mod):
-                                _, _, _, mod_out = LayerDiscovery.forward_moe_param_container(
-                                    _mod,
-                                    _inputs,
-                                    intervention_fn=lambda act: InterventionKernel.apply(
-                                        act,
-                                        layer_specs,
-                                        is_conv2d=False,
-                                        conditional_masks=conditional_masks,
-                                        latched_masks=latched_masks,
-                                    ),
-                                )
-                                return mod_out if mod_out is not None else output
-                            if isinstance(output, torch.Tensor):
-                                return InterventionKernel.apply(
-                                    output,
-                                    layer_specs,
-                                    is_conv2d=conv_flag,
-                                    conditional_masks=conditional_masks,
-                                    latched_masks=latched_masks,
-                                )
-                            elif isinstance(output, tuple) and isinstance(output[0], torch.Tensor):
-                                modified = InterventionKernel.apply(
-                                    output[0],
-                                    layer_specs,
-                                    is_conv2d=conv_flag,
-                                    conditional_masks=conditional_masks,
-                                    latched_masks=latched_masks,
-                                )
-                                return (modified,) + output[1:]
-                            return output
-
-                        return _fwd_hook
-
-                    handle = module.register_forward_hook(_make_fwd_hook(specs, is_conv2d))
-
-                self._active_handles.append(handle)
+            if not self._interventions:
+                return
+            hs, cond_masks = build_intervention_hookset(self.model, self._interventions, self._latched_masks,
+                                                        self._modification_counter)
+            self._extra_handles.append(self.model.register_forward_pre_hook(lambda _m, _i: cond_masks.clear()))
+            hs.attach()
+            self._hookset = hs
 
     def detach_hooks(self) -> None:
-        """Safely removes all active PyTorch hooks."""
         with self._lock:
-            for handle in self._active_handles:
-                handle.remove()
-            self._active_handles.clear()
+            if self._hookset is not None:
+                self._hookset.detach()
+                self._hookset = None
+            for h in self._extra_handles:
+                h.remove()
+            self._extra_handles.clear()
 
     @contextmanager
     def active_injection(self):
-        """
-        Thread-safe context manager that activates all registered neuron interventions
-        for the duration of a block and guarantees cleanup afterward.
-        """
         with self._lock:
             self.reset_latched_gates()
             self.attach_hooks()
@@ -517,240 +324,105 @@ class NeuralInjector:
 
     @contextmanager
     def without_interventions(self):
-        """
-        Non-destructive, thread-safe context manager that temporarily detaches any active hooks
-        for a clean forward pass, then restores the previous hook state upon exit
-        without clearing `self._interventions`.
-        """
         with self._lock:
-            was_attached = len(self._active_handles) > 0
-            if was_attached:
+            was = self._hookset is not None
+            if was:
                 self.detach_hooks()
             try:
                 yield self
             finally:
-                if was_attached:
+                if was:
                     self.attach_hooks()
 
     @contextmanager
     def temporary_interventions(self, temp_specs: Optional[List[InterventionSpec]] = None):
-        """
-        Non-destructive, thread-safe context manager that temporarily replaces active interventions
-        with `temp_specs`, attaches their hooks for the duration of the block, and
-        restores the exact prior `self._interventions` and hook state upon exit.
-        """
         with self._lock:
-            saved_interventions = {k: list(v) for k, v in self._interventions.items()}
-            saved_latches = dict(self._latched_masks)
-            was_attached = len(self._active_handles) > 0
+            saved = {k: list(v) for k, v in self._interventions.items()}
+            saved_latch = dict(self._latched_masks)
+            was = self._hookset is not None
             self.detach_hooks()
             self._interventions = {}
             self._latched_masks.clear()
-            for spec in temp_specs or []:
-                self.add_intervention(spec)
-            if temp_specs:
-                self.attach_hooks()
             try:
+                for s in temp_specs or []:
+                    self.add_intervention(s)
+                self.attach_hooks()
                 yield self
             finally:
                 self.detach_hooks()
-                self._interventions = saved_interventions
+                self._interventions = saved
                 self._latched_masks.clear()
-                self._latched_masks.update(saved_latches)
-                if was_attached:
+                self._latched_masks.update(saved_latch)
+                if was:
                     self.attach_hooks()
 
     @contextmanager
     def clean_forward(self):
-        """
-        Non-destructive context manager that guarantees zero active intervention hooks during
-        a baseline forward pass while preserving any user-registered interventions afterward.
-        """
         with self.temporary_interventions([]):
             yield self
 
     # -------------------------------------------------------------------------
-    # 3. Bipolar Neuron Auditing & Concept Discovery
+    # 3. Auditing
     # -------------------------------------------------------------------------
     @torch.no_grad()
     def audit_layers(
         self,
         layer_names: List[str],
         dataloader_or_batches: Iterable[Dict[str, Any]],
-        forward_fn: Callable[[nn.Module, Dict[str, Any]], Any],
-        top_k: int = 8,
-        tracked_neurons: Optional[List[int]] = None,
+        forward_fn: Callable[[nn.Module, Dict[str, Any]], Any] = default_forward,
+        top_k: int = 16,
+        **tracker_kwargs: Any,
     ) -> Dict[str, StreamingLayerStats]:
         """
-        Streams batches through the model and records bipolar activation statistics,
-        pole-specific conditional moments, SwiGLU double-negative (`gate < 0, up < 0`)
-        diagnostics, forward next-token context, and quantile-stratified activating contexts.
+        Streams batches through the unmodified model and records, for each layer, the exact streaming
+        statistics of `StreamingLayerStats`. Batch dicts may carry `attention_mask`, `sample_ids`,
+        `tokens_per_sample` (decoded token strings) and `contexts_per_sample` (sample texts).
         """
         with self._lock:
-            handles: List[RemovableHandle] = []
-            current_batch_meta: Dict[str, Any] = {}
-            latest_gate_acts: Dict[str, torch.Tensor] = {}
-            latest_up_acts: Dict[str, torch.Tensor] = {}
+            hs = HookSet(self.model)
+            meta: Dict[str, Any] = {}
+            for name in layer_names:
+                site = hs.site(name)
+                tracker = StreamingLayerStats(name, site.num_neurons, gated=site.gated, top_k=top_k,
+                                              device=self.device, **tracker_kwargs)
+                self._stats_trackers[name] = tracker
 
-            for layer_name in layer_names:
-                module, hook_target, num_neurons = LayerDiscovery.resolve_module(
-                    self.model, layer_name
-                )
-                _, up_mod, gate_mod = LayerDiscovery.resolve_mlp_read_write_modules(
-                    self.model, layer_name
-                )
-                fused_mod = LayerDiscovery.resolve_fused_gate_up_module(
-                    self.model, layer_name
-                )
-                tracker = StreamingLayerStats(
-                    layer_name=layer_name,
-                    num_neurons=num_neurons,
-                    top_k=top_k,
-                    device=self.device,
-                )
-                self._stats_trackers[layer_name] = tracker
-
-                # Case A: Split gate_proj and up_proj sibling modules
-                if (
-                    hook_target == "input"
-                    and gate_mod is not None
-                    and up_mod is not None
-                    and not isinstance(gate_mod, _SlicedLinearView)
-                    and not isinstance(up_mod, _SlicedLinearView)
-                ):
-
-                    def _make_gate_hook(lname: str):
-                        def _g_hook(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
-                            t0 = out[0] if isinstance(out, tuple) else out
-                            if isinstance(t0, torch.Tensor):
-                                latest_gate_acts[lname] = t0.detach()
-
-                        return _g_hook
-
-                    def _make_up_hook(lname: str):
-                        def _u_hook(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
-                            t0 = out[0] if isinstance(out, tuple) else out
-                            if isinstance(t0, torch.Tensor):
-                                latest_up_acts[lname] = t0.detach()
-
-                        return _u_hook
-
-                    handles.append(gate_mod.register_forward_hook(_make_gate_hook(layer_name)))
-                    handles.append(up_mod.register_forward_hook(_make_up_hook(layer_name)))
-
-                # Case B: Single fused gate_up_proj module returning [..., 2 * d_mlp]
-                elif hook_target == "input" and fused_mod is not None:
-
-                    def _make_fused_hook(lname: str, n_neurons: int):
-                        def _f_hook(_m: nn.Module, _inp: Tuple[Any, ...], out: Any) -> None:
-                            t0 = out[0] if isinstance(out, tuple) else out
-                            if isinstance(t0, torch.Tensor) and t0.shape[-1] == 2 * n_neurons:
-                                g_act, u_act = t0.detach().chunk(2, dim=-1)
-                                latest_gate_acts[lname] = g_act
-                                latest_up_acts[lname] = u_act
-
-                        return _f_hook
-
-                    handles.append(
-                        fused_mod.register_forward_hook(_make_fused_hook(layer_name, num_neurons))
+                def _cap(act: torch.Tensor, gate: Optional[torch.Tensor], routed: Optional[torch.Tensor], t=tracker, s=site) -> None:
+                    grid = meta.get("grid")
+                    if routed is not None and grid is None:
+                        raise ValueError("MoE expert audits need batches with a 2D `input_ids` tensor to map routed rows to positions.")
+                    t.update(
+                        act.detach(),
+                        sample_ids=meta.get("sample_ids"),
+                        tokens_per_sample=meta.get("tokens_per_sample"),
+                        contexts_per_sample=meta.get("contexts_per_sample"),
+                        attention_mask=meta.get("attention_mask") if routed is None else None,
+                        gate_activations=gate.detach() if gate is not None else None,
+                        routed_token_indices=routed,
+                        token_grid=grid if routed is not None else None,
                     )
 
-                if hook_target == "input":
-
-                    def _make_audit_pre_hook(t: StreamingLayerStats, lname: str):
-                        def _hook(_mod: nn.Module, inputs: Tuple[Any, ...]) -> None:
-                            if inputs and isinstance(inputs[0], torch.Tensor):
-                                t.update(
-                                    inputs[0].detach(),
-                                    sample_ids=current_batch_meta.get("sample_ids"),
-                                    tokens_per_sample=current_batch_meta.get("tokens_per_sample"),
-                                    contexts_per_sample=current_batch_meta.get(
-                                        "contexts_per_sample"
-                                    ),
-                                    tracked_neurons=tracked_neurons,
-                                    attention_mask=current_batch_meta.get("attention_mask"),
-                                    routed_token_indices=current_batch_meta.get(
-                                        "routed_token_indices"
-                                    ),
-                                    gate_activations=latest_gate_acts.pop(lname, None),
-                                    up_activations=latest_up_acts.pop(lname, None),
-                                )
-
-                        return _hook
-
-                    handles.append(
-                        module.register_forward_pre_hook(_make_audit_pre_hook(tracker, layer_name))
-                    )
-                else:
-
-                    def _make_audit_fwd_hook(t: StreamingLayerStats):
-                        def _hook(_mod: nn.Module, _inputs: Tuple[Any, ...], output: Any) -> None:
-                            if LayerDiscovery.is_moe_param_container(_mod):
-                                act, g_act, u_act, _ = LayerDiscovery.forward_moe_param_container(
-                                    _mod, _inputs
-                                )
-                                if isinstance(act, torch.Tensor):
-                                    t.update(
-                                        act.detach(),
-                                        sample_ids=current_batch_meta.get("sample_ids"),
-                                        tokens_per_sample=current_batch_meta.get("tokens_per_sample"),
-                                        contexts_per_sample=current_batch_meta.get(
-                                            "contexts_per_sample"
-                                        ),
-                                        tracked_neurons=tracked_neurons,
-                                        attention_mask=current_batch_meta.get("attention_mask"),
-                                        routed_token_indices=current_batch_meta.get(
-                                            "routed_token_indices"
-                                        ),
-                                        gate_activations=g_act.detach() if isinstance(g_act, torch.Tensor) else None,
-                                        up_activations=u_act.detach() if isinstance(u_act, torch.Tensor) else None,
-                                    )
-                                return
-                            act = output[0] if isinstance(output, tuple) else output
-                            if isinstance(act, torch.Tensor):
-                                t.update(
-                                    act.detach(),
-                                    sample_ids=current_batch_meta.get("sample_ids"),
-                                    tokens_per_sample=current_batch_meta.get("tokens_per_sample"),
-                                    contexts_per_sample=current_batch_meta.get(
-                                        "contexts_per_sample"
-                                    ),
-                                    tracked_neurons=tracked_neurons,
-                                    attention_mask=current_batch_meta.get("attention_mask"),
-                                    routed_token_indices=current_batch_meta.get(
-                                        "routed_token_indices"
-                                    ),
-                                )
-
-                        return _hook
-
-                    handles.append(module.register_forward_hook(_make_audit_fwd_hook(tracker)))
+                hs.add_capture(name, _cap, need_gate=site.gated, dense_moe=False)
 
             was_training = self.model.training
             self.model.eval()
             try:
-                with self.without_interventions():
+                with self.clean_forward(), hs.active():
                     for batch in dataloader_or_batches:
-                        latest_gate_acts.clear()
-                        latest_up_acts.clear()
+                        meta.clear()
                         if isinstance(batch, dict):
-                            current_batch_meta = {
-                                "sample_ids": batch.get("sample_ids"),
-                                "tokens_per_sample": batch.get("tokens_per_sample"),
-                                "contexts_per_sample": batch.get("contexts_per_sample"),
-                                "attention_mask": batch.get("attention_mask"),
-                                "routed_token_indices": batch.get("routed_token_indices"),
-                            }
-                        else:
-                            current_batch_meta = {}
+                            for k in ("sample_ids", "tokens_per_sample", "contexts_per_sample", "attention_mask"):
+                                meta[k] = batch.get(k)
+                            ids = batch.get("input_ids")
+                            if isinstance(ids, torch.Tensor) and ids.ndim == 2:
+                                meta["grid"] = (int(ids.shape[0]), int(ids.shape[1]))
+                        elif isinstance(batch, torch.Tensor) and batch.ndim == 2 and not batch.is_floating_point():
+                            meta["grid"] = (int(batch.shape[0]), int(batch.shape[1]))
                         forward_fn(self.model, batch)
             finally:
-                for h in handles:
-                    h.remove()
                 if was_training:
                     self.model.train()
-
-            return self._stats_trackers
+            return {n: self._stats_trackers[n] for n in layer_names}
 
     def get_neuron_profile(
         self,
@@ -758,34 +430,26 @@ class NeuralInjector:
         neuron_idx: int,
         unembed_weight: Optional[torch.Tensor] = None,
         idx_to_token: Optional[Dict[int, str]] = None,
+        band_edges: Sequence[float] = DEFAULT_BAND_EDGES,
+        samples_per_band: int = 4,
+        logit_top_k: int = 10,
     ) -> NeuronPoleProfile:
-        """
-        Exports a complete NeuronPoleProfile for `neuron_idx` in `layer_name`,
-        optionally enriched with Direct Weight-to-Logit vocabulary attributions.
-        """
-        if layer_name not in self._stats_trackers:
-            raise KeyError(
-                f"Layer '{layer_name}' has not been audited yet. Call `audit_layers` first."
-            )
+        with self._lock:
+            profile = self._require_tracker(layer_name).export_profile(neuron_idx, band_edges, samples_per_band)
+            if unembed_weight is not None:
+                wv = self.neuron_write_vectors(layer_name)
+                if wv is not None:
+                    promoted, suppressed = LogitLensAttributor.attribute_write_vector(
+                        wv[neuron_idx], unembed_weight, idx_to_token=idx_to_token, top_k=logit_top_k,
+                        final_norm_module=LayerDiscovery.resolve_final_norm(self.model),
+                    )
+                    profile.top_promoted_tokens = promoted
+                    profile.top_suppressed_tokens = suppressed
+            return profile
 
-        profile = self._stats_trackers[layer_name].export_profile(neuron_idx)
-
-        if unembed_weight is not None:
-            module, _, _ = LayerDiscovery.resolve_module(self.model, layer_name)
-            if hasattr(module, "weight") or LayerDiscovery.is_moe_param_container(module):
-                final_norm = LayerDiscovery.resolve_final_norm(self.model)
-                promoted, suppressed = LogitLensAttributor.attribute_neuron_to_vocab(
-                    down_proj_module=module,
-                    unembed_weight=unembed_weight,
-                    neuron_idx=neuron_idx,
-                    idx_to_token=idx_to_token,
-                    final_norm_module=final_norm,
-                )
-                profile.top_promoted_tokens = promoted
-                profile.top_suppressed_tokens = suppressed
-
-        return profile
-
+    # -------------------------------------------------------------------------
+    # 4. Causal measurements
+    # -------------------------------------------------------------------------
     @torch.no_grad()
     def measure_ablation_kl_divergence(
         self,
@@ -796,778 +460,665 @@ class NeuralInjector:
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> float:
-        """
-        Measures the exact causal impact of zero-ablating a single neuron or list of neurons
-        (or one of its poles) by computing the KL-Divergence D_KL(P_clean || P_ablated) on
-        the model's output logits.
-        """
-        def _default_fwd(m: nn.Module, inp: Any) -> Any:
-            if isinstance(inp, dict):
-                return m(inp["input_ids"]) if "input_ids" in inp else m(**inp)
-            return m(inp)
-
-        run_fwd = forward_fn or _default_fwd
-        target_indices = [neuron_idx] if isinstance(neuron_idx, int) else list(neuron_idx)
+        """Mean over valid positions of KL(P_clean || P_ablated) when the neuron(s) are zero-ablated."""
+        run = forward_fn or default_forward
+        idx = [neuron_idx] if isinstance(neuron_idx, int) else list(neuron_idx)
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
         with self._lock:
             was_training = self.model.training
             self.model.eval()
             try:
-                with self.without_interventions():
-                    clean_out = run_fwd(self.model, inputs)
-                    clean_logits = (
-                        clean_out.logits if hasattr(clean_out, "logits") else clean_out
-                    )
-                    clean_log_probs = torch.log_softmax(clean_logits.float(), dim=-1)
-                    clean_probs = clean_log_probs.exp()
-
-                ablate_spec = InterventionSpec(
-                    layer_name=layer_name,
-                    neuron_indices=target_indices,
-                    mode=InterventionMode.ZERO_ABLATE,
-                    pole=pole,
-                    value=0.0,
-                )
-                with self.temporary_interventions([ablate_spec]):
-                    ablated_out = run_fwd(self.model, inputs)
-                    ablated_logits = (
-                        ablated_out.logits if hasattr(ablated_out, "logits") else ablated_out
-                    )
-                    ablated_log_probs = torch.log_softmax(ablated_logits.float(), dim=-1)
-
-                token_kl = (clean_probs * (clean_log_probs - ablated_log_probs)).sum(dim=-1)
-                if attention_mask is not None:
-                    mask = attention_mask.to(
-                        device=token_kl.device, dtype=torch.bool
-                    )
-                    if mask.shape == token_kl.shape and mask.any():
-                        return float(token_kl[mask].mean().item())
-                    if mask.numel() == token_kl.numel() and mask.any():
-                        return float(token_kl.reshape(-1)[mask.reshape(-1)].mean().item())
-                return float(token_kl.mean().item())
+                with self.clean_forward():
+                    clean = F.log_softmax(extract_logits(run(self.model, inputs)).float(), dim=-1)
+                spec = InterventionSpec(layer_name, idx, InterventionMode.ZERO_ABLATE, pole)
+                with self.temporary_interventions([spec]):
+                    abl = F.log_softmax(extract_logits(run(self.model, inputs)).float(), dim=-1)
+                kl = (clean.exp() * (clean - abl)).sum(dim=-1).reshape(-1)
+                valid = valid_position_mask(attention_mask, kl.numel(), kl.device)
+                return float(kl[valid].mean().item())
             finally:
                 if was_training:
                     self.model.train()
 
-    # -------------------------------------------------------------------------
-    # 4. Layer-to-Layer Circuit Tracing & Superposition Readout Verification
-    # -------------------------------------------------------------------------
-    def trace_circuit(
+    @torch.no_grad()
+    def measure_token_set_effect(
         self,
-        src_layer: str,
-        dst_layer: str,
-        src_neuron: int,
+        specs: List[InterventionSpec],
         inputs: Any,
-        src_pole: PoleType = PoleType.POSITIVE,
+        token_ids: Sequence[int],
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        compute_jacobian: bool = True,
-        top_k: int = 10,
         attention_mask: Optional[torch.Tensor] = None,
-        position_mode: str = "all_active",
-    ) -> CircuitGraph:
+    ) -> Dict[str, Any]:
         """
-        Traces how `(src_layer, src_neuron, src_pole)` excites, inhibits, or gates
-        downstream neurons in `dst_layer`.
+        Change in next-token log-probability mass of a token set (e.g. every vocabulary token that
+        starts with '.') under the given interventions — the 'Don't Say Dot' check: remove the
+        neuron and see whether the next period gets likelier.
         """
+        run = forward_fn or default_forward
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
+        t_idx = torch.as_tensor(list(token_ids), dtype=torch.long)
         with self._lock:
-            return self.tracer.trace_circuit(
-                src_layer=src_layer,
-                dst_layer=dst_layer,
-                src_neuron=src_neuron,
-                inputs=inputs,
-                forward_fn=forward_fn,
-                src_pole=src_pole,
-                compute_jacobian=compute_jacobian,
-                top_k=top_k,
-                attention_mask=attention_mask,
-                position_mode=position_mode,
-            )
+            with self.clean_forward():
+                c = F.log_softmax(extract_logits(run(self.model, inputs)).float(), dim=-1)
+            with self.temporary_interventions(specs):
+                m = F.log_softmax(extract_logits(run(self.model, inputs)).float(), dim=-1)
+        t_idx = t_idx.to(c.device)
+        c_mass = torch.logsumexp(c[..., t_idx], dim=-1).reshape(-1)
+        m_mass = torch.logsumexp(m[..., t_idx], dim=-1).reshape(-1)
+        valid = valid_position_mask(attention_mask, c_mass.numel(), c_mass.device)
+        delta = (m_mass - c_mass)[valid]
+        return {
+            "positions": int(valid.sum().item()),
+            "mean_clean_logprob_mass": float(c_mass[valid].mean().item()),
+            "mean_intervened_logprob_mass": float(m_mass[valid].mean().item()),
+            "mean_delta_logprob_mass": float(delta.mean().item()),
+            "per_position_delta": delta.cpu().tolist(),
+        }
 
-    def trace_incoming_circuit(
+    def _batch_labels(self, batch: Any) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if isinstance(batch, dict):
+            return batch.get("input_ids"), batch.get("attention_mask")
+        if isinstance(batch, torch.Tensor) and not batch.is_floating_point():
+            return batch, None
+        return None, None
+
+    @torch.no_grad()
+    def _evaluate_modifiers(
         self,
-        src_layer: str,
-        dst_layer: str,
-        dst_neuron: int,
-        inputs: Any,
-        dst_pole: PoleType = PoleType.POSITIVE,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        top_k: int = 8,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> CircuitGraph:
+        batches: List[Any],
+        forward_fn: Callable[[nn.Module, Any], Any],
+        label: str,
+        factory: ModifierFactory,
+        need_gate: Optional[Dict[str, bool]] = None,
+    ) -> InterventionEffectReport:
+        tot_tokens = 0
+        clean_nll = mod_nll = kl_sum = 0.0
+        agree = flips = 0
+        flip_margin = all_margin = 0.0
+        counter: Dict[str, int] = {}
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for batch in batches:
+                ids, mask = self._batch_labels(batch)
+                with self.clean_forward():
+                    cl = extract_logits(forward_fn(self.model, batch)).float()
+                hs = HookSet(self.model)
+                for name, fn in factory(counter).items():
+                    hs.add_modifier(name, fn, need_gate=bool(need_gate and need_gate.get(name)))
+                with self.clean_forward(), hs.active():
+                    ml = extract_logits(forward_fn(self.model, batch)).float()
+                c_lp = F.log_softmax(cl, dim=-1)
+                m_lp = F.log_softmax(ml, dim=-1)
+                if ids is not None and cl.ndim == 3:
+                    tgt = ids[:, 1:].to(cl.device)
+                    c_lp_s, m_lp_s = c_lp[:, :-1], m_lp[:, :-1]
+                    valid = torch.ones_like(tgt, dtype=torch.bool)
+                    if mask is not None:
+                        mk = mask.to(cl.device).bool()
+                        valid = mk[:, 1:] & mk[:, :-1]
+                    clean_nll += float(-c_lp_s.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)[valid].sum())
+                    mod_nll += float(-m_lp_s.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)[valid].sum())
+                    pos_valid = valid
+                    c_use, m_use = c_lp_s, m_lp_s
+                else:
+                    c_use, m_use = c_lp, m_lp
+                    pos_valid = valid_position_mask(mask, c_lp.shape[:-1].numel(), cl.device).reshape(c_lp.shape[:-1])
+                kl = (c_use.exp() * (c_use - m_use)).sum(-1)
+                kl_sum += float(kl[pos_valid].sum())
+                c_top = c_use.topk(2, dim=-1)
+                m_top1 = m_use.argmax(-1)
+                same = (c_top.indices[..., 0] == m_top1) & pos_valid
+                agree += int(same.sum())
+                flipped = (~same) & pos_valid
+                flips += int(flipped.sum())
+                probs = c_top.values.exp()
+                margin = probs[..., 0] - probs[..., 1]
+                flip_margin += float(margin[flipped].sum())
+                all_margin += float(margin[pos_valid].sum())
+                tot_tokens += int(pos_valid.sum())
+        finally:
+            if was_training:
+                self.model.train()
+        n = max(tot_tokens, 1)
+        return InterventionEffectReport(
+            label=label,
+            tokens_evaluated=tot_tokens,
+            clean_nll=clean_nll / n,
+            intervened_nll=mod_nll / n,
+            mean_kl=kl_sum / n,
+            top1_agreement=agree / n,
+            flipped_positions=flips,
+            flipped_clean_margin_mean=flip_margin / flips if flips else float("nan"),
+            all_clean_margin_mean=all_margin / n,
+            entries_modified=sum(counter.values()),
+        )
+
+    def evaluate_intervention_effect(
+        self,
+        batches: Iterable[Any],
+        specs: Optional[List[InterventionSpec]] = None,
+        forward_fn: Callable[[nn.Module, Any], Any] = default_forward,
+        label: str = "interventions",
+    ) -> InterventionEffectReport:
         """
-        Traces incoming upstream connections from ALL neurons in `src_layer` into a single
-        target `(dst_layer, dst_neuron, dst_pole)` to decompose which upstream routers drive
-        a neuron's trunk or recursive offshoots.
+        Next-token NLL, KL to the clean model and top-1 agreement under `specs` (or the currently
+        registered interventions). Flipped predictions are reported with their clean top-1/top-2
+        probability margin, to see whether changes only tip near-ties.
         """
+        specs = specs if specs is not None else self.get_active_interventions()
+        by_layer: Dict[str, List[InterventionSpec]] = {}
+        for s in specs:
+            by_layer.setdefault(s.layer_name, []).append(s)
+        if any(s.gate_condition is not None for s in specs):
+            raise ValueError("evaluate_intervention_effect does not support conditional gates; use active_injection().")
+
+        def factory(counter: Dict[str, int]):
+            out = {}
+            for name, ls in by_layer.items():
+                conv = resolve_site(self.model, name).is_conv2d
+
+                def fn(act, gate, ls=ls, nm=name, conv=conv):
+                    new = InterventionKernel.apply(act, ls, is_conv2d=conv, gate=gate)
+                    counter[nm] = counter.get(nm, 0) + int((new != act).sum().item())
+                    return new
+                out[name] = fn
+            return out
+
+        need = {n: any(s.needs_gate_signal for s in ls) for n, ls in by_layer.items()}
         with self._lock:
-            return self.tracer.trace_incoming_circuit(
-                src_layer=src_layer,
-                dst_layer=dst_layer,
-                dst_neuron=dst_neuron,
-                inputs=inputs,
-                forward_fn=forward_fn,
-                dst_pole=dst_pole,
-                top_k=top_k,
-                attention_mask=attention_mask,
-            )
+            return self._evaluate_modifiers(list(batches), forward_fn, label, factory, need)
 
-    def cluster_incoming_attribution_bundles(
+    def measure_weak_activation_ablation(
         self,
-        src_layer: str,
-        dst_layer: str,
-        dst_neuron: int,
-        inputs: Any,
-        dst_pole: PoleType = PoleType.POSITIVE,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        top_k_upstream: int = 12,
-        num_clusters: int = 3,
-    ) -> List[UpstreamAttributionBundle]:
+        layer_names: List[str],
+        batches: Iterable[Any],
+        fraction_of_extreme: Optional[float] = None,
+        percentile: Optional[float] = None,
+        forward_fn: Callable[[nn.Module, Any], Any] = default_forward,
+        seed: int = 0,
+    ) -> Dict[str, InterventionEffectReport]:
         """
-        Clusters incoming upstream contributors from `src_layer` into `(dst_layer, dst_neuron)`
-        into coherent functional attribution bundles (Cammarata: 'Understanding Compounds').
+        Removes the weak activations of every neuron in `layer_names` (per pole, below a fraction of
+        the pole's own extreme or below a within-pole percentile) and compares with a control that
+        zeros the same number of activations per neuron chosen uniformly at random.
         """
+        batches = list(batches)
+        th: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for name in layer_names:
+            tr = self._require_tracker(name)
+            idx = list(range(tr.num_neurons))
+            tp = tr.compute_thresholds(idx, PoleType.POSITIVE, fraction_of_extreme=fraction_of_extreme, percentile=percentile)
+            tn = tr.compute_thresholds(idx, PoleType.NEGATIVE, fraction_of_extreme=fraction_of_extreme, percentile=percentile)
+            th[name] = (torch.tensor(tp), torch.tensor(tn))
+        gen = torch.Generator().manual_seed(seed)
+
+        def _weak_mask(act: torch.Tensor, name: str) -> torch.Tensor:
+            tp, tn = th[name]
+            shape = [1] * (act.ndim - 1) + [-1]
+            tp_ = tp.to(act.device, act.dtype).view(*shape)
+            tn_ = tn.to(act.device, act.dtype).view(*shape)
+            return ((act > 0) & (act < tp_)) | ((act < 0) & (-act < tn_))
+
+        def weak_factory(counter):
+            def make(name):
+                def fn(act, _g):
+                    m = _weak_mask(act, name)
+                    counter[name] = counter.get(name, 0) + int(m.sum())
+                    return torch.where(m, torch.zeros_like(act), act)
+                return fn
+            return {n: make(n) for n in layer_names}
+
+        def random_factory(counter):
+            def make(name):
+                def fn(act, _g):
+                    m = _weak_mask(act, name)
+                    flat = flat_neuron_view(act, False)
+                    mflat = flat_neuron_view(m, False)
+                    cnt = mflat.sum(dim=0)
+                    keys = torch.rand(flat.shape, generator=gen).to(flat.device)
+                    ranks = keys.argsort(dim=0).argsort(dim=0)
+                    rm = ranks < cnt.unsqueeze(0)
+                    counter[name] = counter.get(name, 0) + int(rm.sum())
+                    out = torch.where(rm, torch.zeros_like(flat), flat)
+                    return out.reshape(act.shape)
+                return fn
+            return {n: make(n) for n in layer_names}
+
+        rule = f"fraction_of_extreme={fraction_of_extreme}" if fraction_of_extreme is not None else f"percentile={percentile}"
+        with self._lock:
+            return {
+                "weak_removed": self._evaluate_modifiers(batches, forward_fn, f"weak activations removed ({rule})", weak_factory),
+                "count_matched_random": self._evaluate_modifiers(batches, forward_fn, "count-matched random removal", random_factory),
+            }
+
+    @torch.no_grad()
+    def calibrate_tail_thresholds(
+        self,
+        layer_names: List[str],
+        batches: Iterable[Any],
+        percentile: float = 99.9,
+        signal: str = "gate",
+        forward_fn: Callable[[nn.Module, Any], Any] = default_forward,
+    ) -> Dict[str, List[float]]:
+        """
+        Exact per-neuron upper-tail order statistic of the gate pre-activation (or the activation)
+        over all valid tokens of `batches`: the value exceeded by a (100 - percentile)% share of tokens.
+        Two passes: one to count tokens, one keeping the exact top-(K+1) values per neuron.
+        """
+        if signal not in ("gate", "activation"):
+            raise ValueError("signal must be 'gate' or 'activation'")
+        batches = list(batches)
+        q = percentile / 100.0
+
+        def _collect(fn_per_layer):
+            hs = HookSet(self.model)
+            for name in layer_names:
+                site = hs.site(name)
+                if signal == "gate" and not site.gated:
+                    raise ValueError(f"'{name}' has no gate projection.")
+                hs.add_capture(name, fn_per_layer(name, site), need_gate=(signal == "gate"), dense_moe=False)
+            meta: Dict[str, Any] = {}
+            with self.clean_forward(), hs.active():
+                for b in batches:
+                    meta["mask"] = b.get("attention_mask") if isinstance(b, dict) else None
+                    _collect.meta = meta
+                    forward_fn(self.model, b)
+
+        counts: Dict[str, int] = {n: 0 for n in layer_names}
+
+        def count_fn(name, site):
+            def fn(act, gate, routed):
+                x = flat_neuron_view(act, site.is_conv2d)
+                m = _collect.meta.get("mask") if routed is None else None
+                counts[name] += int(valid_position_mask(m, x.shape[0], x.device).sum()) if m is not None else x.shape[0]
+            return fn
+
+        _collect.meta = {}
+        _collect(count_fn)
+        k_keep = {n: int(math.floor((1.0 - q) * counts[n])) + 1 for n in layer_names}
+        tops: Dict[str, Optional[torch.Tensor]] = {n: None for n in layer_names}
+
+        def top_fn(name, site):
+            def fn(act, gate, routed):
+                src = gate if signal == "gate" else act
+                x = flat_neuron_view(src.float(), site.is_conv2d)
+                m = _collect.meta.get("mask") if routed is None else None
+                if m is not None:
+                    x = x[valid_position_mask(m, x.shape[0], x.device)]
+                cur = tops[name]
+                cat = x if cur is None else torch.cat([cur, x], dim=0)
+                k = min(k_keep[name], cat.shape[0])
+                tops[name] = torch.topk(cat, k=k, dim=0).values
+            return fn
+
+        _collect(top_fn)
+        out: Dict[str, List[float]] = {}
+        for n in layer_names:
+            t = tops[n]
+            if t is None or t.shape[0] < k_keep[n]:
+                raise ValueError(f"Not enough tokens in '{n}' for the {percentile} percentile.")
+            out[n] = t[k_keep[n] - 1].cpu().tolist()
+        return out
+
+    def run_extreme_culling_experiment(
+        self,
+        thresholds: Dict[str, List[float]],
+        batches: Iterable[Any],
+        percentile: float,
+        signal: str = "gate",
+        forward_fn: Callable[[nn.Module, Any], Any] = default_forward,
+        seed: int = 0,
+        generation_prompt_ids: Optional[torch.Tensor] = None,
+        generation_tokens: int = 0,
+        decode_fn: Optional[Callable[[List[int]], str]] = None,
+    ) -> ExtremeCullReport:
+        """
+        'Remove extreme responses': zero each neuron's output wherever its gate (or activation) exceeds
+        its calibrated tail threshold, against two random controls applied to the same forward pass:
+        the same number of zeroed activations per neuron chosen at random (count-matched), and random
+        activations whose summed |a| matches the culled |a| per neuron (magnitude-matched).
+        """
+        batches = list(batches)
+        layers = list(thresholds.keys())
+        th = {n: torch.tensor(v) for n, v in thresholds.items()}
+        gen = torch.Generator().manual_seed(seed)
+
+        def _cull_mask(act, gate, name):
+            src = gate if signal == "gate" else act
+            shape = [1] * (act.ndim - 1) + [-1]
+            return src > th[name].to(src.device, src.dtype).view(*shape)
+
+        def cull_factory(counter):
+            def make(name):
+                def fn(act, gate):
+                    m = _cull_mask(act, gate, name)
+                    counter[name] = counter.get(name, 0) + int(m.sum())
+                    return torch.where(m, torch.zeros_like(act), act)
+                return fn
+            return {n: make(n) for n in layers}
+
+        def count_factory(counter):
+            def make(name):
+                def fn(act, gate):
+                    m = flat_neuron_view(_cull_mask(act, gate, name), False)
+                    flat = flat_neuron_view(act, False)
+                    cnt = m.sum(0)
+                    keys = torch.rand(flat.shape, generator=gen).to(flat.device)
+                    keys = torch.where(m, torch.full_like(keys, 2.0), keys)  # never pick culled entries
+                    ranks = keys.argsort(0).argsort(0)
+                    rm = ranks < cnt.unsqueeze(0)
+                    counter[name] = counter.get(name, 0) + int(rm.sum())
+                    return torch.where(rm, torch.zeros_like(flat), flat).reshape(act.shape)
+                return fn
+            return {n: make(n) for n in layers}
+
+        def mag_factory(counter):
+            def make(name):
+                def fn(act, gate):
+                    m = flat_neuron_view(_cull_mask(act, gate, name), False)
+                    flat = flat_neuron_view(act, False)
+                    target = (flat.abs() * m).sum(0)
+                    keys = torch.rand(flat.shape, generator=gen).to(flat.device)
+                    keys = torch.where(m, torch.full_like(keys, 2.0), keys)
+                    order = keys.argsort(0)
+                    mags = torch.gather(flat.abs() * (~m), 0, order)
+                    cum = mags.cumsum(0)
+                    # smallest random prefix whose summed |a| reaches the culled mass
+                    take_sorted = (cum - mags) < target.unsqueeze(0)
+                    take_sorted &= target.unsqueeze(0) > 0
+                    rm = torch.zeros_like(m)
+                    rm.scatter_(0, order, take_sorted)
+                    counter[name] = counter.get(name, 0) + int(rm.sum())
+                    return torch.where(rm, torch.zeros_like(flat), flat).reshape(act.shape)
+                return fn
+            return {n: make(n) for n in layers}
+
+        need = {n: signal == "gate" for n in layers}
+        with self._lock:
+            culled = self._evaluate_modifiers(batches, forward_fn, f"cull > p{percentile} ({signal})", cull_factory, need)
+            cm = self._evaluate_modifiers(batches, forward_fn, "count-matched random", count_factory, need)
+            mm = self._evaluate_modifiers(batches, forward_fn, "magnitude-matched random", mag_factory, need)
+            gens: Dict[str, str] = {}
+            if generation_prompt_ids is not None and generation_tokens > 0:
+                for lbl, fac in (("clean", None), ("culled", cull_factory), ("count_matched_random", count_factory),
+                                 ("magnitude_matched_random", mag_factory)):
+                    ids = self._greedy_generate(generation_prompt_ids, generation_tokens, fac, need)
+                    gens[lbl] = decode_fn(ids) if decode_fn else " ".join(map(str, ids))
+        return ExtremeCullReport(layers, percentile, signal, culled, cm, mm, gens)
+
+    @torch.no_grad()
+    def _greedy_generate(self, prompt_ids: torch.Tensor, n_tokens: int, factory: Optional[ModifierFactory],
+                         need_gate: Optional[Dict[str, bool]] = None) -> List[int]:
+        ids = prompt_ids.clone()
+        out: List[int] = []
+        for _ in range(n_tokens):
+            hs = HookSet(self.model)
+            if factory is not None:
+                for name, fn in factory({}).items():
+                    hs.add_modifier(name, fn, need_gate=bool(need_gate and need_gate.get(name)))
+            with self.clean_forward(), hs.active():
+                logits = extract_logits(self.model(ids)).float()
+            nxt = int(logits[0, -1].argmax())
+            out.append(nxt)
+            ids = torch.cat([ids, torch.tensor([[nxt]], device=ids.device)], dim=1)
+        return out
+
+    # -------------------------------------------------------------------------
+    # 5. Circuits
+    # -------------------------------------------------------------------------
+    def trace_circuit(self, src_layer: str, dst_layer: str, src_neuron: int, inputs: Any,
+                      src_pole: PoleType = PoleType.POSITIVE, forward_fn: Optional[Callable] = None,
+                      compute_jacobian: bool = True, top_k: int = 10, attention_mask: Optional[torch.Tensor] = None,
+                      position_mode: str = "all_active") -> CircuitGraph:
+        with self._lock:
+            return self.tracer.trace_circuit(src_layer=src_layer, dst_layer=dst_layer, src_neuron=src_neuron,
+                                             inputs=inputs, forward_fn=forward_fn, src_pole=src_pole,
+                                             compute_jacobian=compute_jacobian, top_k=top_k,
+                                             attention_mask=attention_mask, position_mode=position_mode)
+
+    def trace_incoming_circuit(self, src_layer: str, dst_layer: str, dst_neuron: int, inputs: Any,
+                               dst_pole: PoleType = PoleType.POSITIVE, forward_fn: Optional[Callable] = None,
+                               top_k: int = 8, attention_mask: Optional[torch.Tensor] = None) -> CircuitGraph:
+        with self._lock:
+            return self.tracer.trace_incoming_circuit(src_layer=src_layer, dst_layer=dst_layer, dst_neuron=dst_neuron,
+                                                      inputs=inputs, forward_fn=forward_fn, dst_pole=dst_pole,
+                                                      top_k=top_k, attention_mask=attention_mask)
+
+    def cluster_incoming_attribution_bundles(self, src_layer: str, dst_layer: str, dst_neuron: int,
+                                             contexts: List[Any], dst_pole: PoleType = PoleType.POSITIVE,
+                                             forward_fn: Optional[Callable] = None, top_k_upstream: int = 24,
+                                             max_bundles: int = 6, context_labels: Optional[List[str]] = None,
+                                             n_permutations: int = 100, alpha: float = 0.05,
+                                             ) -> List[UpstreamAttributionBundle]:
         with self._lock:
             return self.tracer.cluster_incoming_attribution_bundles(
-                src_layer=src_layer,
-                dst_layer=dst_layer,
-                dst_neuron=dst_neuron,
-                inputs=inputs,
-                forward_fn=forward_fn,
-                dst_pole=dst_pole,
-                top_k_upstream=top_k_upstream,
-                num_clusters=num_clusters,
-            )
+                src_layer=src_layer, dst_layer=dst_layer, dst_neuron=dst_neuron, contexts=contexts,
+                dst_pole=dst_pole, forward_fn=forward_fn, top_k_upstream=top_k_upstream,
+                max_bundles=max_bundles, context_labels=context_labels, n_permutations=n_permutations, alpha=alpha)
 
-    def audit_residual_stream_sinks(
-        self,
-        src_layer: str,
-        neuron_indices: Optional[List[int]] = None,
-        unembed_weight: Optional[torch.Tensor] = None,
-        sink_cosine_threshold: float = 0.25,
-    ) -> ResidualSinkReport:
-        """
-        Audits neurons in `src_layer` for Residual Stream Sink behavior
-        (Cammarata: 'Finding Clean Circuits — Residual Stream Sinks & Norm Scaling').
-        """
+    def audit_residual_stream_sinks(self, residual_site: str, batches: Iterable[Any],
+                                    forward_fn: Callable = default_forward,
+                                    neuron_layers: Optional[List[str]] = None) -> ResidualSinkReport:
         with self._lock:
-            return self.tracer.audit_residual_stream_sinks(
-                src_layer=src_layer,
-                neuron_indices=neuron_indices,
-                unembed_weight=unembed_weight,
-                sink_cosine_threshold=sink_cosine_threshold,
-            )
+            return self.tracer.audit_residual_stream_sinks(residual_site=residual_site, batches=batches,
+                                                           forward_fn=forward_fn, neuron_layers=neuron_layers)
 
-    def trace_forward_ad_all_layers(
-        self,
-        src_layer: str,
-        src_neuron: int,
-        inputs: Any,
-        dst_layers: Optional[List[str]] = None,
-        src_pole: PoleType = PoleType.POSITIVE,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        position_mode: str = "all_active",
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Single-pass Forward-Mode AD (`torch.autograd.forward_ad`) circuit tracer:
-        Returns a dictionary mapping every downstream layer name to its exact 1D Jacobian
-        sensitivity tensor `d(A_dst)/d(a_{src_layer, src_neuron})` in a single forward pass.
-        """
+    def trace_forward_ad_all_layers(self, src_layer: str, src_neuron: int, inputs: Any,
+                                    dst_layers: Optional[List[str]] = None, src_pole: PoleType = PoleType.POSITIVE,
+                                    forward_fn: Optional[Callable] = None, position_mode: str = "all_active") -> Dict[str, torch.Tensor]:
         with self._lock:
-            return self.tracer.trace_forward_ad_all_layers(
-                src_layer=src_layer,
-                src_neuron=src_neuron,
-                inputs=inputs,
-                dst_layers=dst_layers,
-                src_pole=src_pole,
-                forward_fn=forward_fn,
-                position_mode=position_mode,
-            )
+            return self.tracer.trace_forward_ad_all_layers(src_layer=src_layer, src_neuron=src_neuron, inputs=inputs,
+                                                           dst_layers=dst_layers, src_pole=src_pole,
+                                                           forward_fn=forward_fn, position_mode=position_mode)
 
-    def verify_downstream_readout(
-        self,
-        src_layer: str,
-        dst_layer: str,
-        src_neurons: List[int],
-        inputs: Any,
-        weak_threshold: Optional[Union[float, List[float]]] = None,
-        std_multiplier: Optional[float] = 0.75,
-        percentile: Optional[float] = None,
-        readout_tolerance: float = 0.05,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> DownstreamReadoutReport:
-        """
-        Tests Cammarata's 'Nothing Reads That Combination' hypothesis
-        ('Where Could Superposition Hide?') across `src_neurons` in `src_layer`
-        with respect to `dst_layer`.
-        """
+    def verify_combination_readout(self, src_layer: str, src_neurons: List[int], coefficients: Optional[List[float]] = None,
+                                   dst_layers: Optional[List[str]] = None, null_samples: int = 1000, seed: int = 0,
+                                   causal_inputs: Any = None, forward_fn: Optional[Callable] = None) -> CombinationReadoutReport:
         with self._lock:
-            return self.tracer.verify_downstream_readout(
-                src_layer=src_layer,
-                dst_layer=dst_layer,
-                src_neurons=src_neurons,
-                inputs=inputs,
-                weak_threshold=weak_threshold,
-                std_multiplier=std_multiplier,
-                percentile=percentile,
-                readout_tolerance=readout_tolerance,
-                forward_fn=forward_fn,
-                attention_mask=attention_mask,
-            )
+            return self.tracer.verify_combination_readout(src_layer=src_layer, src_neurons=src_neurons,
+                                                          coefficients=coefficients, dst_layers=dst_layers,
+                                                          null_samples=null_samples, seed=seed,
+                                                          causal_inputs=causal_inputs, forward_fn=forward_fn)
 
-    def decompose_direct_vs_indirect_effect(
-        self,
-        layer_name: str,
-        neuron_idx: int,
-        inputs: Any,
-        target_token_id: int,
-        downstream_layer: str,
-        rescue_downstream_neurons: List[int],
-        pole: PoleType = PoleType.BOTH,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, float]:
-        """
-        Decomposes a neuron's total causal effect on `target_token_id` into its direct
-        (unmediated) logit effect and its indirect effect mediated through `rescue_downstream_neurons`.
-        """
+    def decompose_direct_vs_indirect_effect(self, layer_name: str, neuron_idx: int, inputs: Any, target_token_id: int,
+                                            downstream_layer: Optional[str] = None,
+                                            rescue_downstream_neurons: Optional[List[int]] = None,
+                                            pole: PoleType = PoleType.BOTH, forward_fn: Optional[Callable] = None,
+                                            position: int = -1) -> Dict[str, float]:
         with self._lock:
             return self.tracer.decompose_direct_vs_indirect_effect(
-                layer_name=layer_name,
-                neuron_idx=neuron_idx,
-                inputs=inputs,
-                target_token_id=target_token_id,
-                downstream_layer=downstream_layer,
-                rescue_downstream_neurons=rescue_downstream_neurons,
-                pole=pole,
-                forward_fn=forward_fn,
-                attention_mask=attention_mask,
-            )
+                layer_name=layer_name, neuron_idx=neuron_idx, inputs=inputs, target_token_id=target_token_id,
+                downstream_layer=downstream_layer, rescue_downstream_neurons=rescue_downstream_neurons,
+                pole=pole, forward_fn=forward_fn, position=position)
 
     # -------------------------------------------------------------------------
-    # 5. Automated LLM-Agent Explanation & Crossword Ecology Solver
+    # 6. Explanations
     # -------------------------------------------------------------------------
-    def set_explainer_llm_client(self, llm_client: LLMClientProtocol) -> None:
-        """Configures the LLM client used by `self.explainer` for agentic neuron explanation."""
+    def set_explainer_llm_client(self, llm_client: LLMClientProtocol,
+                                 test_writer_client: Optional[LLMClientProtocol] = None) -> None:
         with self._lock:
             self.explainer.llm_client = llm_client
+            self.explainer.test_writer_client = test_writer_client or llm_client
 
-    def explain_neuron(
-        self,
-        layer_name: str,
-        neuron_idx: int,
-        tok_to_id: Optional[Dict[str, int]] = None,
-        idx_to_token: Optional[Dict[int, str]] = None,
-        unembed_weight: Optional[torch.Tensor] = None,
-        dst_layer: Optional[str] = None,
-        circuit_inputs: Optional[Any] = None,
-        tokenizer: Optional[Any] = None,
-        src_layer: Optional[str] = None,
-    ) -> BipolarVerbHypothesis:
-        """
-        Synthesizes a bipolar 'verb' explanation for `(layer_name, neuron_idx)` (optionally
-        tracing downstream to `dst_layer` and upstream from `src_layer`) and runs automated
-        surgical Zero-Ablation and Pole-Clamping experiments to empirically verify it.
-        """
+    def explain_neuron(self, layer_name: str, neuron_idx: int, **kwargs: Any) -> BipolarVerbHypothesis:
+        """Explain one neuron and put the explanation at risk; see `NeuronExplainerAgent.explain_and_verify`."""
+        kwargs.setdefault("tokenizer", self.tokenizer)
         with self._lock:
-            return self.explainer.explain_and_verify(
-                layer_name=layer_name,
-                neuron_idx=neuron_idx,
-                tok_to_id=tok_to_id or {},
-                idx_to_token=idx_to_token or {},
-                unembed_weight=unembed_weight,
-                dst_layer=dst_layer,
-                circuit_inputs=circuit_inputs,
-                tokenizer=tokenizer or self.tokenizer,
-                src_layer=src_layer,
-            )
+            return self.explainer.explain_and_verify(layer_name=layer_name, neuron_idx=neuron_idx, **kwargs)
 
-    def solve_layer_ecology(
-        self,
-        layer_name: str,
-        tok_to_id: Optional[Dict[str, int]] = None,
-        idx_to_token: Optional[Dict[int, str]] = None,
-        unembed_weight: Optional[torch.Tensor] = None,
-        dst_layer: Optional[str] = None,
-        circuit_inputs: Optional[Any] = None,
-        top_anchors: int = 3,
-        top_contextual: int = 3,
-        tokenizer: Optional[Any] = None,
-        src_layer: Optional[str] = None,
-    ) -> LayerEcologySolveReport:
+    def audit_layer_explanations(self, layer_name: str, n_neurons: int, seed: int = 0,
+                                 neuron_indices: Optional[List[int]] = None, **kwargs: Any) -> ExplanationAuditSummary:
         """
-        Implements Cammarata's Crossword / Circuit Ecology propagation loop
-        ('Understanding Compounds'):
-          - Pass 1 (Easy Crossword Clues): Ranks audited neurons by selectivity and causal impact,
-            explains + verifies the top `top_anchors` anchor neurons, and stores their verified
-            hypotheses and circuit edges in `self.ecology_map`.
-          - Sibling & Reader Link Propagation: Connects Pass 2 contextual neurons in `layer_name`
-            to Pass 1 verified anchors via shared downstream `dst_layer` readers or outgoing
-            write-direction coupling (`register_same_layer_siblings`).
-          - Pass 2 (Compound Understanding): Explains the next `top_contextual` structured
-            recursive mixture / contextual neurons while injecting the verified neighbor motifs
-            from `self.ecology_map` into the LLM prompt.
+        Explain-and-test a uniform random sample of neurons from `layer_name` (or the given indices) and
+        aggregate the outcomes. Only a random sample gives an unbiased estimate for the layer.
         """
+        tr = self._require_tracker(layer_name)
+        if neuron_indices is None:
+            rng = random.Random(seed)
+            neuron_indices = rng.sample(range(tr.num_neurons), k=min(n_neurons, tr.num_neurons))
+            sampling = f"uniform_random(seed={seed}, n={len(neuron_indices)})"
+        else:
+            sampling = "user_selected"
+        for i in neuron_indices:
+            self.explain_neuron(layer_name, int(i), **kwargs)
+        return self.ecology_map.summarize(layer_name, neuron_indices=list(neuron_indices), sampling=sampling)
+
+    def solve_circuit_ecology(self, seed_neurons: List[Tuple[str, int]], neighbor_layers: List[str],
+                              circuit_inputs_fn: Callable[[str, int], Any], max_pass2_neurons: int = 8,
+                              edges_per_neuron: int = 4, **explain_kwargs: Any) -> LayerEcologySolveReport:
         with self._lock:
-            scan = self.scan_layer_cleanliness(
-                layer_name=layer_name, sort_by="estimated_causal_impact"
-            )
-            anchors = [
-                n.neuron_idx
-                for n in scan.neurons
-                if n.taxonomy_class == NeuronTaxonomy.CLEAN_MONOSEMANTIC
-            ][:top_anchors]
-            if len(anchors) < top_anchors:
-                for n in scan.neurons:
-                    if n.neuron_idx not in anchors:
-                        anchors.append(n.neuron_idx)
-                    if len(anchors) >= top_anchors:
-                        break
-
-            contextual = [
-                n.neuron_idx
-                for n in scan.neurons
-                if n.neuron_idx not in anchors
-                and n.taxonomy_class != NeuronTaxonomy.DEAD_OR_NOISY
-            ][:top_contextual]
-
-            solved: Dict[int, BipolarVerbHypothesis] = {}
-            scores: List[float] = []
-
-            # Pass 1: Solve anchor neurons
-            for n_idx in anchors:
-                hyp = self.explain_neuron(
-                    layer_name=layer_name,
-                    neuron_idx=n_idx,
-                    tok_to_id=tok_to_id,
-                    idx_to_token=idx_to_token,
-                    unembed_weight=unembed_weight,
-                    dst_layer=dst_layer,
-                    circuit_inputs=circuit_inputs,
-                    tokenizer=tokenizer,
-                    src_layer=src_layer,
-                )
-                solved[n_idx] = hyp
-                if hyp.verification_report is not None:
-                    scores.append(hyp.verification_report.empirical_verification_score)
-
-            # Link Pass 1 anchors to Pass 2 contextual neurons via shared downstream readers
-            # or same-layer functional sibling relationships so Pass 2 receives non-empty clues!
-            for c_idx in contextual:
-                if dst_layer is not None and circuit_inputs is not None:
-                    c_graph = self.trace_circuit(
-                        src_layer=layer_name,
-                        dst_layer=dst_layer,
-                        src_neuron=c_idx,
-                        inputs=circuit_inputs,
-                        src_pole=PoleType.POSITIVE,
-                        compute_jacobian=False,
-                        top_k=8,
-                    )
-                    c_dst_set = {e.dst_neuron for e in c_graph.edges[:4]}
-                else:
-                    c_dst_set = set()
-
-                for a_idx in anchors:
-                    a_edges = self.ecology_map.edges_from.get((layer_name, a_idx), [])
-                    a_dst_set = {e.dst_neuron for e in a_edges[:4]}
-                    shared_dst = c_dst_set & a_dst_set
-                    if shared_dst:
-                        self.ecology_map.register_same_layer_siblings(
-                            layer_name=layer_name,
-                            neuron_a=a_idx,
-                            neuron_b=c_idx,
-                            role=f"shared_downstream_reader_N{sorted(shared_dst)[0]}",
-                            coupling_strength=0.75,
-                        )
-                    else:
-                        self.ecology_map.register_same_layer_siblings(
-                            layer_name=layer_name,
-                            neuron_a=a_idx,
-                            neuron_b=c_idx,
-                            role="same_layer_anchor_context",
-                            coupling_strength=0.35,
-                        )
-
-            # Pass 2: Solve contextual neurons with ecology neighbor clues populated
-            clues_injected = 0
-            for n_idx in contextual:
-                clues = self.ecology_map.get_neighbor_contexts(layer_name, n_idx)
-                clues_injected += len(clues)
-                hyp = self.explain_neuron(
-                    layer_name=layer_name,
-                    neuron_idx=n_idx,
-                    tok_to_id=tok_to_id,
-                    idx_to_token=idx_to_token,
-                    unembed_weight=unembed_weight,
-                    dst_layer=dst_layer,
-                    circuit_inputs=circuit_inputs,
-                    tokenizer=tokenizer,
-                    src_layer=src_layer,
-                )
-                solved[n_idx] = hyp
-                if hyp.verification_report is not None:
-                    scores.append(hyp.verification_report.empirical_verification_score)
-
-            mean_score = sum(scores) / max(len(scores), 1) if scores else 0.0
-            return LayerEcologySolveReport(
-                layer_name=layer_name,
-                anchor_neurons_explained=anchors,
-                contextual_neurons_explained=contextual,
-                hypotheses=solved,
-                mean_verification_score=round(mean_score, 3),
-                contextual_clues_injected_count=clues_injected,
-            )
+            return self.explainer.solve_circuit_ecology(seed_neurons=seed_neurons, neighbor_layers=neighbor_layers,
+                                                        circuit_inputs_fn=circuit_inputs_fn,
+                                                        max_pass2_neurons=max_pass2_neurons,
+                                                        edges_per_neuron=edges_per_neuron, **explain_kwargs)
 
     # -------------------------------------------------------------------------
-    # 6. Batch Layer-Wide & Pole-Specific Cleanliness Scanning
+    # 7. Layer scan
     # -------------------------------------------------------------------------
     @torch.no_grad()
-    def scan_layer_cleanliness(
-        self,
-        layer_name: str,
-        sort_by: str = "pole_selectivity_score",
-        compute_kl_for_top_n: int = 0,
-        kl_eval_inputs: Optional[torch.Tensor] = None,
-        limit: Optional[int] = None,
-    ) -> LayerCleanlinessReport:
-        """
-        Scans all neurons in `layer_name` in parallel using GPU Welford moments and
-        outgoing weight norms as a fast statistical prior, then promotes any neuron
-        with a verified hypothesis in `self.ecology_map` (`semantic_verified=True`).
-        """
-        if layer_name not in self._stats_trackers:
-            raise KeyError(
-                f"Layer '{layer_name}' has not been audited yet. Call `audit_layers` first."
+    def scan_layer(self, layer_name: str, sort_by: str = "rms_write_norm", compute_kl_for_top_n: int = 0,
+                   kl_eval_inputs: Optional[Any] = None, limit: Optional[int] = None) -> LayerScanReport:
+        """Descriptive per-neuron table of an audited layer plus the aggregate of its explanation audits."""
+        with self._lock:
+            tr = self._require_tracker(layer_name)
+            wv = self.neuron_write_vectors(layer_name)
+            rows = tr.scan(wv.float().norm(dim=1) if wv is not None else None)
+            for r in rows:
+                h = self.ecology_map.get_hypothesis(layer_name, r.neuron_idx)
+                if h is not None:
+                    r.explained = True
+                    r.pos_taxonomy, r.neg_taxonomy = h.pos_taxonomy, h.neg_taxonomy
+                    r.pos_outcome, r.neg_outcome = h.outcome(PoleType.POSITIVE), h.outcome(PoleType.NEGATIVE)
+            keys = {
+                "rms_write_norm": lambda r: (r.rms_write_norm if math.isfinite(r.rms_write_norm) else -1.0),
+                "std": lambda r: r.std,
+                "max_val": lambda r: r.max_val,
+                "min_val": lambda r: -r.min_val,
+                "positive_excess_kurtosis": lambda r: r.positive_excess_kurtosis,
+                "negative_excess_kurtosis": lambda r: r.negative_excess_kurtosis,
+                "double_negative_positive_rate": lambda r: r.double_negative_positive_rate,
+            }
+            if sort_by == "neuron_idx":
+                rows.sort(key=lambda r: r.neuron_idx)
+            elif sort_by in keys:
+                rows.sort(key=keys[sort_by], reverse=True)
+            else:
+                raise ValueError(f"Unknown sort_by '{sort_by}'. Options: neuron_idx, {', '.join(keys)}")
+            if compute_kl_for_top_n > 0 and kl_eval_inputs is not None:
+                for r in rows[:compute_kl_for_top_n]:
+                    r.ablation_kl_divergence = self.measure_ablation_kl_divergence(layer_name, r.neuron_idx, kl_eval_inputs)
+            if limit is not None:
+                rows = rows[:limit]
+            return LayerScanReport(
+                layer_name=layer_name,
+                num_neurons=tr.num_neurons,
+                tokens_scanned=tr.count,
+                gated=tr.gated,
+                neurons=rows,
+                layer_double_negative_positive_rate=tr.layer_double_negative_positive_rate(),
+                explanation_audit=self.ecology_map.summarize(layer_name),
             )
-
-        tracker = self._stats_trackers[layer_name]
-        module, _, _ = LayerDiscovery.resolve_module(self.model, layer_name)
-
-        counts, pcts, summaries = tracker.scan_layer_cleanliness(
-            down_proj_module=module,
-            verified_hypotheses=self.ecology_map.hypotheses,
-        )
-
-        # Aggregate independent pole-level taxonomy counts across all 2 * num_neurons poles
-        pole_counts: Dict[str, int] = {
-            NeuronTaxonomy.CLEAN_MONOSEMANTIC.value: 0,
-            NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value: 0,
-            NeuronTaxonomy.TRUE_POLYSEMANTIC.value: 0,
-            NeuronTaxonomy.DEAD_OR_NOISY.value: 0,
-        }
-        prior_counts: Dict[str, int] = {}
-        verified_cnt = 0
-        untriggered_cnt = 0
-        for summary_item in summaries:
-            pole_counts[summary_item.pos_taxonomy_class.value] = (
-                pole_counts.get(summary_item.pos_taxonomy_class.value, 0) + 1
-            )
-            pole_counts[summary_item.neg_taxonomy_class.value] = (
-                pole_counts.get(summary_item.neg_taxonomy_class.value, 0) + 1
-            )
-            p_val = summary_item.sparsity_tail_prior.value
-            prior_counts[p_val] = prior_counts.get(p_val, 0) + 1
-            if summary_item.semantic_verified:
-                verified_cnt += 1
-            peak_abs = max(abs(summary_item.max_val), abs(summary_item.min_val))
-            if (
-                summary_item.taxonomy_class == NeuronTaxonomy.TRUE_POLYSEMANTIC
-                and peak_abs < 3.2 * max(summary_item.std, 1e-6)
-            ):
-                untriggered_cnt += 1
-
-        total_poles = max(2 * tracker.num_neurons, 1)
-        pole_pcts = {k: round((v / total_poles) * 100.0, 2) for k, v in pole_counts.items()}
-        clean_poles_pct = pole_pcts.get(NeuronTaxonomy.CLEAN_MONOSEMANTIC.value, 0.0)
-        struct_poles_pct = pole_pcts.get(NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value, 0.0)
-
-        if sort_by == "estimated_causal_impact":
-            summaries.sort(key=lambda item: item.estimated_causal_impact, reverse=True)
-        elif sort_by == "bipolar_balance":
-            summaries.sort(key=lambda item: item.bipolar_balance, reverse=True)
-        elif sort_by == "neuron_idx":
-            summaries.sort(key=lambda item: item.neuron_idx)
-        else:
-            summaries.sort(key=lambda item: item.pole_selectivity_score, reverse=True)
-
-        if compute_kl_for_top_n > 0 and kl_eval_inputs is not None:
-            for summary in summaries[:compute_kl_for_top_n]:
-                summary.ablation_kl_divergence = round(
-                    self.measure_ablation_kl_divergence(
-                        layer_name=layer_name,
-                        neuron_idx=summary.neuron_idx,
-                        inputs=kl_eval_inputs,
-                    ),
-                    5,
-                )
-
-        clean_pct = pcts.get(NeuronTaxonomy.CLEAN_MONOSEMANTIC.value, 0.0)
-        struct_pct = pcts.get(NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value, 0.0)
-        mean_sel = (
-            sum(item.pole_selectivity_score for item in summaries) / max(len(summaries), 1)
-            if summaries
-            else 0.0
-        )
-        total_neurons = max(tracker.num_neurons, 1)
-        untriggered_pct = round((untriggered_cnt / total_neurons) * 100.0, 2)
-        triggered_neurons = max(total_neurons - untriggered_cnt, 1)
-        clean_plus_struct_cnt = counts.get(NeuronTaxonomy.CLEAN_MONOSEMANTIC.value, 0) + counts.get(
-            NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value, 0
-        )
-        clean_among_triggered_pct = round(
-            min(100.0, (clean_plus_struct_cnt / triggered_neurons) * 100.0), 2
-        )
-
-        if limit is not None:
-            summaries = summaries[:limit]
-
-        return LayerCleanlinessReport(
-            layer_name=layer_name,
-            num_neurons=tracker.num_neurons,
-            tokens_scanned=tracker.count,
-            taxonomy_counts=counts,
-            taxonomy_percentages=pcts,
-            clean_monosemantic_pct=clean_pct,
-            structured_recursive_pct=struct_pct,
-            combined_clean_and_structured_pct=round(clean_pct + struct_pct, 2),
-            mean_selectivity_score=round(mean_sel, 3),
-            neurons=summaries,
-            pole_taxonomy_counts=pole_counts,
-            pole_taxonomy_percentages=pole_pcts,
-            clean_poles_pct=clean_poles_pct,
-            structured_poles_pct=struct_poles_pct,
-            combined_clean_and_structured_poles_pct=round(clean_poles_pct + struct_poles_pct, 2),
-            prior_counts=prior_counts,
-            semantically_verified_count=verified_cnt,
-            untriggered_on_sample_count=untriggered_cnt,
-            untriggered_on_sample_pct=untriggered_pct,
-            clean_and_structured_among_triggered_pct=clean_among_triggered_pct,
-        )
 
     # -------------------------------------------------------------------------
-    # 7. Contrastive Discovery, Checkpoint Evolution & Synergistic Ablation
+    # 8. Contrastive discovery, development, coalitions
     # -------------------------------------------------------------------------
-    def discover_contrastive_neurons(
-        self,
-        pos_inputs: Union[torch.Tensor, Iterable[Any]],
-        neg_inputs: Union[torch.Tensor, Iterable[Any]],
-        layer_names: Optional[List[str]] = None,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        top_k: int = 16,
-    ) -> ContrastiveDiscoveryReport:
-        """
-        Contrastive Pole Discovery:
-        Ranks all native neurons across `layer_names` by their Welch's Bipolar
-        Separation t-statistic between `pos_inputs` (D+) and `neg_inputs` (D-).
-        """
-        target_layers = layer_names or list(self.list_targetable_layers().keys())
-        with self._lock, self.without_interventions():
-            return ContrastivePoleFinder.discover(
-                model=self.model,
-                pos_inputs=pos_inputs,
-                neg_inputs=neg_inputs,
-                layer_names=target_layers,
-                forward_fn=forward_fn,
-                top_k=top_k,
-                device=self.device,
-            )
+    def discover_contrastive_neurons(self, pos_inputs: Union[torch.Tensor, Iterable[Any]],
+                                     neg_inputs: Union[torch.Tensor, Iterable[Any]],
+                                     layer_names: Optional[List[str]] = None,
+                                     forward_fn: Optional[Callable] = None, top_k: int = 16) -> ContrastiveDiscoveryReport:
+        """Welch's t on per-prompt mean activations between two prompt sets (prompts are the units)."""
+        layers = layer_names or list(self.list_targetable_layers().keys())
+        with self._lock, self.clean_forward():
+            return ContrastivePoleFinder.discover(self.model, pos_inputs, neg_inputs, layers,
+                                                  forward_fn=forward_fn or default_forward, top_k=top_k,
+                                                  device=self.device)
 
-    def inject_contrastive_behavior(
-        self,
-        contrastive_report_or_matches: Union[ContrastiveDiscoveryReport, List[ContrastiveNeuronMatch]],
-        strength: float = 2.0,
-        top_k: Optional[int] = None,
-        direction: float = 1.0,
-        mode: InterventionMode = InterventionMode.ADDITIVE_STEER,
-    ) -> List[InterventionSpec]:
+    def inject_contrastive_behavior(self, contrastive_report_or_matches: Union[ContrastiveDiscoveryReport, List[ContrastiveNeuronMatch]],
+                                    strength: float, top_k: Optional[int] = None, direction: float = 1.0,
+                                    mode: InterventionMode = InterventionMode.ADDITIVE_STEER) -> List[InterventionSpec]:
         """
-        Native-Scale Contrastive Behavioral Neural Injection:
-        Registers surgical neuron-basis interventions across the top discovered contrastive
-        neurons, scaling each neuron's shift to its own native empirical differential
-        `direction * strength * (m.pos_mean - m.neg_mean)` (or clamping to `m.pos_mean * strength`
-        for `direction > 0` / `m.neg_mean * strength` for `direction < 0` when `mode == HARD_CLAMP`).
+        Steers the discovered neurons on their own native scale: ADDITIVE_STEER by
+        direction * strength * (mean_pos - mean_neg), or HARD_CLAMP to strength * (mean of the chosen set).
         """
-        matches = (
-            contrastive_report_or_matches.top_matches
-            if isinstance(contrastive_report_or_matches, ContrastiveDiscoveryReport)
-            else list(contrastive_report_or_matches)
-        )
+        matches = (contrastive_report_or_matches.top_matches
+                   if isinstance(contrastive_report_or_matches, ContrastiveDiscoveryReport)
+                   else list(contrastive_report_or_matches))
         if top_k is not None:
             matches = matches[:top_k]
-
         by_layer: Dict[str, List[Tuple[int, float]]] = {}
         for m in matches:
             if mode == InterventionMode.HARD_CLAMP:
-                target_val = (
-                    m.pos_mean * abs(strength) if direction >= 0 else m.neg_mean * abs(strength)
-                )
+                val = (m.pos_mean if direction >= 0 else m.neg_mean) * abs(strength)
+            elif mode == InterventionMode.ADDITIVE_STEER:
+                val = float(direction) * float(strength) * (m.pos_mean - m.neg_mean)
             else:
-                target_val = float(direction) * float(strength) * (m.pos_mean - m.neg_mean)
-            by_layer.setdefault(m.layer_name, []).append((m.neuron_idx, float(target_val)))
-
-        specs: List[InterventionSpec] = []
-        for lname, pairs in by_layer.items():
-            n_indices = [p[0] for p in pairs]
-            n_vals = [p[1] for p in pairs]
-            spec = InterventionSpec(
-                layer_name=lname,
-                neuron_indices=n_indices,
-                mode=mode,
-                pole=PoleType.BOTH,
-                value=n_vals[0] if n_vals else 0.0,
-                per_neuron_values=n_vals,
-            )
+                raise ValueError("mode must be ADDITIVE_STEER or HARD_CLAMP")
+            by_layer.setdefault(m.layer_name, []).append((m.neuron_idx, float(val)))
+        specs = []
+        for name, pairs in by_layer.items():
+            spec = InterventionSpec(name, [p[0] for p in pairs], mode, PoleType.BOTH, 0.0,
+                                    per_neuron_values=[p[1] for p in pairs])
             self.add_intervention(spec)
             specs.append(spec)
         return specs
 
-    def track_checkpoint_evolution(
-        self,
-        checkpoints: List[Tuple[str, Union[nn.Module, Callable[[], nn.Module]]]],
-        layer_name: str,
-        neuron_idx: int,
-        batches: Iterable[Dict[str, Any]],
-        forward_fn: Callable[[nn.Module, Dict[str, Any]], Any],
-        top_k: int = 8,
-    ) -> NeuronEvolutionReport:
-        """
-        Cross-Checkpoint 'Recursive Growth' Tracker:
-        Measures how `(layer_name, neuron_idx)` evolves its pole selectivity, outgoing
-        weight vector, and stratified quantile offshoots across `checkpoints`.
-        """
-        return CheckpointEvolutionTracker.track_neuron_evolution(
-            checkpoints=checkpoints,
-            layer_name=layer_name,
-            neuron_idx=neuron_idx,
-            batches=batches,
-            forward_fn=forward_fn,
-            top_k=top_k,
-        )
+    def track_checkpoint_evolution(self, checkpoints, layer_name: str, neuron_idx: int, batches, forward_fn=default_forward,
+                                   top_k: int = 16) -> NeuronEvolutionReport:
+        return CheckpointEvolutionTracker.track_neuron_evolution(checkpoints, layer_name, neuron_idx, batches,
+                                                                 forward_fn, top_k=top_k)
 
-    def find_synergistic_ablation_set(
-        self,
-        layer_name: str,
-        inputs: Any,
-        max_subset_size: int = 3,
-        candidate_pool_size: int = 16,
-        method: str = "greedy",
-        target_token_ids: Optional[List[int]] = None,
-        pole: PoleType = PoleType.BOTH,
-        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
-        candidate_neurons: Optional[List[int]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> SynergisticAblationResult:
-        """
-        Subspace / Multi-Neuron Synergistic Ablation:
-        Finds a minimal coalition of `max_subset_size` neurons in `layer_name` whose
-        joint ablation overcomes backup circuits to maximize output shift.
-        """
+    def find_synergistic_ablation_set(self, layer_name: str, inputs: Any, **kwargs: Any) -> SynergisticAblationResult:
         with self._lock:
-            return self.ablation_optimizer.find_synergistic_ablation_set(
-                layer_name=layer_name,
-                inputs=inputs,
-                max_subset_size=max_subset_size,
-                candidate_pool_size=candidate_pool_size,
-                method=method,
-                target_token_ids=target_token_ids,
-                pole=pole,
-                forward_fn=forward_fn,
-                candidate_neurons=candidate_neurons,
-                attention_mask=attention_mask,
-            )
+            return self.ablation_optimizer.find_synergistic_ablation_set(layer_name=layer_name, inputs=inputs, **kwargs)
 
     # -------------------------------------------------------------------------
-    # 8. Production Steering Vector & Preset Export / Weight Folding
+    # 9. Export and weight folding
     # -------------------------------------------------------------------------
-    def export_production_preset(
-        self,
-        preset_name: str = "production_steering_preset",
-        model_name: str = "custom-model",
-        description: str = "Verified surgical neuron interventions & compiled residual vectors",
-        save_json_path: Optional[str] = None,
-        save_pt_vectors_path: Optional[str] = None,
-        allowed_workspace_dir: Optional[Union[str, Path]] = None,
-    ) -> ProductionPresetBundle:
-        """
-        Packages all currently active interventions and compiles their linear residual-stream
-        steering vectors v_steer = sum_i shift_i * W_down[:, i] into a ProductionPresetBundle.
-        """
+    def export_production_preset(self, preset_name: str = "steering_preset", model_name: str = "custom-model",
+                                 description: str = "", save_json_path: Optional[str] = None,
+                                 save_pt_vectors_path: Optional[str] = None,
+                                 allowed_workspace_dir: Optional[Union[str, Path]] = None) -> ProductionPresetBundle:
         with self._lock:
-            bundle = SteeringExporter.build_preset_bundle(
-                model=self.model,
-                interventions_by_layer=self._interventions,
-                preset_name=preset_name,
-                model_name=model_name,
-                description=description,
-            )
+            bundle = SteeringExporter.build_preset_bundle(self.model, self._interventions, preset_name, model_name, description)
             if save_json_path is not None:
-                workspace = (
-                    allowed_workspace_dir
-                    if allowed_workspace_dir is not None
-                    else self.allowed_workspace_dir
-                )
-                SteeringExporter.save_preset_json(
-                    bundle=bundle,
-                    filepath=save_json_path,
-                    export_pt_vectors_path=save_pt_vectors_path,
-                    allowed_workspace_dir=workspace,
-                )
+                ws = allowed_workspace_dir if allowed_workspace_dir is not None else self.allowed_workspace_dir
+                SteeringExporter.save_preset_json(bundle, save_json_path, save_pt_vectors_path, ws)
             return bundle
 
-    def load_production_preset(
-        self,
-        preset_data_or_path: Union[str, Dict[str, Any]],
-        replace_existing: bool = True,
-        allowed_workspace_dir: Optional[Union[str, Path]] = None,
-    ) -> ProductionPresetBundle:
-        """Loads a saved ProductionPresetBundle (from JSON path or dict) into active interventions."""
+    def load_production_preset(self, preset_data_or_path: Union[str, Dict[str, Any]], replace_existing: bool = True,
+                               allowed_workspace_dir: Optional[Union[str, Path]] = None) -> ProductionPresetBundle:
         with self._lock:
             if isinstance(preset_data_or_path, str):
-                workspace = (
-                    allowed_workspace_dir
-                    if allowed_workspace_dir is not None
-                    else self.allowed_workspace_dir
-                )
-                safe_path = SteeringExporter.validate_safe_export_path(
-                    preset_data_or_path, allowed_workspace_dir=workspace
-                )
-                raw = json.loads(safe_path.read_text(encoding="utf-8"))
+                ws = allowed_workspace_dir if allowed_workspace_dir is not None else self.allowed_workspace_dir
+                safe = SteeringExporter.validate_safe_export_path(preset_data_or_path, allowed_workspace_dir=ws)
+                raw = json.loads(safe.read_text(encoding="utf-8"))
             else:
                 raw = preset_data_or_path
-
             bundle, specs = SteeringExporter.parse_preset_dict(raw)
             if replace_existing:
                 self.clear_interventions()
-            for spec in specs:
-                self.add_intervention(spec)
+            for s in specs:
+                self.add_intervention(s)
             return bundle
 
     def fold_interventions_into_weights(self) -> Dict[str, Any]:
-        """
-        Permanently folds unconditional ZERO_ABLATE, SCALE, ADDITIVE_STEER, and HARD_CLAMP
-        interventions directly into module weights and biases for 0% hook latency in production.
-        Retains any unfoldable specs (`CONDITIONAL_GATE`, `pole != BOTH`, `WEAK_PRUNE`,
-        `POLE_RECTIFY`, `token_positions != None`) in `self._interventions`.
-        """
+        """Folds unconditional affine interventions into weights; unfoldable specs stay as hooks."""
         with self._lock:
-            res = SteeringExporter.fold_interventions_into_weights(
-                self.model, self._interventions
-            )
-            folded_ids = set(res.get("folded_spec_ids", []))
-            if folded_ids:
-                was_attached = len(self._active_handles) > 0
+            res = SteeringExporter.fold_interventions_into_weights(self.model, self._interventions)
+            folded = set(res.get("folded_spec_ids", []))
+            if folded:
+                was = self._hookset is not None
                 self.detach_hooks()
-                for lname in list(self._interventions.keys()):
-                    remaining = [
-                        s for s in self._interventions[lname] if id(s) not in folded_ids
-                    ]
-                    if remaining:
-                        self._interventions[lname] = remaining
+                for name in list(self._interventions):
+                    rest = [s for s in self._interventions[name] if id(s) not in folded]
+                    if rest:
+                        self._interventions[name] = rest
                     else:
-                        del self._interventions[lname]
+                        del self._interventions[name]
                 self._latched_masks.clear()
-                if was_attached and self._interventions:
+                if was and self._interventions:
                     self.attach_hooks()
             return res

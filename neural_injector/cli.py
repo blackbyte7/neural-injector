@@ -3,44 +3,43 @@ from __future__ import annotations
 import argparse
 import cmd
 import os
+from pathlib import Path
 import shlex
 from typing import List, Optional
 
-from .explainer import HeuristicSynthesisClient, OpenAICompatibleClient
+from .explainer import OpenAICompatibleClient
 from .session import WorkbenchSession
 from .types import InterventionMode, PoleType
 
 
 def _split_cli_args(arg: str) -> List[str]:
-    """
-    Splits CLI arguments while preserving Windows backslash path separators (`\\`).
-    Using `posix=False` prevents `shlex.split` from stripping `\\` out of Windows paths.
-    """
+    """Splits arguments while keeping Windows backslashes."""
     return [tok.strip("\"'") for tok in shlex.split(arg, posix=False) if tok.strip("\"'")]
 
 
-DEFAULT_HF_AUDIT_CORPUS: List[str] = [
-    "The quick brown fox jumps over the lazy dog while the server processes incoming requests.",
-    "SELECT user_id, created_at FROM transactions WHERE amount > 1000 ORDER BY created_at DESC;",
-    "In cryptography, TLS 1.3 negotiates an ephemeral Diffie-Hellman key exchange with AES-256-GCM.",
-    "She walked quietly through the autumn forest, listening to the wind rustle the golden leaves.",
-    "def fibonacci(n: int) -> int:\n    return n if n <= 1 else fibonacci(n - 1) + fibonacci(n - 2)",
-    "The Federal Reserve announced a quarter-point adjustment following the monthly inflation report.",
-]
+def load_corpus(path: str) -> List[str]:
+    """Loads prompts from a text file: blocks separated by blank lines (or one prompt per line if no blank lines)."""
+    text = Path(path).read_text(encoding="utf-8")
+    blocks = [b.strip() for b in text.replace("\r\n", "\n").split("\n\n") if b.strip()]
+    if len(blocks) <= 1:
+        blocks = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return blocks
+
+
+def _prompts_from(arg: str) -> List[str]:
+    arg = arg.strip()
+    if arg.startswith("@"):
+        return load_corpus(arg[1:].strip())
+    return [p.strip() for p in arg.split("|") if p.strip()]
 
 
 class NeuralInjectorREPL(cmd.Cmd):
-    """
-    Stateful interactive terminal workbench for auditing neurons, manipulating poles,
-    comparing next-token logits & multi-token Chain-of-Thought completions, tracing
-    downstream & incoming circuits, solving crossword circuit ecology, discovering
-    contrastive neurons, and running closed-loop agent explanations.
-    """
+    """Interactive workbench: audit, inspect, intervene, trace, explain and export."""
 
     intro = (
         "\n======================================================================\n"
-        "  NEURAL INJECTOR INTERACTIVE WORKBENCH (REPL)\n"
-        "  Type 'help' or '?' to list commands. Type 'layers' to get started.\n"
+        "  NEURAL INJECTOR WORKBENCH\n"
+        "  'help' lists commands. Start with 'layers', then 'audit'.\n"
         "======================================================================\n"
     )
     prompt = "neural-injector> "
@@ -49,581 +48,263 @@ class NeuralInjectorREPL(cmd.Cmd):
         super().__init__()
         self.session = session
 
-    def _get_default_audit_prompts(self) -> List[str]:
-        if self.session.last_audit_prompts:
-            return list(self.session.last_audit_prompts)
-        if "AES256" in self.session.tok_to_id:
-            return [
-                "the system negotiated AES256 TLS cipher",
-                "the system executed SELECT WHERE postgres",
-                "packet buffer TLS handshake AES256 cipher",
-                "packet buffer postgres index_scan SELECT WHERE",
-                "the server executed packet buffer latencies",
-            ]
-        return list(DEFAULT_HF_AUDIT_CORPUS)
+    def _audited(self, layer: str) -> bool:
+        if not self.session.injector.is_layer_audited(layer):
+            print(f"Layer '{layer}' has not been audited. Run: audit {layer} @corpus.txt  (or prompts separated by |)")
+            return False
+        return True
 
-    def _ensure_layer_audited(self, layer_name: str) -> None:
-        """
-        Ensures `layer_name` has been audited before running `scan`, `profile`, `explain`,
-        or `ecology`. If the layer exists in `list_targetable_layers()` but has not been
-        audited yet (e.g., right after loading a HuggingFace model), automatically streams
-        a default calibration corpus.
-        """
-        if self.session.injector.is_layer_audited(layer_name):
-            return
-        targetable = self.session.injector.list_targetable_layers(include_all_linear=True)
-        if layer_name in targetable:
-            prompts = self._get_default_audit_prompts()
-            print(
-                f"[Auto-Audit] Layer '{layer_name}' not yet audited; streaming {len(prompts)} calibration prompts..."
-            )
-            self.session.run_audit(layer_names=[layer_name], prompts=prompts)
+    def onecmd(self, line: str) -> bool:
+        try:
+            return super().onecmd(line)
+        except Exception as exc:  # keep the REPL alive, but show the real error
+            print(f"Error: {type(exc).__name__}: {exc}")
+            return False
 
     def do_layers(self, _arg: str) -> None:
-        """layers : List all discovered targetable neuron layers in the model."""
-        layers = self.session.injector.list_targetable_layers()
-        print(f"\nModel: {self.session.model_name} | Vocab Size: {len(self.session.tok_to_id)}")
-        print(f"{'LAYER NAME':<28} | {'TYPE':<32} | {'NEURONS':<8} | {'HOOK':<6}")
-        print("-" * 82)
-        for name, desc in layers.items():
-            print(
-                f"{name:<28} | {desc.module_type:<32} | {desc.num_neurons:<8} | {desc.hook_target:<6}"
-            )
+        """layers : list targetable neuron layers."""
+        print(f"\nModel: {self.session.model_name}")
+        print(f"{'LAYER NAME':<44} | {'TYPE':<44} | {'NEURONS':<8} | HOOK")
+        print("-" * 112)
+        for name, d in self.session.injector.list_targetable_layers().items():
+            print(f"{name:<44} | {d.module_type:<44} | {d.num_neurons:<8} | {d.hook_target}")
         print()
 
     def do_audit(self, arg: str) -> None:
-        """audit <layer_name|all> [prompt1 | prompt2 | ...] : Stream text prompts to populate bipolar neuron statistics."""
-        if not arg.strip():
-            print("Usage: audit <layer_name|all> [prompt1 | prompt2 | ...]")
+        """audit <layer[,layer...]|all> <@corpus.txt | prompt1 | prompt2 | ...> : record streaming statistics."""
+        parts = arg.strip().split(None, 1)
+        if len(parts) < 2:
+            print("Usage: audit <layer[,layer]|all> <@corpus.txt | prompt1 | prompt2 ...>")
             return
-        if "|" in arg:
-            first_segment, rest_prompts = arg.split("|", 1)
-            first_parts = _split_cli_args(first_segment)
-            if not first_parts:
-                print("Usage: audit <layer_name|all> [prompt1 | prompt2 | ...]")
-                return
-            target_spec = first_parts[0]
-            first_prompt = " ".join(first_parts[1:]).strip()
-            custom_prompts = [p.strip() for p in ([first_prompt] + rest_prompts.split("|")) if p.strip()]
-        else:
-            parts = _split_cli_args(arg)
-            target_spec = parts[0]
-            custom_prompts = [" ".join(parts[1:]).strip()] if len(parts) > 1 else []
-
-        all_layers = list(self.session.injector.list_targetable_layers().keys())
-        if target_spec.lower() == "all":
-            layer_names = all_layers
-        else:
-            layer_names = [x.strip() for x in target_spec.split(",") if x.strip()]
-
-        prompts = custom_prompts if custom_prompts else self._get_default_audit_prompts()
-        res = self.session.run_audit(layer_names=layer_names, prompts=prompts)
-        print(
-            f"Audited {len(res['layers'])} layer(s) ({', '.join(res['layers'])}) across {res['num_prompts']} prompt(s)."
-        )
+        layers = list(self.session.injector.list_targetable_layers()) if parts[0] == "all" else [x for x in parts[0].split(",") if x]
+        prompts = _prompts_from(parts[1])
+        res = self.session.run_audit(layer_names=layers, prompts=prompts)
+        print(f"Audited {len(res['layers'])} layer(s) on {res['num_prompts']} prompt(s).")
 
     def do_llm(self, arg: str) -> None:
-        """llm <heuristic | model_name> [base_url] [api_key] : Configure the LLM client for agentic neuron explanation."""
+        """llm <model_name> [base_url] [api_key] : configure the explainer and test-writer LLM (OpenAI-compatible)."""
         parts = _split_cli_args(arg)
         if not parts:
-            print(
-                "Usage: llm <heuristic | model_name> [base_url] [api_key]\n"
-                "  e.g. llm gpt-4o-mini https://api.openai.com/v1 sk-...\n"
-                "  e.g. llm heuristic"
-            )
+            print("Usage: llm <model_name> [base_url] [api_key]   e.g. llm llama3.1 http://localhost:11434/v1")
             return
-        if parts[0].lower() == "heuristic":
-            self.session.injector.set_explainer_llm_client(HeuristicSynthesisClient())
-            print("Configured NeuronExplainerAgent to use offline HeuristicSynthesisClient.")
-            return
-        model_name = parts[0]
-        base_url = parts[1] if len(parts) >= 2 else os.environ.get(
-            "NEURAL_INJECTOR_LLM_BASE_URL", "https://api.openai.com/v1"
-        )
-        api_key = parts[2] if len(parts) >= 3 else os.environ.get("OPENAI_API_KEY")
-        client = OpenAICompatibleClient(model=model_name, api_key=api_key, base_url=base_url)
-        self.session.injector.set_explainer_llm_client(client)
-        print(
-            f"Configured NeuronExplainerAgent with OpenAICompatibleClient(model='{model_name}', base_url='{base_url}')."
-        )
+        base = parts[1] if len(parts) >= 2 else os.environ.get("NEURAL_INJECTOR_LLM_BASE_URL", "https://api.openai.com/v1")
+        key = parts[2] if len(parts) >= 3 else os.environ.get("OPENAI_API_KEY")
+        self.session.injector.set_explainer_llm_client(OpenAICompatibleClient(model=parts[0], api_key=key, base_url=base))
+        print(f"Explainer and test writer: {parts[0]} @ {base}")
 
     def do_scan(self, arg: str) -> None:
-        """scan <layer_name> [sort_by] [top_n] : Run a batch layer-wide & pole-specific cleanliness audit."""
+        """scan <layer> [sort_by] [top_n] : descriptive table (sort_by: rms_write_norm, std, max_val, min_val, positive_excess_kurtosis, negative_excess_kurtosis, double_negative_positive_rate, neuron_idx)."""
         parts = _split_cli_args(arg)
-        if not parts:
-            print(
-                "Usage: scan <layer_name> [pole_selectivity_score|estimated_causal_impact|bipolar_balance] [top_n]"
-            )
+        if not parts or not self._audited(parts[0]):
             return
-        layer_name = parts[0]
-        sort_by = parts[1] if len(parts) >= 2 else "pole_selectivity_score"
-        limit = int(parts[2]) if len(parts) >= 3 else 12
-
-        self._ensure_layer_audited(layer_name)
-        kl_inputs = self.session.get_default_eval_inputs()
-        report = self.session.injector.scan_layer_cleanliness(
-            layer_name=layer_name,
-            sort_by=sort_by,
-            compute_kl_for_top_n=3,
-            kl_eval_inputs=kl_inputs,
-            limit=limit,
-        )
-
-        print(
-            f"\n=== LAYER-WIDE CLEANLINESS SCAN: {report.layer_name} ({report.num_neurons} neurons / {2 * report.num_neurons} poles) ==="
-        )
-        print(
-            f"Whole-Neuron Clean : {report.clean_monosemantic_pct:.1f}% | "
-            f"Structured Recursive: {report.structured_recursive_pct:.1f}% | "
-            f"Combined: {report.combined_clean_and_structured_pct:.1f}%"
-        )
-        print(
-            f"Independent Poles  : {report.clean_poles_pct:.1f}% Clean | "
-            f"Structured Poles: {report.structured_poles_pct:.1f}% | "
-            f"Combined Poles: {report.combined_clean_and_structured_poles_pct:.1f}%"
-        )
-        print(
-            f"\n{'IDX':<5} | {'TAXONOMY':<28} | {'SEL (+ / -)':<19} | {'BIPOLAR':<7} | {'IMPACT':<8} | {'KL_ABL':<8} | {'+TOK / -TOK'}"
-        )
-        print("-" * 106)
-        for n in report.neurons:
-            kl_str = (
-                f"{n.ablation_kl_divergence:.4f}"
-                if n.ablation_kl_divergence is not None
-                else "  -   "
-            )
-            sel_pair = f"{n.pole_selectivity_score:4.1f} ({n.pos_pole_selectivity_score:4.1f}/{n.neg_pole_selectivity_score:4.1f})"
-            tok_pair = f"{n.top_pos_token or '-'} / {n.top_neg_token or '-'}"
-            tax_label = f"{n.taxonomy_class.value}{'*' if n.semantic_verified else ''}"
-            print(
-                f"N{n.neuron_idx:<4} | {tax_label:<28} | {sel_pair:<19} | "
-                f"{n.bipolar_balance:<7.3f} | {n.estimated_causal_impact:<8.3f} | {kl_str:<8} | {tok_pair}"
-            )
+        rep = self.session.injector.scan_layer(parts[0], sort_by=parts[1] if len(parts) > 1 else "rms_write_norm",
+                                               limit=int(parts[2]) if len(parts) > 2 else 15)
+        print(f"\n=== {rep.layer_name}: {rep.num_neurons} neurons, {rep.tokens_scanned} tokens, gated={rep.gated} ===")
+        if rep.gated:
+            print(f"Share of a>0 activations in the -- regime (layer): {rep.layer_double_negative_positive_rate:.4f}")
+        ea = rep.explanation_audit
+        if ea.poles_explained:
+            print(f"Explained poles: {ea.poles_explained} | taxonomy {ea.taxonomy_counts} | outcomes {ea.outcome_counts} "
+                  f"| strong rates: positives {ea.positive_control_strong_rate:.2f}, near misses {ea.near_miss_strong_rate:.2f}, "
+                  f"distant {ea.distant_strong_rate:.2f}")
+        print(f"\n{'IDX':<6} {'MAX':>9} {'MIN':>9} {'P+':>6} {'P-':>6} {'K+':>8} {'K-':>8} {'--%':>6} {'RMSWRITE':>9}  +TOK / -TOK  [explained]")
+        for n in rep.neurons:
+            ex = f"[{n.pos_taxonomy.value}/{n.pos_outcome.value}]" if n.explained else ""
+            print(f"N{n.neuron_idx:<5} {n.max_val:>9.3f} {n.min_val:>9.3f} {n.positive_firing_rate:>6.3f} {n.negative_firing_rate:>6.3f} "
+                  f"{n.positive_excess_kurtosis:>8.2f} {n.negative_excess_kurtosis:>8.2f} {100 * n.double_negative_positive_rate:>5.1f} "
+                  f"{n.rms_write_norm:>9.3f}  {n.top_pos_token!r} / {n.top_neg_token!r} {ex}")
         print()
 
     def do_profile(self, arg: str) -> None:
-        """profile <layer_name> <neuron_idx> : Inspect Positive & Negative poles, Next-Token clues, SwiGLU Double-Negative rate, Quantile Bands, and Logit Attribution."""
+        """profile <layer> <neuron> : both poles, sign regimes, activation bands, logit attribution."""
         parts = _split_cli_args(arg)
-        if len(parts) < 2:
-            print("Usage: profile <layer_name> <neuron_idx>  (e.g., profile mlp_block_0.down_proj 7)")
+        if len(parts) < 2 or not self._audited(parts[0]):
             return
-        layer_name, neuron_idx = parts[0], int(parts[1])
-        try:
-            self._ensure_layer_audited(layer_name)
-            p = self.session.injector.get_neuron_profile(
-                layer_name=layer_name,
-                neuron_idx=neuron_idx,
-                unembed_weight=self.session.unembed_weight,
-                idx_to_token=self.session.id_to_tok,
-            )
-            print(f"\n--- NEURON PROFILE: {p.layer_name} [Neuron #{p.neuron_idx}] ---")
-            print(
-                f"Mean: {p.mean:+.4f} | Std: {p.std:.4f} | Overall Selectivity: {p.pole_selectivity_score:.2f} | Clean Candidate: {p.is_clean_candidate}"
-            )
-            print(
-                f"+Pole Selectivity: {p.pos_pole_selectivity_score:.2f} ({p.pos_taxonomy_class.value}) | "
-                f"-Pole Selectivity: {p.neg_pole_selectivity_score:.2f} ({p.neg_taxonomy_class.value}) | "
-                f"SwiGLU Double-Neg (+Pole): {p.double_negative_positive_rate * 100:.1f}%"
-            )
-            print(
-                f"Lexical R^2: {p.lexical_selectivity_r2:.3f} | Motif: {p.inferred_firing_motif} | "
-                f"Tail Prior: {p.tail_prior.value}"
-            )
-            print(
-                f"\n[+] POSITIVE POLE (Firing Rate: {p.positive_firing_rate * 100:.1f}%, Max: {p.max_val:+.3f}):"
-            )
-            for s in p.top_positive_samples[:4]:
-                nxt = f" -> '{s.next_token_str}'" if s.next_token_str else ""
-                dbl = " [SwiGLU g<0,u<0]" if s.is_double_negative_route else ""
-                print(
-                    f"    Act: {s.activation_value:+.3f}{dbl} | Token: '{s.token_str}'{nxt} | Context: \"{s.context_str}\""
-                )
-            for band, b_samples in p.positive_quantile_buckets.items():
-                toks = [s.token_str for s in b_samples[:4] if s.token_str]
-                if toks:
-                    print(f"    [Band: {band:<17}] Tokens: {toks}")
-
-            print(
-                f"\n[-] NEGATIVE POLE (Firing Rate: {p.negative_firing_rate * 100:.1f}%, Min: {p.min_val:+.3f}):"
-            )
-            for s in p.top_negative_samples[:4]:
-                nxt = f" -> '{s.next_token_str}'" if s.next_token_str else ""
-                print(
-                    f"    Act: {s.activation_value:+.3f} | Token: '{s.token_str}'{nxt} | Context: \"{s.context_str}\""
-                )
-            print(f"\nDirect Vocab Attribution (+Pole Promotes) : {p.top_promoted_tokens[:5]}")
-            print(f"Direct Vocab Attribution (-Pole Promotes) : {p.top_suppressed_tokens[:5]}\n")
-        except Exception as exc:
-            print(f"Error: {exc}")
+        p = self.session.injector.get_neuron_profile(parts[0], int(parts[1]), unembed_weight=self.session.unembed_weight,
+                                                     idx_to_token=self.session.id_to_tok)
+        print(f"\n--- {p.layer_name} [N{p.neuron_idx}] | tokens {p.tokens_observed} | mean {p.mean:+.4f} std {p.std:.4f} ---")
+        for name, m in (("+", p.positive_pole), ("-", p.negative_pole)):
+            print(f"pole {name}: rate {m.rate:.4f} extreme {m.extreme:+.4f} mean|a| {m.mean:.4f} std {m.std:.4f} excess kurtosis {m.excess_kurtosis:.2f}")
+        if p.gated:
+            print(f"sign regime rates: {p.swiglu_sign_regime_rates} | -- share of a>0: {p.double_negative_positive_rate:.4f}")
+        for title, samples in (("TOP POSITIVE (all regimes)", p.top_positive_samples), ("TOP NEGATIVE", p.top_negative_samples)):
+            print(f"\n[{title}]")
+            for s in samples[:8]:
+                print(f"  {s.activation_value:+9.4f} {s.sign_regime or ''} {s.window_str!r} -> next {s.next_token_str!r}")
+        for title, bands in (("POSITIVE BANDS", p.positive_bands), ("NEGATIVE BANDS", p.negative_bands)):
+            print(f"\n[{title}] (share of pole extreme: count, regime counts, examples)")
+            for b in bands:
+                print(f"  [{b.lower_fraction:.3f}, {b.upper_fraction:.3f}) n={b.count} {b.regime_counts} {[s.token_str for s in b.samples]}")
+        print(f"\npromoted logits:   {[(t, round(v, 3)) for t, v in p.top_promoted_tokens[:8]]}")
+        print(f"suppressed logits: {[(t, round(v, 3)) for t, v in p.top_suppressed_tokens[:8]]}\n")
 
     def do_ablate(self, arg: str) -> None:
-        """ablate <layer_name> <neuron_idx> [both|positive|negative] : Surgically set a neuron or pole to 0.0."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 2:
-            print("Usage: ablate <layer_name> <neuron_idx> [both|positive|negative]")
-            return
-        layer_name, idx = parts[0], int(parts[1])
-        pole = PoleType(parts[2]) if len(parts) >= 3 else PoleType.BOTH
-        self.session.injector.zero_ablate(layer_name, neuron_indices=idx, pole=pole)
-        print(
-            f"Registered ZERO_ABLATE on {layer_name}[{idx}] (pole={pole.value}). Run 'eval <prompt>' to test."
-        )
+        """ablate <layer> <neuron> [both|positive|negative]"""
+        p = _split_cli_args(arg)
+        self.session.injector.zero_ablate(p[0], int(p[1]), PoleType(p[2]) if len(p) > 2 else PoleType.BOTH)
+        print("Registered ZERO_ABLATE.")
 
     def do_clamp(self, arg: str) -> None:
-        """clamp <layer_name> <neuron_idx> <value> [both|positive|negative] : Force a neuron to a constant value."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 3:
-            print("Usage: clamp <layer_name> <neuron_idx> <value> [both|positive|negative]")
-            return
-        layer_name, idx, val = parts[0], int(parts[1]), float(parts[2])
-        pole = PoleType(parts[3]) if len(parts) >= 4 else PoleType.BOTH
-        self.session.injector.clamp_neurons(layer_name, neuron_indices=idx, value=val, pole=pole)
-        print(f"Registered HARD_CLAMP={val:+.2f} on {layer_name}[{idx}] (pole={pole.value}).")
+        """clamp <layer> <neuron> <value> [both|positive|negative]"""
+        p = _split_cli_args(arg)
+        self.session.injector.clamp_neurons(p[0], int(p[1]), float(p[2]), PoleType(p[3]) if len(p) > 3 else PoleType.BOTH)
+        print("Registered HARD_CLAMP.")
+
+    def do_steer(self, arg: str) -> None:
+        """steer <layer> <neuron> <delta> : additive steering by delta."""
+        p = _split_cli_args(arg)
+        self.session.injector.steer_neurons(p[0], int(p[1]), delta=float(p[2]))
+        print("Registered ADDITIVE_STEER.")
 
     def do_prune(self, arg: str) -> None:
-        """prune <layer_name> <threshold_or_std_mult> [adaptive] : Zero out weak activations across the layer."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 2:
-            print("Usage: prune <layer_name> <threshold> [adaptive]")
+        """prune <layer> <fraction|percentile|absolute> <value> : zero weak activations of every neuron of the layer."""
+        p = _split_cli_args(arg)
+        if len(p) < 3:
+            print("Usage: prune <layer> <fraction|percentile|absolute> <value>")
             return
-        layer_name, val = parts[0], float(parts[1])
-        use_adaptive = len(parts) >= 3 and parts[2].lower() == "adaptive"
-        layers = self.session.injector.list_targetable_layers()
-        num_n = layers[layer_name].num_neurons if layer_name in layers else 128
-        if use_adaptive:
-            self.session.injector.prune_weak_activations(
-                layer_name, list(range(num_n)), std_multiplier=val
-            )
-            print(
-                f"Registered adaptive WEAK_PRUNE (std_multiplier={val}) across {num_n} neurons in {layer_name}."
-            )
-        else:
-            self.session.injector.prune_weak_activations(
-                layer_name, list(range(num_n)), threshold=val
-            )
-            print(
-                f"Registered WEAK_PRUNE (|a| below {val}) across {num_n} neurons in {layer_name}."
-            )
+        kw = {"fraction": "fraction_of_extreme", "percentile": "percentile", "absolute": "threshold"}[p[1]]
+        specs = self.session.injector.prune_weak_activations(p[0], **{kw: float(p[2])})
+        print(f"Registered {len(specs)} WEAK_PRUNE spec(s) on {p[0]}.")
+
+    def do_dblneg(self, arg: str) -> None:
+        """dblneg [layer,layer...|all] : zero the -- (double-negative) regime in gated layers."""
+        names = None if not arg.strip() or arg.strip() == "all" else arg.strip().split(",")
+        specs = self.session.injector.ablate_double_negative_regime(names)
+        print(f"Registered DOUBLE_NEGATIVE_ABLATE on {len(specs)} layer(s).")
 
     def do_gate(self, arg: str) -> None:
-        """gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> [threshold] : Register a closed-loop conditional gate."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 5:
-            print(
-                "Usage: gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> [threshold]"
-            )
+        """gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> <threshold> : closed-loop conditional steering."""
+        p = _split_cli_args(arg)
+        if len(p) < 6:
+            print("Usage: gate <target_layer> <target_neuron> <det_layer> <det_neuron> <delta> <threshold>")
             return
-        t_layer, t_idx = parts[0], int(parts[1])
-        d_layer, d_idx = parts[2], int(parts[3])
-        delta = float(parts[4])
-        thresh = float(parts[5]) if len(parts) >= 6 else 1.0
-        self.session.injector.add_conditional_gate(
-            target_layer=t_layer,
-            target_neurons=[t_idx],
-            detector_layer=d_layer,
-            detector_neuron=d_idx,
-            detector_pole=PoleType.POSITIVE,
-            threshold=thresh,
-            action_mode=InterventionMode.ADDITIVE_STEER,
-            value=delta,
-            sequence_scope="any_token",
-            sticky_on_decode=True,
-        )
-        print(
-            f"Registered CONDITIONAL_GATE: steer {t_layer}[N{t_idx}] by {delta:+.2f} when {d_layer}[N{d_idx}] > {thresh}."
-        )
+        self.session.injector.add_conditional_gate(p[0], [int(p[1])], p[2], int(p[3]), threshold=float(p[5]),
+                                                   action_mode=InterventionMode.ADDITIVE_STEER, value=float(p[4]),
+                                                   sequence_scope="any_token", sticky_on_decode=True)
+        print("Registered CONDITIONAL_GATE.")
 
     def do_clear(self, _arg: str) -> None:
-        """clear : Remove all active surgical neuron interventions."""
+        """clear : remove all interventions."""
         self.session.injector.clear_interventions()
-        print("Cleared all active interventions.")
+        print("Cleared all interventions.")
 
     def do_eval(self, arg: str) -> None:
-        """eval <prompt> : Compare Clean vs. Surgically Intervened next-token probabilities and KL divergence."""
-        prompt = arg.strip() or self.session.get_default_eval_prompt()
-        res = self.session.evaluate_prompt_comparison(prompt)
-        print(f"\nPrompt: \"{res['prompt']}\" | Sequence KL-Divergence: {res['kl_divergence']:.5f}")
-        print(f"Active Interventions: {len(res['active_interventions'])}")
-        print(f"\n{'CLEAN BASELINE TOP TOKENS':<36} | {'INTERVENED TOP TOKENS':<36}")
-        print("-" * 75)
+        """eval <prompt> : clean vs intervened next-token predictions."""
+        res = self.session.evaluate_prompt_comparison(arg.strip() or self.session.get_default_eval_prompt())
+        print(f"\nKL (mean over positions): {res['kl_divergence']:.5f} | interventions: {len(res['active_interventions'])}")
         for c, m in zip(res["clean_top_predictions"], res["intervened_top_predictions"]):
-            c_str = f"{c['token']:<18} ({c['prob'] * 100:5.1f}%)"
-            m_str = f"{m['token']:<18} ({m['prob'] * 100:5.1f}%)"
-            print(f"{c_str:<36} | {m_str:<36}")
+            print(f"  {c['token']!r:<22} {100 * c['prob']:5.1f}%   |   {m['token']!r:<22} {100 * m['prob']:5.1f}%")
         print()
 
     def do_generate(self, arg: str) -> None:
-        """generate [max_new_tokens] [prompt] : Compare Clean vs. Surgically Intervened multi-token completions (Chain-of-Thought)."""
-        parts = _split_cli_args(arg)
-        max_new = 6
-        if parts and parts[0].isdigit():
-            max_new = int(parts[0])
-            prompt = " ".join(parts[1:]) or self.session.get_default_eval_prompt()
-        else:
-            prompt = arg.strip() or self.session.get_default_eval_prompt()
-
-        res = self.session.generate_comparison(prompt=prompt, max_new_tokens=max_new)
-        print(
-            f"\n=== MULTI-TOKEN GENERATION COMPARISON (max_new_tokens={res['max_new_tokens']}, changed={res['tokens_changed_count']}) ==="
-        )
-        print(f"Prompt             : \"{res['prompt']}\"")
-        print(f"Clean Completion   : {res['clean_completion_text']}")
-        print(f"Steered Completion : {res['intervened_completion_text']}\n")
+        """generate [n_tokens] <prompt> : greedy clean vs intervened continuation."""
+        p = arg.strip().split(None, 1)
+        n = int(p[0]) if p and p[0].isdigit() else 24
+        prompt = (p[1] if p and p[0].isdigit() and len(p) > 1 else arg.strip()) or self.session.get_default_eval_prompt()
+        res = self.session.generate_comparison(prompt=prompt, max_new_tokens=n)
+        print(f"\nclean:      {res['clean_completion_text']!r}\nintervened: {res['intervened_completion_text']!r}\n"
+              f"tokens changed: {res['tokens_changed_count']}\n")
 
     def do_trace(self, arg: str) -> None:
-        """trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt] : Trace downstream layer-to-layer circuit."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 3:
-            print("Usage: trace <src_layer> <dst_layer> <src_neuron> [positive|negative] [prompt]")
+        """trace <src_layer> <dst_layer> <src_neuron> <positive|negative> <prompt> : downstream causal edges."""
+        p = arg.strip().split(None, 4)
+        if len(p) < 5:
+            print("Usage: trace <src_layer> <dst_layer> <src_neuron> <positive|negative> <prompt>")
             return
-        src_l, dst_l, n_idx = parts[0], parts[1], int(parts[2])
-        pole = PoleType(parts[3]) if len(parts) >= 4 else PoleType.POSITIVE
-        prompt = " ".join(parts[4:]) if len(parts) >= 5 else self.session.get_default_eval_prompt()
-        input_ids, _ = self.session.encode_prompt(prompt)
-        graph = self.session.injector.trace_circuit(
-            src_layer=src_l,
-            dst_layer=dst_l,
-            src_neuron=n_idx,
-            inputs=input_ids,
-            src_pole=pole,
-            compute_jacobian=True,
-            top_k=6,
-        )
-        print(f"\n--- CIRCUIT TRACE: ({src_l}, N{n_idx}, {pole.value}) --> {dst_l} ---")
-        print("[Top Excited Downstream Neurons]:")
-        for e in graph.top_excitatory(3):
-            print(
-                f"  -> N{e.dst_neuron:02d} | Role: {e.role.value:<10} | Causal Delta: {e.mean_causal_delta:+.4f} "
-                f"| Jacobian: {e.jacobian_sensitivity:+.4f} | W_up: {e.virtual_weight_up:+.3f}, W_gate: {e.virtual_weight_gate:+.3f}"
-            )
-        print("[Top Inhibited Downstream Neurons]:")
-        for e in graph.top_inhibitory(3):
-            print(
-                f"  -> N{e.dst_neuron:02d} | Role: {e.role.value:<10} | Causal Delta: {e.mean_causal_delta:+.4f} "
-                f"| Jacobian: {e.jacobian_sensitivity:+.4f} | W_up: {e.virtual_weight_up:+.3f}, W_gate: {e.virtual_weight_gate:+.3f}"
-            )
-        print()
+        ids, _ = self.session.encode_prompt(p[4])
+        g = self.session.injector.trace_circuit(p[0], p[1], int(p[2]), ids, src_pole=PoleType(p[3]), top_k=8)
+        for e in g.edges:
+            gp = f" gate-path {e.gate_path_delta:+.4f} value-path {e.up_path_delta:+.4f}" if e.gate_path_delta is not None else ""
+            print(f"  -> N{e.dst_neuron:<5} delta {e.mean_causal_delta:+.5f} J {e.jacobian_sensitivity:+.5f} role {e.role.value}{gp}")
 
     def do_trace_incoming(self, arg: str) -> None:
-        """trace_incoming <src_layer> <dst_layer> <dst_neuron> [positive|negative] [prompt] : Trace upstream neurons driving dst_neuron."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 3:
-            print("Usage: trace_incoming <src_layer> <dst_layer> <dst_neuron> [positive|negative] [prompt]")
+        """trace_incoming <src_layer> <dst_layer> <dst_neuron> <positive|negative> <prompt> : upstream attribution + ablation."""
+        p = arg.strip().split(None, 4)
+        if len(p) < 5:
+            print("Usage: trace_incoming <src_layer> <dst_layer> <dst_neuron> <positive|negative> <prompt>")
             return
-        src_l, dst_l, n_idx = parts[0], parts[1], int(parts[2])
-        pole = PoleType(parts[3]) if len(parts) >= 4 else PoleType.POSITIVE
-        prompt = " ".join(parts[4:]) if len(parts) >= 5 else self.session.get_default_eval_prompt()
-        input_ids, _ = self.session.encode_prompt(prompt)
-        graph = self.session.injector.trace_incoming_circuit(
-            src_layer=src_l,
-            dst_layer=dst_l,
-            dst_neuron=n_idx,
-            inputs=input_ids,
-            dst_pole=pole,
-            top_k=6,
-        )
-        print(f"\n--- INCOMING UPSTREAM TRACE: {src_l} --> ({dst_l}, N{n_idx}, {pole.value}) ---")
-        print("[Top Excitatory Upstream Neurons]:")
-        for e in graph.top_excitatory(3):
-            print(
-                f"  N{e.src_neuron:02d} ({e.src_pole.value}) -> | Role: {e.role.value:<10} | Causal Delta: {e.mean_causal_delta:+.4f} "
-                f"| Jacobian: {e.jacobian_sensitivity:+.4f} | W_up: {e.virtual_weight_up:+.3f}, W_gate: {e.virtual_weight_gate:+.3f}"
-            )
-        print("[Top Inhibitory Upstream Neurons]:")
-        for e in graph.top_inhibitory(3):
-            print(
-                f"  N{e.src_neuron:02d} ({e.src_pole.value}) -> | Role: {e.role.value:<10} | Causal Delta: {e.mean_causal_delta:+.4f} "
-                f"| Jacobian: {e.jacobian_sensitivity:+.4f} | W_up: {e.virtual_weight_up:+.3f}, W_gate: {e.virtual_weight_gate:+.3f}"
-            )
-        print()
+        ids, _ = self.session.encode_prompt(p[4])
+        g = self.session.injector.trace_incoming_circuit(p[0], p[1], int(p[2]), ids, dst_pole=PoleType(p[3]), top_k=8)
+        for e in g.edges:
+            print(f"  N{e.src_neuron:<5} ({e.src_pole.value}) delta {e.mean_causal_delta:+.5f} J {e.jacobian_sensitivity:+.5f}")
 
     def do_readout(self, arg: str) -> None:
-        """readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold] : Audit whether weak cross-activations are read downstream."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 3:
-            print("Usage: readout <src_layer> <dst_layer> <neuron_indices_csv> [threshold]")
+        """readout <src_layer> <neuron_csv> : does any downstream reader read this combination beyond chance and beyond its parts?"""
+        p = _split_cli_args(arg)
+        if len(p) < 2:
+            print("Usage: readout <src_layer> <neuron_csv>")
             return
-        src_l, dst_l = parts[0], parts[1]
-        neurons = [int(x.strip()) for x in parts[2].split(",") if x.strip()]
-        thresh = float(parts[3]) if len(parts) >= 4 else None
-        input_ids = self.session.get_default_eval_inputs()
-        rep = self.session.injector.verify_downstream_readout(
-            src_layer=src_l,
-            dst_layer=dst_l,
-            src_neurons=neurons,
-            inputs=input_ids,
-            weak_threshold=thresh,
-        )
-        print(f"\n--- DOWNSTREAM READOUT AUDIT ({src_l} {neurons} -> {dst_l}) ---")
-        print(
-            f"Max Downstream Act Shift : {rep.max_downstream_activation_shift:.5f} | "
-            f"Max Gate Shift: {rep.max_downstream_gate_shift:.5f} | "
-            f"Output KL: {rep.output_kl_divergence:.5f}"
-        )
-        print(
-            f"Benign Spillover ('Nothing Reads That Combination'): {rep.is_benign_spillover} | "
-            f"Affected Downstream Neurons: {rep.affected_downstream_neurons}\n"
-        )
+        r = self.session.injector.verify_combination_readout(p[0], [int(x) for x in p[1].split(",")])
+        print(f"combination max |cos| {r.combination_max_reader_cosine:.4f} at {r.best_reader} | best constituent {r.best_single_constituent_cosine:.4f} "
+              f"| null mean {r.null_mean:.4f}, p95 {r.null_p95:.4f}, percentile {r.combination_percentile_in_null:.3f} "
+              f"| read beyond constituents: {r.reads_combination_beyond_constituents}")
 
     def do_explain(self, arg: str) -> None:
-        """explain <layer_name> <neuron_idx> [dst_layer] [src_layer] : Run the Automated LLM Explainer & Surgical Verifier."""
-        parts = _split_cli_args(arg)
-        if len(parts) < 2:
-            print("Usage: explain <layer_name> <neuron_idx> [dst_layer] [src_layer]")
+        """explain <layer> <neuron> [steer prompt ...] : two-agent explanation + blind tests (needs 'llm')."""
+        p = arg.strip().split(None, 2)
+        if len(p) < 2 or not self._audited(p[0]):
             return
-        layer_name, idx = parts[0], int(parts[1])
-        dst_layer = parts[2] if len(parts) >= 3 and parts[2] != "-" else None
-        src_layer = parts[3] if len(parts) >= 4 and parts[3] != "-" else None
-        self._ensure_layer_audited(layer_name)
-        input_ids = self.session.get_default_eval_inputs()
-        hyp = self.session.injector.explain_neuron(
-            layer_name=layer_name,
-            neuron_idx=idx,
-            tok_to_id=self.session.tok_to_id,
-            idx_to_token=self.session.id_to_tok,
-            unembed_weight=self.session.unembed_weight,
-            dst_layer=dst_layer,
-            circuit_inputs=input_ids if (dst_layer or src_layer) else None,
-            src_layer=src_layer,
-        )
-        print(f"\n=== AGENTIC EXPLANATION: {hyp.layer_name} [Neuron #{hyp.neuron_idx}] ===")
-        print(f"Taxonomy       : {hyp.taxonomy_class.value} (Confidence: {hyp.confidence_score:.2f})")
-        print(f"+Pole Motif    : {hyp.positive_pole_motif}")
-        print(f"-Pole Motif    : {hyp.negative_pole_motif}")
-        print(f"Unified 'Verb' : {hyp.unified_verb_hypothesis}")
-        if hyp.recursive_offshoots:
-            print("Offshoots      :")
-            for branch in hyp.recursive_offshoots:
-                print(f"  - {branch}")
-        if hyp.verification_report:
-            print(
-                f"Verification   : Score={hyp.verification_report.empirical_verification_score:.3f} | {hyp.verification_report.summary_notes}\n"
-            )
-
-    def do_ecology(self, arg: str) -> None:
-        """ecology <layer_name> [dst_layer] [top_anchors] [top_contextual] : Solve layer ecology via Crossword propagation."""
-        parts = _split_cli_args(arg)
-        if not parts:
-            print("Usage: ecology <layer_name> [dst_layer] [top_anchors] [top_contextual]")
-            return
-        layer_name = parts[0]
-        dst_layer = parts[1] if len(parts) >= 2 else None
-        top_a = int(parts[2]) if len(parts) >= 3 else 2
-        top_c = int(parts[3]) if len(parts) >= 4 else 2
-        self._ensure_layer_audited(layer_name)
-        input_ids = self.session.get_default_eval_inputs()
-        rep = self.session.injector.solve_layer_ecology(
-            layer_name=layer_name,
-            tok_to_id=self.session.tok_to_id,
-            idx_to_token=self.session.id_to_tok,
-            unembed_weight=self.session.unembed_weight,
-            dst_layer=dst_layer,
-            circuit_inputs=input_ids if dst_layer else None,
-            top_anchors=top_a,
-            top_contextual=top_c,
-        )
-        print(f"\n=== CROSSWORD CIRCUIT ECOLOGY SOLVE: {rep.layer_name} ===")
-        print(
-            f"Anchor Neurons Solved: {rep.anchor_neurons_explained} | "
-            f"Contextual Neurons Solved: {rep.contextual_neurons_explained} | "
-            f"Mean Verification Score: {rep.mean_verification_score:.3f}"
-        )
-        for n_idx, hyp in rep.hypotheses.items():
-            print(f"  * N{n_idx:<3} [{hyp.taxonomy_class.value}]: {hyp.unified_verb_hypothesis}")
+        steer = [p[2]] if len(p) > 2 else None
+        h = self.session.explain_neuron(p[0], int(p[1]), steering_prompts=steer)
+        print(f"\n=== {h.layer_name} [N{h.neuron_idx}] (confidence {h.confidence_score:.2f}, neighbour clues {h.neighbor_clues_used}) ===")
+        print(f"+ ({h.pos_taxonomy.value}): {h.positive_pole_motif}")
+        print(f"- ({h.neg_taxonomy.value}): {h.negative_pole_motif}")
+        print(f"distinction: {h.unified_verb_hypothesis}")
+        for o in h.recursive_offshoots:
+            print(f"  offshoot: {o}")
+        for pole, rep in h.verification.items():
+            print(f"[{pole}] outcome {rep.outcome.value} | positives strong {rep.positive_strong_count}/5, near misses strong "
+                  f"{rep.near_miss_strong_count}/5, distant strong {rep.distant_strong_count}/5 | blind max {rep.blind_max_ratio:.2f} of corpus extreme")
+        if h.causal_checks:
+            print(f"ablation KL {h.causal_checks.target_ablation_kl:.5f}, percentile among random neurons "
+                  f"{h.causal_checks.target_kl_percentile_among_controls:.2f}")
         print()
 
     def do_contrastive(self, arg: str) -> None:
-        """contrastive <pos_prompt> | <neg_prompt> : Discover native neurons separating two contrastive prompts."""
-        if "|" not in arg:
-            print(
-                "Usage: contrastive <pos_prompt> | <neg_prompt>  (e.g., contrastive the system negotiated AES256 TLS | the system executed SELECT postgres)"
-            )
+        """contrastive <@pos.txt | p1 ;; p2 ...> || <@neg.txt | n1 ;; n2 ...> : Welch t over per-prompt means (>= 2 prompts per side)."""
+        if "||" not in arg:
+            print("Usage: contrastive <pos prompts> || <neg prompts>   (prompts separated by ';;' or @file)")
             return
-        pos_str, neg_str = [s.strip() for s in arg.split("|", 1)]
-        pos_ids, _ = self.session.encode_prompt(pos_str)
-        neg_ids, _ = self.session.encode_prompt(neg_str)
-        rep = self.session.injector.discover_contrastive_neurons(
-            pos_inputs=pos_ids, neg_inputs=neg_ids, top_k=6
-        )
-        print("\n=== CONTRASTIVE BIPOLAR NEURON DISCOVERY (Welch's t-statistic) ===")
+        a, b = [x.strip() for x in arg.split("||", 1)]
+        side = lambda s: load_corpus(s[1:]) if s.startswith("@") else [x.strip() for x in s.split(";;") if x.strip()]
+        pos = [self.session.encode_prompt(t)[0] for t in side(a)]
+        neg = [self.session.encode_prompt(t)[0] for t in side(b)]
+        rep = self.session.injector.discover_contrastive_neurons(pos, neg, top_k=10)
+        print(f"\n{rep.tests_performed} neurons tested on {rep.pos_prompts_count} vs {rep.neg_prompts_count} prompts")
         for m in rep.top_matches:
-            print(
-                f"  {m.layer_name}[N{m.neuron_idx:<3}] | t={m.t_statistic:+.3f} | "
-                f"mu+={m.pos_mean:+.3f}, mu-={m.neg_mean:+.3f} | "
-                f"SignFlip={m.bipolar_sign_flip} | Pole={m.recommended_pole.value}"
-            )
-        print()
+            print(f"  {m.layer_name}[N{m.neuron_idx}] t={m.t_statistic:+.3f} df={m.degrees_of_freedom:.1f} p={m.p_value:.2e} "
+                  f"(Bonferroni {m.bonferroni_p_value:.2e}) d={m.cohens_d:+.2f} mean+ {m.pos_mean:+.4f} mean- {m.neg_mean:+.4f}")
 
     def do_synergy(self, arg: str) -> None:
-        """synergy <layer_name> [k] [greedy|l1_optim] : Find a minimal synergistic coalition of k neurons to ablate."""
-        parts = _split_cli_args(arg)
-        if not parts:
-            print("Usage: synergy <layer_name> [k] [greedy|l1_optim]")
+        """synergy <layer> [k] [greedy|l1_optim] <prompt> : coalition whose joint ablation matters most."""
+        p = arg.strip().split(None, 3)
+        if len(p) < 4:
+            print("Usage: synergy <layer> <k> <greedy|l1_optim> <prompt>")
             return
-        layer_name = parts[0]
-        k = int(parts[1]) if len(parts) >= 2 else 3
-        method = parts[2] if len(parts) >= 3 else "greedy"
-        input_ids = self.session.get_default_eval_inputs()
-        res = self.session.injector.find_synergistic_ablation_set(
-            layer_name=layer_name, inputs=input_ids, max_subset_size=k, method=method
-        )
-        print(f"\n=== SYNERGISTIC MULTI-NEURON ABLATION ({res.layer_name}, method={res.method}) ===")
-        print(f"Selected Coalition : {res.selected_neurons}")
-        print(f"Stepwise Scores    : {res.stepwise_scores}")
-        print(
-            f"Joint Ablation KL  : {res.joint_ablation_kl:.5f} | "
-            f"Sum Individual KLs: {res.sum_of_individual_kls:.5f} | "
-            f"Synergy Ratio: {res.synergy_ratio:.3f}\n"
-        )
+        ids, _ = self.session.encode_prompt(p[3])
+        r = self.session.injector.find_synergistic_ablation_set(p[0], ids, max_subset_size=int(p[1]), method=p[2])
+        print(f"coalition {r.selected_neurons} | joint {r.joint_score:.5f} vs sum of individual {r.sum_of_individual_scores:.5f} "
+              f"| ratio {r.synergy_ratio:.3f} ({r.objective})")
 
     def do_export(self, arg: str) -> None:
-        """export <json_filepath> [pt_vectors_filepath] : Export active interventions & compiled steering vectors."""
-        parts = _split_cli_args(arg)
-        if not parts:
-            print(
-                "Usage: export <json_filepath> [pt_vectors_filepath]  (e.g., export steering_preset.json vectors.pt)"
-            )
-            return
-        json_path = parts[0]
-        pt_path = parts[1] if len(parts) >= 2 else None
-
-        bundle = self.session.injector.export_production_preset(
-            preset_name="cli_exported_preset",
-            model_name=self.session.model_name,
-            save_json_path=json_path,
-            save_pt_vectors_path=pt_path,
-        )
-        print(f"\nExported '{bundle.preset_name}' to {json_path}:")
-        print(f"  - Surgical Interventions : {len(bundle.interventions)}")
-        print(f"  - Compiled d_model Vectors: {len(bundle.compiled_vectors)}")
-        for cv in bundle.compiled_vectors:
-            print(
-                f"    * Layer '{cv.layer_name}' (d_model={cv.d_model}) | Neurons={cv.source_neurons} | ||v_steer||_2 = {cv.vector_norm:.4f}"
-            )
-        print()
+        """export <json_path> [pt_vectors_path]"""
+        p = _split_cli_args(arg)
+        b = self.session.injector.export_production_preset(model_name=self.session.model_name, save_json_path=p[0],
+                                                           save_pt_vectors_path=p[1] if len(p) > 1 else None)
+        print(f"Exported {len(b.interventions)} interventions, {len(b.compiled_vectors)} compiled vectors.")
 
     def do_import(self, arg: str) -> None:
-        """import <json_filepath> : Load a saved production steering preset into the active session."""
-        parts = _split_cli_args(arg)
-        if not parts:
-            print("Usage: import <json_filepath>")
-            return
-        bundle = self.session.injector.load_production_preset(parts[0])
-        print(f"Loaded preset '{bundle.preset_name}' with {len(bundle.interventions)} interventions.")
+        """import <json_path>"""
+        b = self.session.injector.load_production_preset(_split_cli_args(arg)[0])
+        print(f"Loaded preset '{b.preset_name}' ({len(b.interventions)} interventions).")
 
     def do_fold(self, _arg: str) -> None:
-        """fold : Permanently fold active unconditional interventions into down_proj weights & biases."""
-        res = self.session.injector.fold_interventions_into_weights()
-        print(f"Folded {res['operations_applied']} interventions directly into model weights:")
-        for d in res["details"]:
-            print(f"  - {d['layer']} (neurons {d['neurons']}): {d['folded_op']}")
-        if res.get("unfolded_specs_retained", 0) > 0:
-            print(
-                f"Retained {res['unfolded_specs_retained']} non-foldable intervention(s) as active runtime hooks."
-            )
+        """fold : fold unconditional affine interventions into weights."""
+        r = self.session.injector.fold_interventions_into_weights()
+        print(f"Folded {r['operations_applied']} spec(s); {r['unfolded_specs_retained']} kept as hooks.")
 
     def do_exit(self, _arg: str) -> bool:
-        """exit : Exit the Neural Injector REPL."""
+        """exit"""
         return True
 
     def do_EOF(self, _arg: str) -> bool:
@@ -632,113 +313,35 @@ class NeuralInjectorREPL(cmd.Cmd):
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="neural-injector",
-        description="Neural Injector CLI & FastAPI Workbench ('Neural Networks Are Already Clean')",
-    )
-    parser.add_argument(
-        "--hf-model",
-        type=str,
-        default=None,
-        help="Optional HuggingFace model ID to load (e.g. 'gpt2' or 'Qwen/Qwen2.5-1.5B'). Defaults to built-in 2-layer SwiGLU model.",
-    )
-    parser.add_argument("--device", type=str, default="cpu", help="Device ('cpu', 'cuda', 'cuda:0', etc.)")
-    parser.add_argument(
-        "--device-map",
-        type=str,
-        default=None,
-        help="Optional HuggingFace Accelerate device_map (e.g. 'auto') for multi-GPU / sharded models.",
-    )
-    parser.add_argument(
-        "--llm-model",
-        type=str,
-        default=os.environ.get("NEURAL_INJECTOR_LLM_MODEL"),
-        help="Optional OpenAI-compatible LLM model name for agentic neuron explanation (e.g. 'gpt-4o-mini').",
-    )
-    parser.add_argument(
-        "--llm-base-url",
-        type=str,
-        default=os.environ.get("NEURAL_INJECTOR_LLM_BASE_URL", "https://api.openai.com/v1"),
-        help="Base URL for OpenAI-compatible LLM endpoint.",
-    )
-    parser.add_argument(
-        "--llm-api-key",
-        type=str,
-        default=os.environ.get("OPENAI_API_KEY"),
-        help="API key for OpenAI-compatible LLM endpoint.",
-    )
-
+    parser = argparse.ArgumentParser(prog="neural-injector", description="Neural Injector workbench")
+    parser.add_argument("--hf-model", type=str, default=None, help="HuggingFace model id (default: built-in toy model)")
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device-map", type=str, default=None)
+    parser.add_argument("--llm-model", type=str, default=os.environ.get("NEURAL_INJECTOR_LLM_MODEL"))
+    parser.add_argument("--llm-base-url", type=str, default=os.environ.get("NEURAL_INJECTOR_LLM_BASE_URL", "https://api.openai.com/v1"))
+    parser.add_argument("--llm-api-key", type=str, default=os.environ.get("OPENAI_API_KEY"))
     sub = parser.add_subparsers(dest="command")
-
-    # 1. Interactive REPL
-    sub.add_parser("repl", help="Start the stateful interactive CLI workbench shell")
-
-    # 2. FastAPI Server
-    serve_p = sub.add_parser("serve", help="Launch the FastAPI REST server & browser UI workbench")
-    serve_p.add_argument("--host", type=str, default="127.0.0.1")
-    serve_p.add_argument("--port", type=int, default=8000)
-
-    # 3. Direct one-shot audit command
-    audit_p = sub.add_parser("audit", help="Audit one or all layers on a prompt corpus")
-    audit_p.add_argument("layer_name", type=str, help="Layer name or 'all'")
-
-    # 4. Direct one-shot profile command
-    prof_p = sub.add_parser("profile", help="Inspect a neuron's bipolar profile")
-    prof_p.add_argument("layer_name", type=str)
-    prof_p.add_argument("neuron_idx", type=int)
-
-    # 5. Direct one-shot explain command
-    exp_p = sub.add_parser(
-        "explain", help="Run the agentic explainer + surgical verification on a neuron"
-    )
-    exp_p.add_argument("layer_name", type=str)
-    exp_p.add_argument("neuron_idx", type=int)
-    exp_p.add_argument("--dst-layer", type=str, default=None)
-    exp_p.add_argument("--src-layer", type=str, default=None)
-
+    sub.add_parser("repl")
+    sp = sub.add_parser("serve")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8000)
+    ap = sub.add_parser("audit")
+    ap.add_argument("layer_name")
+    ap.add_argument("corpus", help="@file or prompts separated by |")
     args = parser.parse_args(argv)
 
-    session = (
-        WorkbenchSession.from_huggingface(
-            args.hf_model, device=args.device, device_map=args.device_map
-        )
-        if args.hf_model
-        else WorkbenchSession.create_demo_session()
-    )
-
+    session = (WorkbenchSession.from_huggingface(args.hf_model, device=args.device, device_map=args.device_map)
+               if args.hf_model else WorkbenchSession.create_demo_session())
     if args.llm_model:
-        session.injector.set_explainer_llm_client(
-            OpenAICompatibleClient(
-                model=args.llm_model,
-                api_key=args.llm_api_key,
-                base_url=args.llm_base_url,
-            )
-        )
-
+        session.injector.set_explainer_llm_client(OpenAICompatibleClient(model=args.llm_model, api_key=args.llm_api_key,
+                                                                         base_url=args.llm_base_url))
     if args.command == "serve":
         import uvicorn
         from .server import create_workbench_app
-
-        app = create_workbench_app(session)
-        print(f"Launching Neural Injector Workbench at http://{args.host}:{args.port}")
-        uvicorn.run(app, host=args.host, port=args.port)
-
+        uvicorn.run(create_workbench_app(session), host=args.host, port=args.port)
     elif args.command == "audit":
-        repl = NeuralInjectorREPL(session)
-        repl.do_audit(args.layer_name)
-
-    elif args.command == "profile":
-        repl = NeuralInjectorREPL(session)
-        repl.do_profile(f"{args.layer_name} {args.neuron_idx}")
-
-    elif args.command == "explain":
-        repl = NeuralInjectorREPL(session)
-        dst_arg = args.dst_layer or "-"
-        src_arg = args.src_layer or "-"
-        repl.do_explain(f"{args.layer_name} {args.neuron_idx} {dst_arg} {src_arg}")
-
+        NeuralInjectorREPL(session).do_audit(f"{args.layer_name} {args.corpus}")
     else:
-        # Default to interactive REPL
         NeuralInjectorREPL(session).cmdloop()
 
 

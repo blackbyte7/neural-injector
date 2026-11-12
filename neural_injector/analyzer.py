@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-import heapq
 import math
 from pathlib import Path
-import random
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import unicodedata
 
 import torch
 import torch.nn as nn
@@ -14,1872 +12,1097 @@ from torch.utils.hooks import RemovableHandle
 
 from .discovery import LayerDiscovery
 from .types import (
+    ActivationBand,
     ActivationSample,
-    BipolarVerbHypothesis,
     ContrastiveDiscoveryReport,
     ContrastiveNeuronMatch,
+    DistributionMoments,
+    GATED_REGIMES,
     NeuronCheckpointSnapshot,
     NeuronEvolutionReport,
     NeuronPoleProfile,
     NeuronScanSummary,
-    NeuronTaxonomy,
     PoleType,
-    SparsityTailPrior,
+    SignRegime,
+    UNGATED_REGIMES,
 )
+
+# Global token codes: code = internal_sample_index * POS_BASE + position
+POS_BASE = 1 << 24
+# Upper bound on the number of [tokens x neurons] elements materialised at once in one update chunk
+_CHUNK_ELEMS = 1 << 23
+
+# Default ring edges as fractions of the pole extreme: successive halvings ("octave rings"),
+# i.e. the strong half, the next quarter, ... down to everything below 1/32 of the extreme.
+DEFAULT_BAND_EDGES: Tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.0)
+
+
+def _excess_kurtosis(n: torch.Tensor, m2: torch.Tensor, m4: torch.Tensor) -> torch.Tensor:
+    safe = m2 > 0
+    out = torch.zeros_like(m2)
+    out[safe] = n[safe] * m4[safe] / (m2[safe] ** 2) - 3.0
+    return out
+
+
+def _skewness(n: torch.Tensor, m2: torch.Tensor, m3: torch.Tensor) -> torch.Tensor:
+    safe = m2 > 0
+    out = torch.zeros_like(m2)
+    out[safe] = torch.sqrt(n[safe]) * m3[safe] / (m2[safe] ** 1.5)
+    return out
+
+
+def is_punctuation_token(token: Optional[str]) -> bool:
+    """True if the token, with BPE/SentencePiece whitespace markers removed, consists only of
+    Unicode punctuation (P*) or symbol (S*) characters."""
+    if not token:
+        return False
+    stripped = token.replace("Ġ", "").replace("▁", "").replace("Ċ", "").strip()
+    if not stripped:
+        return False
+    return all(unicodedata.category(ch)[0] in ("P", "S") for ch in stripped)
 
 
 class StreamingLayerStats:
     """
-    GPU-accelerated streaming statistics tracker for an entire layer of neurons.
-    Tracks:
-      - Full-distribution Welford/Pébay moments (M1, M2, M3, M4), min, max, and firing rates
-      - Pole-specific conditional moments (M1+, M2+, M3+, M4+ for a > 0 and M1-, M2-, M3-, M4- for a < 0)
-        so Positive and Negative poles are evaluated independently (Cammarata: 'Thinking in Neurons')
-      - Full 4-quadrant SwiGLU sign regime counters (`pos_gate_pos_up`, `neg_gate_neg_up`,
-        `pos_gate_neg_up`, `neg_gate_pos_up`) plus SwiGLU Double-Negative Route activations
-        (`gate < 0` and `up < 0` yielding `silu(gate) * up > 0`) and per-quantile-band double-negative shares
-      - Top-k activating contexts AND Stratified Quantile Activation Buckets per pole
-        ("peak_trunk" [80%..100%], "secondary_branch" [40%..80%), "tertiary_offshoot" [15%..40%))
-        sampled across the full dynamic range of each batch
-      - Unbiased Algorithm R active-magnitude reservoirs per neuron for accurate empirical percentiles.
+    Exact, vectorised streaming record of every neuron in one layer.
+
+    Per neuron it keeps
+      * exact Pébay moments (M1..M4) of all activations, of each pole, and of each sign regime
+        (gated MLPs: ++, --, +-, -+; otherwise + and -),
+      * exact top-k activations per sign regime (so '--' echoes never enter the '++' list, and the
+        raw mixed list is their exact merge),
+      * an exact log2-magnitude histogram per sign regime (resolution `bins_per_octave`), from which
+        fraction-of-extreme band counts and within-pole percentiles are read,
+      * a uniform random sample of activations inside every magnitude octave of each pole
+        (bottom-k priority sampling, mergeable across batches), used to show examples from every
+        activation band rather than only the top of the list.
+    Token strings and contexts are stored once per sample in a registry that is compacted
+    to the samples still referenced.
     """
 
-    QUANTILE_BAND_SPECS: Tuple[Tuple[str, float, float], ...] = (
-        ("peak_trunk", 0.80, 1.01),
-        ("secondary_branch", 0.40, 0.80),
-        ("tertiary_offshoot", 0.15, 0.40),
-    )
-
-    _PUNCTUATION_CHARS = frozenset(".,;:!?()[]{}-/\"'`~@#$%^&*_+=<>|\\")
-
-    def __init__(self, layer_name: str, num_neurons: int, top_k: int = 10, device: str = "cpu"):
+    def __init__(
+        self,
+        layer_name: str,
+        num_neurons: int,
+        gated: bool,
+        top_k: int = 16,
+        device: str = "cpu",
+        bins_per_octave: int = 4,
+        min_exponent: int = -20,
+        max_exponent: int = 20,
+        samples_per_octave: int = 3,
+        seed: int = 0,
+        window_tokens_before: int = 12,
+        window_tokens_after: int = 4,
+    ):
         self.layer_name = layer_name
-        self.num_neurons = num_neurons
-        self.top_k = top_k
-        self.device = device
+        self.num_neurons = int(num_neurons)
+        self.gated = bool(gated)
+        self.top_k = int(top_k)
+        self.device = torch.device(device)
+        self.bins_per_octave = int(bins_per_octave)
+        self.min_exponent = int(min_exponent)
+        self.max_exponent = int(max_exponent)
+        self.samples_per_octave = int(samples_per_octave)
+        self.seed = int(seed)
+        self.window_tokens_before = int(window_tokens_before)
+        self.window_tokens_after = int(window_tokens_after)
 
-        # Full-distribution moments
+        self.regimes: Tuple[SignRegime, ...] = GATED_REGIMES if self.gated else UNGATED_REGIMES
+        R = len(self.regimes)
+        D = self.num_neurons
+        dev = self.device
+        f64 = torch.float64
+
         self.count = 0
-        self.mean = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.m2 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.max_val = torch.full((num_neurons,), float("-inf"), dtype=torch.float64, device=device)
-        self.min_val = torch.full((num_neurons,), float("inf"), dtype=torch.float64, device=device)
+        self.mean = torch.zeros(D, dtype=f64, device=dev)
+        self.m2 = torch.zeros(D, dtype=f64, device=dev)
+        self.m3 = torch.zeros(D, dtype=f64, device=dev)
+        self.m4 = torch.zeros(D, dtype=f64, device=dev)
+        self.max_val = torch.full((D,), float("-inf"), dtype=f64, device=dev)
+        self.min_val = torch.full((D,), float("inf"), dtype=f64, device=dev)
 
-        # Conditional Positive Pole (a > 0) moments
-        self.pos_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.pos_mean = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.pos_m2 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.pos_m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.pos_m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        # pole moments: index 0 = positive (values a), 1 = negative (magnitudes |a|)
+        self.pole_count = torch.zeros(2, D, dtype=torch.long, device=dev)
+        self.pole_mean = torch.zeros(2, D, dtype=f64, device=dev)
+        self.pole_m2 = torch.zeros(2, D, dtype=f64, device=dev)
+        self.pole_m3 = torch.zeros(2, D, dtype=f64, device=dev)
+        self.pole_m4 = torch.zeros(2, D, dtype=f64, device=dev)
+        # regime moments on magnitudes
+        self.reg_count = torch.zeros(R, D, dtype=torch.long, device=dev)
+        self.reg_mean = torch.zeros(R, D, dtype=f64, device=dev)
+        self.reg_m2 = torch.zeros(R, D, dtype=f64, device=dev)
+        self.reg_m3 = torch.zeros(R, D, dtype=f64, device=dev)
+        self.reg_m4 = torch.zeros(R, D, dtype=f64, device=dev)
 
-        # Conditional Negative Pole (|a| where a < 0) moments
-        self.neg_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.neg_mean = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.neg_m2 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.neg_m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.neg_m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        K = self.top_k
+        self.top_vals = torch.full((R, K, D), float("-inf"), dtype=torch.float32, device=dev)
+        self.top_codes = torch.full((R, K, D), -1, dtype=torch.long, device=dev)
 
-        # SwiGLU Double-Negative route counter (a > 0 where gate < 0 and up < 0)
-        # and full 4-quadrant sign regime counters + uncontaminated (+ x +) positive moments
-        self.double_neg_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.q_pp_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.q_nn_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.q_pn_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.q_np_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.true_pos_count = torch.zeros(num_neurons, dtype=torch.long, device=device)
-        self.true_pos_mean = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.true_pos_m2 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.true_pos_m3 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
-        self.true_pos_m4 = torch.zeros(num_neurons, dtype=torch.float64, device=device)
+        self.n_bins = (self.max_exponent - self.min_exponent) * self.bins_per_octave + 2
+        self.hist = torch.zeros(R, D, self.n_bins, dtype=torch.int32, device=dev)
 
-        # Per-neuron bounded min-heaps for top positive, negative, and SwiGLU double-negative activations
-        self._tie_breaker = 0
-        self.pos_heaps: Dict[int, List[Tuple[float, int, ActivationSample]]] = defaultdict(list)
-        self.neg_heaps: Dict[int, List[Tuple[float, int, ActivationSample]]] = defaultdict(list)
-        self.double_neg_heaps: Dict[int, List[Tuple[float, int, ActivationSample]]] = defaultdict(list)
+        self.n_octaves = (self.max_exponent - self.min_exponent) + 2
+        C = self.samples_per_octave
+        self.res_keys = torch.full((2, D, self.n_octaves, C), float("inf"), dtype=torch.float32, device=dev)
+        self.res_vals = torch.zeros(2, D, self.n_octaves, C, dtype=torch.float32, device=dev)
+        self.res_codes = torch.full((2, D, self.n_octaves, C), -1, dtype=torch.long, device=dev)
+        self.res_regime = torch.full((2, D, self.n_octaves, C), -1, dtype=torch.int8, device=dev)
 
-        # Stratified active sample reservoirs per neuron for quantile-band bucketing
-        self._reservoir_cap = max(top_k * 6, 36)
-        self.pos_band_reservoirs: Dict[int, List[Tuple[float, int, ActivationSample]]] = defaultdict(list)
-        self.neg_band_reservoirs: Dict[int, List[Tuple[float, int, ActivationSample]]] = defaultdict(list)
+        self._generator = torch.Generator(device="cpu")
+        self._generator.manual_seed(self.seed)
+        self._next_internal = 0
+        # internal sample index -> (user sample id, tokens or None, context or None, spatial (h, w) or None)
+        self.registry: Dict[int, Tuple[Any, Optional[List[str]], Optional[str], Optional[Tuple[int, int]]]] = {}
 
-        # Unbiased Algorithm R active magnitude reservoirs for accurate empirical percentiles
-        self._mag_reservoir_cap = 512
-        self._rng = random.Random(42)
-        self.pos_mag_reservoirs: Dict[int, List[float]] = defaultdict(list)
-        self.neg_mag_reservoirs: Dict[int, List[float]] = defaultdict(list)
-        self._pos_mag_seen: Dict[int, int] = defaultdict(int)
-        self._neg_mag_seen: Dict[int, int] = defaultdict(int)
-
+    # ------------------------------------------------------------------
+    # Moment updates
+    # ------------------------------------------------------------------
     @staticmethod
-    def _update_conditional_moments(
+    def _merge_moments(
         mask: torch.Tensor,
-        magnitudes: torch.Tensor,
+        values: torch.Tensor,
         count_vec: torch.Tensor,
         mean_vec: torch.Tensor,
         m2_vec: torch.Tensor,
         m3_vec: torch.Tensor,
         m4_vec: torch.Tensor,
     ) -> None:
-        """
-        Vectorized GPU Pébay parallel moment update across all neurons where `mask` is True.
-        Keeps 2D `[batch_n, D]` intermediates in `magnitudes.dtype` (`float32`) and accumulates
-        reduced 1D `[D]` moment sums in `float64` for both high speed and numerical precision.
-        Updates `count_vec`, `mean_vec`, `m2_vec`, `m3_vec`, `m4_vec` in-place.
-        """
+        """Pébay pairwise merge of the masked batch moments into the running moments (in place)."""
         n_b_long = mask.sum(dim=0)
-        active_neurons = n_b_long > 0
-        if not active_neurons.any():
+        if not bool((n_b_long > 0).any()):
             return
-
+        zero = torch.zeros((), dtype=values.dtype, device=values.device)
         n_a = count_vec.to(torch.float64)
         n_b = n_b_long.to(torch.float64)
-        new_count = n_a + n_b
+        n = n_a + n_b
         safe_nb = torch.clamp(n_b, min=1.0)
-        safe_new = torch.clamp(new_count, min=1.0)
+        safe_n = torch.clamp(n, min=1.0)
 
-        zero_2d = torch.zeros(1, dtype=magnitudes.dtype, device=magnitudes.device)
-        masked_vals = torch.where(mask, magnitudes, zero_2d)
-        batch_mean = masked_vals.sum(dim=0, dtype=torch.float64) / safe_nb
+        mv = torch.where(mask, values, zero)
+        b_mean = mv.sum(dim=0, dtype=torch.float64) / safe_nb
+        c = torch.where(mask, values - b_mean.to(values.dtype).unsqueeze(0), zero)
+        c2 = c * c
+        b_m2 = c2.sum(dim=0, dtype=torch.float64)
+        b_m3 = (c2 * c).sum(dim=0, dtype=torch.float64)
+        b_m4 = (c2 * c2).sum(dim=0, dtype=torch.float64)
 
-        centered_b = torch.where(
-            mask,
-            magnitudes - batch_mean.to(magnitudes.dtype).unsqueeze(0),
-            zero_2d,
-        )
-        c2 = centered_b * centered_b
-        batch_m2 = c2.sum(dim=0, dtype=torch.float64)
-        batch_m3 = (c2 * centered_b).sum(dim=0, dtype=torch.float64)
-        batch_m4 = (c2 * c2).sum(dim=0, dtype=torch.float64)
-
-        delta = batch_mean - mean_vec
-        delta_n = delta / safe_new
-        delta_n2 = delta_n * delta_n
-        prod_n = n_a * n_b
-
+        delta = b_mean - mean_vec
+        d_n = delta / safe_n
+        d_n2 = d_n * d_n
+        prod = n_a * n_b
         new_m4 = (
-            m4_vec
-            + batch_m4
-            + prod_n * (n_a * n_a - prod_n + n_b * n_b) * delta * delta_n * delta_n2
-            + 6.0 * (n_a * n_a * batch_m2 + n_b * n_b * m2_vec) * delta_n2
-            + 4.0 * (n_a * batch_m3 - n_b * m3_vec) * delta_n
+            m4_vec + b_m4
+            + prod * (n_a * n_a - prod + n_b * n_b) * delta * d_n * d_n2
+            + 6.0 * (n_a * n_a * b_m2 + n_b * n_b * m2_vec) * d_n2
+            + 4.0 * (n_a * b_m3 - n_b * m3_vec) * d_n
         )
-        new_m3 = (
-            m3_vec
-            + batch_m3
-            + prod_n * (n_a - n_b) * delta * delta_n2
-            + 3.0 * (n_a * batch_m2 - n_b * m2_vec) * delta_n
-        )
-        new_m2 = m2_vec + batch_m2 + (delta ** 2) * (prod_n / safe_new)
-        new_mean = mean_vec + delta * (n_b / safe_new)
+        new_m3 = m3_vec + b_m3 + prod * (n_a - n_b) * delta * d_n2 + 3.0 * (n_a * b_m2 - n_b * m2_vec) * d_n
+        new_m2 = m2_vec + b_m2 + delta * delta * prod / safe_n
+        new_mean = mean_vec + delta * n_b / safe_n
 
-        first_seen = active_neurons & (count_vec == 0)
-        continuing = active_neurons & (count_vec > 0)
-
-        mean_vec[:] = torch.where(first_seen, batch_mean, torch.where(continuing, new_mean, mean_vec))
-        m2_vec[:] = torch.where(first_seen, batch_m2, torch.where(continuing, new_m2, m2_vec))
-        m3_vec[:] = torch.where(first_seen, batch_m3, torch.where(continuing, new_m3, m3_vec))
-        m4_vec[:] = torch.where(first_seen, batch_m4, torch.where(continuing, new_m4, m4_vec))
+        active = n_b_long > 0
+        mean_vec.copy_(torch.where(active, new_mean, mean_vec))
+        m2_vec.copy_(torch.where(active, new_m2, m2_vec))
+        m3_vec.copy_(torch.where(active, new_m3, m3_vec))
+        m4_vec.copy_(torch.where(active, new_m4, m4_vec))
         count_vec.add_(n_b_long)
 
-    def _record_unbiased_magnitude(
-        self, mag: float, reservoir: List[float], seen_dict: Dict[int, int], neuron_idx: int
-    ) -> None:
-        """Algorithm R reservoir sampling over active firing magnitudes for unbiased quantiles."""
-        seen = seen_dict[neuron_idx] + 1
-        seen_dict[neuron_idx] = seen
-        if len(reservoir) < self._mag_reservoir_cap:
-            reservoir.append(mag)
-        else:
-            j = self._rng.randint(0, seen - 1)
-            if j < self._mag_reservoir_cap:
-                reservoir[j] = mag
+    # ------------------------------------------------------------------
+    # Binning helpers
+    # ------------------------------------------------------------------
+    def _bin_index(self, mags: torch.Tensor) -> torch.Tensor:
+        lg = torch.log2(torch.clamp(mags, min=1e-38))
+        b = torch.floor((lg - self.min_exponent) * self.bins_per_octave).to(torch.long) + 1
+        return torch.clamp(b, 0, self.n_bins - 1)
 
+    def _octave_index(self, mags: torch.Tensor) -> torch.Tensor:
+        lg = torch.log2(torch.clamp(mags, min=1e-38))
+        o = torch.floor(lg).to(torch.long) - self.min_exponent + 1
+        return torch.clamp(o, 0, self.n_octaves - 1)
+
+    def _bin_lower_value(self, b: int) -> float:
+        if b <= 0:
+            return 0.0
+        return 2.0 ** (self.min_exponent + (b - 1) / self.bins_per_octave)
+
+    def _value_to_edge(self, v: float) -> int:
+        """Nearest histogram bin edge index for a magnitude (edge e = lower edge of bin e)."""
+        if v <= 0.0:
+            return 0
+        e = int(round((math.log2(v) - self.min_exponent) * self.bins_per_octave)) + 1
+        return max(1, min(self.n_bins - 1, e))
+
+    def _regime_codes_for_pole(self, pole: PoleType) -> List[int]:
+        return [i for i, r in enumerate(self.regimes) if r.pole == pole]
+
+    # ------------------------------------------------------------------
+    # Update
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def update(
         self,
         activations: torch.Tensor,
-        sample_ids: Optional[List[int]] = None,
-        tokens_per_sample: Optional[List[List[str]]] = None,
-        contexts_per_sample: Optional[List[str]] = None,
-        tracked_neurons: Optional[List[int]] = None,
+        sample_ids: Optional[Sequence[Any]] = None,
+        tokens_per_sample: Optional[Sequence[Optional[List[str]]]] = None,
+        contexts_per_sample: Optional[Sequence[Optional[str]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        routed_token_indices: Optional[torch.Tensor] = None,
         gate_activations: Optional[torch.Tensor] = None,
-        up_activations: Optional[torch.Tensor] = None,
+        routed_token_indices: Optional[torch.Tensor] = None,
+        token_grid: Optional[Tuple[int, int]] = None,
     ) -> None:
         """
-        Updates streaming neuron statistics from a batch of activations.
-        activations shape: [B, S, D] or [B, D] or [B, C, H, W] or [N_routed, D] (MoE).
-        When `gate_activations` and `up_activations` are provided (for SwiGLU blocks),
-        automatically detects and separates the 4 sign quadrants including the
-        'double-negative' route (`gate < 0` and `up < 0`).
+        Adds one batch.
+          activations: [B, S, D], [B, D], [B, D, H, W] (conv) or [N_routed, D] (MoE expert, with
+                       `routed_token_indices` giving each row's flat index into the [B*S] grid
+                       described by `token_grid=(B, S)`).
+          gate_activations: gate pre-activations g of the same shape (required when `gated`).
         """
-        orig_shape = activations.shape
-        spatial_hw: Optional[Tuple[int, int]] = None
-        work_dtype = torch.float64 if activations.dtype == torch.float64 else torch.float32
-        if activations.ndim == 4:
-            _, c_dim, h_dim, w_dim = orig_shape
-            flat_acts = activations.permute(0, 2, 3, 1).reshape(-1, c_dim).to(
-                device=self.device, dtype=work_dtype
+        if self.gated and gate_activations is None:
+            raise ValueError(
+                f"Layer '{self.layer_name}' is tracked as gated but no gate activations were supplied."
             )
-            seq_len = h_dim * w_dim
+
+        spatial_hw: Optional[Tuple[int, int]] = None
+        if activations.ndim == 4:
+            b_dim, c_dim, h_dim, w_dim = activations.shape
+            flat = activations.permute(0, 2, 3, 1).reshape(-1, c_dim)
+            gate_flat = (
+                gate_activations.permute(0, 2, 3, 1).reshape(-1, c_dim) if gate_activations is not None else None
+            )
+            n_batch, seq_len = b_dim, h_dim * w_dim
             spatial_hw = (h_dim, w_dim)
         elif activations.ndim == 3:
-            _, seq_len, d_dim = orig_shape
-            flat_acts = activations.reshape(-1, d_dim).to(device=self.device, dtype=work_dtype)
-        else:
-            # 2D [B, D] or MoE routed [N_routed, D]: infer seq_len from tokens_per_sample if available
-            if tokens_per_sample and len(tokens_per_sample) > 0 and len(tokens_per_sample[0]) > 1:
-                seq_len = len(tokens_per_sample[0])
+            n_batch, seq_len, d_dim = activations.shape
+            flat = activations.reshape(-1, d_dim)
+            gate_flat = gate_activations.reshape(-1, d_dim) if gate_activations is not None else None
+        elif activations.ndim == 2:
+            flat = activations
+            gate_flat = gate_activations
+            if routed_token_indices is not None:
+                if token_grid is None:
+                    raise ValueError("`token_grid=(B, S)` is required with `routed_token_indices`.")
+                n_batch, seq_len = token_grid
             else:
-                seq_len = 1
-            flat_acts = activations.to(device=self.device, dtype=work_dtype)
+                n_batch, seq_len = activations.shape[0], 1
+        else:
+            raise ValueError(f"Unsupported activation shape {tuple(activations.shape)}")
 
-        # Align optional SwiGLU gate and up projections to the same flattened shape
-        flat_gate: Optional[torch.Tensor] = None
-        flat_up: Optional[torch.Tensor] = None
-        if gate_activations is not None and up_activations is not None:
-            try:
-                g_reshaped = gate_activations.reshape(-1, flat_acts.shape[-1]).to(self.device)
-                u_reshaped = up_activations.reshape(-1, flat_acts.shape[-1]).to(self.device)
-                if g_reshaped.shape == flat_acts.shape and u_reshaped.shape == flat_acts.shape:
-                    flat_gate = g_reshaped
-                    flat_up = u_reshaped
-            except RuntimeError:
-                flat_gate = None
-                flat_up = None
+        if flat.shape[-1] != self.num_neurons:
+            raise ValueError(
+                f"Layer '{self.layer_name}': expected {self.num_neurons} neurons, got {flat.shape[-1]}"
+            )
+        work_dtype = torch.float64 if flat.dtype == torch.float64 else torch.float32
+        flat = flat.to(device=self.device, dtype=work_dtype)
+        if gate_flat is not None:
+            gate_flat = gate_flat.to(device=self.device, dtype=work_dtype)
+            if gate_flat.shape != flat.shape:
+                raise ValueError("gate activations do not match activation shape")
 
-        # Map each row back to its original flattened (batch * seq_len + pos) index
-        valid_flat_indices: Optional[torch.Tensor] = None
+        # Flat [B*S] grid index of every row
         if routed_token_indices is not None:
-            valid_flat_indices = routed_token_indices.reshape(-1).to(
-                device=self.device, dtype=torch.long
-            )
-        elif attention_mask is not None:
-            mask_flat = attention_mask.reshape(-1).to(device=self.device, dtype=torch.bool)
-            if mask_flat.numel() == flat_acts.shape[0]:
-                valid_flat_indices = torch.nonzero(mask_flat, as_tuple=False).squeeze(-1)
-                if valid_flat_indices.ndim == 0:
-                    valid_flat_indices = valid_flat_indices.unsqueeze(0)
-                flat_acts = flat_acts[valid_flat_indices]
-                if flat_gate is not None and flat_up is not None:
-                    flat_gate = flat_gate[valid_flat_indices]
-                    flat_up = flat_up[valid_flat_indices]
+            grid_idx = routed_token_indices.reshape(-1).to(device=self.device, dtype=torch.long)
+        else:
+            grid_idx = torch.arange(flat.shape[0], device=self.device, dtype=torch.long)
+            if attention_mask is not None and spatial_hw is None:
+                m = attention_mask.reshape(-1).to(device=self.device, dtype=torch.bool)
+                if m.numel() != flat.shape[0]:
+                    raise ValueError("attention_mask does not match the activation grid")
+                keep = torch.nonzero(m, as_tuple=False).reshape(-1)
+                flat = flat[keep]
+                if gate_flat is not None:
+                    gate_flat = gate_flat[keep]
+                grid_idx = keep
 
-        batch_n = flat_acts.shape[0]
-        if batch_n == 0:
+        # Register samples of this batch
+        base = self._next_internal
+        self._next_internal += n_batch
+        for b in range(n_batch):
+            sid = sample_ids[b] if sample_ids is not None and b < len(sample_ids) else base + b
+            toks = list(tokens_per_sample[b]) if tokens_per_sample is not None and b < len(tokens_per_sample) and tokens_per_sample[b] is not None else None
+            ctx = contexts_per_sample[b] if contexts_per_sample is not None and b < len(contexts_per_sample) else None
+            self.registry[base + b] = (sid, toks, ctx, spatial_hw)
+
+        N = flat.shape[0]
+        if N == 0:
             return
+        codes_rows = (base + grid_idx // seq_len) * POS_BASE + (grid_idx % seq_len)
 
-        # 1. Batch Welford / Pébay parallel update for exact full-distribution M1, M2, M3, M4 moments
+        # 1. full-distribution moments
         n_a = self.count
-        n_b = batch_n
-        new_count = n_a + n_b
-        batch_mean = flat_acts.mean(dim=0, dtype=torch.float64)
-        centered_b = flat_acts - batch_mean.to(flat_acts.dtype).unsqueeze(0)
-        c2 = centered_b * centered_b
-        batch_m2 = c2.sum(dim=0, dtype=torch.float64)
-        batch_m3 = (c2 * centered_b).sum(dim=0, dtype=torch.float64)
-        batch_m4 = (c2 * c2).sum(dim=0, dtype=torch.float64)
-
+        n_b = N
+        n = n_a + n_b
+        b_mean = flat.mean(dim=0, dtype=torch.float64)
+        c = flat - b_mean.to(flat.dtype).unsqueeze(0)
+        c2 = c * c
+        b_m2 = c2.sum(dim=0, dtype=torch.float64)
+        b_m3 = (c2 * c).sum(dim=0, dtype=torch.float64)
+        b_m4 = (c2 * c2).sum(dim=0, dtype=torch.float64)
         if n_a == 0:
-            self.mean = batch_mean
-            self.m2 = batch_m2
-            self.m3 = batch_m3
-            self.m4 = batch_m4
+            self.mean, self.m2, self.m3, self.m4 = b_mean, b_m2, b_m3, b_m4
         else:
-            delta = batch_mean - self.mean
-            delta_n = delta / new_count
-            delta_n2 = delta_n * delta_n
-            prod_n = n_a * n_b
-
-            self.m4 += (
-                batch_m4
-                + prod_n * (n_a * n_a - prod_n + n_b * n_b) * delta * delta_n * delta_n2
-                + 6.0 * (n_a * n_a * batch_m2 + n_b * n_b * self.m2) * delta_n2
-                + 4.0 * (n_a * batch_m3 - n_b * self.m3) * delta_n
+            delta = b_mean - self.mean
+            d_n = delta / n
+            d_n2 = d_n * d_n
+            prod = float(n_a) * float(n_b)
+            self.m4 = (
+                self.m4 + b_m4
+                + prod * (n_a * n_a - prod + n_b * n_b) * delta * d_n * d_n2
+                + 6.0 * (n_a * n_a * b_m2 + n_b * n_b * self.m2) * d_n2
+                + 4.0 * (n_a * b_m3 - n_b * self.m3) * d_n
             )
-            self.m3 += (
-                batch_m3
-                + prod_n * (n_a - n_b) * delta * delta_n2
-                + 3.0 * (n_a * batch_m2 - n_b * self.m2) * delta_n
-            )
-            self.m2 += batch_m2 + (delta ** 2) * (n_a * n_b / new_count)
-            self.mean += delta * (n_b / new_count)
+            self.m3 = self.m3 + b_m3 + prod * (n_a - n_b) * delta * d_n2 + 3.0 * (n_a * b_m2 - n_b * self.m2) * d_n
+            self.m2 = self.m2 + b_m2 + delta * delta * prod / n
+            self.mean = self.mean + delta * (n_b / n)
+        self.count = n
+        self.max_val = torch.maximum(self.max_val, flat.max(dim=0).values.to(torch.float64))
+        self.min_val = torch.minimum(self.min_val, flat.min(dim=0).values.to(torch.float64))
 
-        self.max_val = torch.maximum(
-            self.max_val, flat_acts.max(dim=0).values.to(torch.float64)
-        )
-        self.min_val = torch.minimum(
-            self.min_val, flat_acts.min(dim=0).values.to(torch.float64)
-        )
-        self.count = new_count
-
-        # 2. Update Pole-Specific Conditional Moments and SwiGLU 4-Quadrant Sign Regime Counts
-        pos_mask = flat_acts > 0
-        neg_mask = flat_acts < 0
-        if flat_gate is not None and flat_up is not None:
-            g_pos = flat_gate > 0
-            g_neg = flat_gate < 0
-            u_pos = flat_up > 0
-            u_neg = flat_up < 0
-            dbl_neg_mask = pos_mask & g_neg & u_neg
-            true_pp_mask = pos_mask & g_pos & u_pos
-            self.double_neg_count.add_(dbl_neg_mask.sum(dim=0))
-            self.q_pp_count.add_(true_pp_mask.sum(dim=0))
-            self.q_nn_count.add_(dbl_neg_mask.sum(dim=0))
-            self.q_pn_count.add_((neg_mask & g_pos & u_neg).sum(dim=0))
-            self.q_np_count.add_((neg_mask & g_neg & u_pos).sum(dim=0))
-            self._update_conditional_moments(
-                true_pp_mask,
-                flat_acts,
-                self.true_pos_count,
-                self.true_pos_mean,
-                self.true_pos_m2,
-                self.true_pos_m3,
-                self.true_pos_m4,
-            )
+        # 2. sign regime of every entry
+        pos = flat > 0
+        neg = flat < 0
+        if self.gated:
+            g_neg = gate_flat < 0
+            regime = torch.where(
+                pos,
+                torch.where(g_neg, 1, 0),
+                torch.where(neg, torch.where(g_neg, 3, 2), -1),
+            ).to(torch.int8)
         else:
-            dbl_neg_mask = None
+            regime = torch.where(pos, 0, torch.where(neg, 1, -1)).to(torch.int8)
+        mags = flat.abs()
 
-        self._update_conditional_moments(
-            pos_mask,
-            flat_acts,
-            self.pos_count,
-            self.pos_mean,
-            self.pos_m2,
-            self.pos_m3,
-            self.pos_m4,
-        )
-        self._update_conditional_moments(
-            neg_mask,
-            -flat_acts,
-            self.neg_count,
-            self.neg_mean,
-            self.neg_m2,
-            self.neg_m3,
-            self.neg_m4,
-        )
+        # 3. pole and regime moments
+        self._merge_moments(pos, flat, self.pole_count[0], self.pole_mean[0], self.pole_m2[0], self.pole_m3[0], self.pole_m4[0])
+        self._merge_moments(neg, mags, self.pole_count[1], self.pole_mean[1], self.pole_m2[1], self.pole_m3[1], self.pole_m4[1])
+        for r in range(len(self.regimes)):
+            self._merge_moments(regime == r, mags, self.reg_count[r], self.reg_mean[r], self.reg_m2[r], self.reg_m3[r], self.reg_m4[r])
 
-        # 3. Update top-k heaps, stratified quantile reservoirs, and unbiased magnitude reservoirs
-        target_indices = (
-            tracked_neurons if tracked_neurons is not None else list(range(self.num_neurons))
-        )
-        if not target_indices:
-            return
+        # 4-6. histogram, per-regime top-k and octave reservoirs, chunked over neurons
+        mags32 = mags.to(torch.float32)
+        chunk = max(1, _CHUNK_ELEMS // max(N, 1))
+        for c0 in range(0, self.num_neurons, chunk):
+            c1 = min(self.num_neurons, c0 + chunk)
+            self._update_chunk(mags32[:, c0:c1], regime[:, c0:c1], codes_rows, c0, c1)
 
-        num_targets = len(target_indices)
-        if num_targets == self.num_neurons and target_indices == list(range(self.num_neurons)):
-            sub_acts = flat_acts
-            sub_dbl_neg = dbl_neg_mask
-        else:
-            sub_acts = flat_acts[:, target_indices]
-            sub_dbl_neg = dbl_neg_mask[:, target_indices] if dbl_neg_mask is not None else None
+        self._maybe_compact_registry()
 
-        valid_idx_cpu = valid_flat_indices.cpu().tolist() if valid_flat_indices is not None else None
-        curr_max_cpu = self.max_val[target_indices].cpu().tolist()
-        curr_min_cpu = self.min_val[target_indices].cpu().tolist()
-
-        # Fast-path for wide layers / large token batches: instead of sorting all [batch_n, D]
-        # elements and materializing 4M+ Python floats, extract only top-k positive peaks,
-        # top-k negative peaks, and a stratified slice of intermediate rows on GPU/C++.
-        if num_targets * batch_n > 65536 and batch_n > self.top_k * 2:
-            self._update_heaps_and_reservoirs_fast(
-                sub_acts=sub_acts,
-                sub_dbl_neg=sub_dbl_neg,
-                target_indices=target_indices,
-                valid_idx_cpu=valid_idx_cpu,
-                curr_max_cpu=curr_max_cpu,
-                curr_min_cpu=curr_min_cpu,
-                seq_len=seq_len,
-                sample_ids=sample_ids,
-                tokens_per_sample=tokens_per_sample,
-                contexts_per_sample=contexts_per_sample,
-                spatial_hw=spatial_hw,
-            )
-            return
-
-        # Full-resolution path for compact layers / batches
-        sorted_vals, sorted_flat_idx = torch.sort(sub_acts, dim=0, descending=True)
-        sorted_vals_cpu = sorted_vals.T.cpu().tolist()
-        sorted_idx_cpu = sorted_flat_idx.T.cpu().tolist()
-        dbl_neg_cpu = sub_dbl_neg.T.cpu().tolist() if sub_dbl_neg is not None else None
-
-        for local_i, neuron_idx in enumerate(target_indices):
-            pos_heap = self.pos_heaps[neuron_idx]
-            neg_heap = self.neg_heaps[neuron_idx]
-            dbl_heap = self.double_neg_heaps[neuron_idx]
-            pos_res = self.pos_band_reservoirs[neuron_idx]
-            neg_res = self.neg_band_reservoirs[neuron_idx]
-            pos_mag_res = self.pos_mag_reservoirs[neuron_idx]
-            neg_mag_res = self.neg_mag_reservoirs[neuron_idx]
-
-            vals_row = sorted_vals_cpu[local_i]
-            idx_row = sorted_idx_cpu[local_i]
-            dbl_row = dbl_neg_cpu[local_i] if dbl_neg_cpu is not None else None
-            running_pos_max = max(float(curr_max_cpu[local_i]), 1e-9)
-            running_neg_max = max(abs(min(float(curr_min_cpu[local_i]), 0.0)), 1e-9)
-
-            # Collect positive entries (vals_row is descending, so positive entries are at the front)
-            pos_positions: List[int] = []
-            for rank_i, val in enumerate(vals_row):
-                if val <= 0.0:
-                    break
-                pos_positions.append(rank_i)
-                self._record_unbiased_magnitude(
-                    float(val), pos_mag_res, self._pos_mag_seen, neuron_idx
-                )
-
-            # Select candidate ranks covering top-k (including top-k true positive) AND evenly spaced quantiles
-            if len(pos_positions) <= self._reservoir_cap:
-                selected_pos_ranks = pos_positions
-            else:
-                stride = max(
-                    1,
-                    (len(pos_positions) - self.top_k) // max(1, self._reservoir_cap - self.top_k),
-                )
-                true_top_ranks: List[int] = []
-                if dbl_row is not None:
-                    for r_pos in pos_positions:
-                        if not dbl_row[idx_row[r_pos]]:
-                            true_top_ranks.append(r_pos)
-                            if len(true_top_ranks) >= self.top_k:
-                                break
-                selected_pos_ranks = list(
-                    dict.fromkeys(
-                        list(range(self.top_k))
-                        + true_top_ranks
-                        + pos_positions[self.top_k:: stride]
-                    )
-                )
-
-            for rank_i in selected_pos_ranks:
-                val = float(vals_row[rank_i])
-                r_idx = idx_row[rank_i]
-                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
-                is_dbl_neg = bool(dbl_row[r_idx]) if dbl_row is not None else False
-
-                need_top = (not is_dbl_neg or val >= 0.80 * running_pos_max) and (
-                    len(pos_heap) < self.top_k or val > pos_heap[0][0]
-                )
-                need_dbl = is_dbl_neg and (
-                    len(dbl_heap) < self.top_k or val > dbl_heap[0][0]
-                )
-                # Keep reservoir samples (including double-negative tagged samples so band rates can be measured)
-                need_res = True
-
-                if not (need_top or need_dbl or need_res):
-                    continue
-
-                sample = self._build_sample(
-                    val,
-                    f_idx,
-                    seq_len,
-                    sample_ids,
-                    tokens_per_sample,
-                    contexts_per_sample,
-                    spatial_hw=spatial_hw,
-                    is_double_negative_route=is_dbl_neg,
-                )
-                if need_top:
-                    self._push_heap(pos_heap, val, sample, self.top_k)
-                if need_dbl:
-                    self._push_heap(dbl_heap, val, sample, self.top_k)
-                if need_res:
-                    self._push_stratified_reservoir(pos_res, val, sample, running_pos_max)
-
-            # Collect negative entries from the tail (ascending magnitude from the end of vals_row)
-            neg_positions: List[int] = []
-            for rev_i in range(len(vals_row) - 1, -1, -1):
-                val = vals_row[rev_i]
-                if val >= 0.0:
-                    break
-                neg_positions.append(rev_i)
-                self._record_unbiased_magnitude(
-                    float(-val), neg_mag_res, self._neg_mag_seen, neuron_idx
-                )
-
-            if len(neg_positions) <= self._reservoir_cap:
-                selected_neg_ranks = neg_positions
-            else:
-                stride = max(
-                    1,
-                    (len(neg_positions) - self.top_k) // max(1, self._reservoir_cap - self.top_k),
-                )
-                selected_neg_ranks = (
-                    neg_positions[: self.top_k] + neg_positions[self.top_k:: stride]
-                )
-
-            for rank_pos, rev_i in enumerate(selected_neg_ranks):
-                val = float(vals_row[rev_i])
-                mag = -val
-                r_idx = idx_row[rev_i]
-                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
-
-                need_top = rank_pos < self.top_k and (
-                    len(neg_heap) < self.top_k or mag > neg_heap[0][0]
-                )
-                sample = self._build_sample(
-                    val,
-                    f_idx,
-                    seq_len,
-                    sample_ids,
-                    tokens_per_sample,
-                    contexts_per_sample,
-                    spatial_hw=spatial_hw,
-                    is_double_negative_route=False,
-                )
-                if need_top:
-                    self._push_heap(neg_heap, mag, sample, self.top_k)
-                self._push_stratified_reservoir(neg_res, mag, sample, running_neg_max)
-
-    def _update_heaps_and_reservoirs_fast(
+    def _update_chunk(
         self,
-        sub_acts: torch.Tensor,
-        sub_dbl_neg: Optional[torch.Tensor],
-        target_indices: List[int],
-        valid_idx_cpu: Optional[List[int]],
-        curr_max_cpu: List[float],
-        curr_min_cpu: List[float],
-        seq_len: int,
-        sample_ids: Optional[List[int]],
-        tokens_per_sample: Optional[List[List[str]]],
-        contexts_per_sample: Optional[List[str]],
-        spatial_hw: Optional[Tuple[int, int]],
+        mags: torch.Tensor,
+        regime: torch.Tensor,
+        codes_rows: torch.Tensor,
+        c0: int,
+        c1: int,
     ) -> None:
-        """
-        High-throughput O(k * D) top-k and reservoir extraction for wide layers (e.g. d_mlp >= 4096).
-        Uses `torch.topk` on device and a small strided batch subset instead of full-matrix sort.
-        """
-        batch_n = sub_acts.shape[0]
-        k = min(self.top_k, batch_n)
+        N, Dc = mags.shape
+        R = len(self.regimes)
+        dev = self.device
+        valid = regime >= 0
 
-        pos_top_vals, pos_top_idx = torch.topk(sub_acts, k=k, dim=0, largest=True)
-        neg_top_vals, neg_top_idx = torch.topk(sub_acts, k=k, dim=0, largest=False)
+        # histogram (exact)
+        b_idx = self._bin_index(mags)
+        col = torch.arange(Dc, device=dev).unsqueeze(0).expand(N, Dc)
+        flat_bin = (regime.to(torch.long) * Dc + col) * self.n_bins + b_idx
+        counts = torch.bincount(flat_bin[valid], minlength=R * Dc * self.n_bins)
+        self.hist[:, c0:c1, :] += counts.view(R, Dc, self.n_bins).to(torch.int32)
 
-        # Sample up to 6 evenly spaced rows across the batch for unbiased magnitude & band reservoirs
-        n_stride = min(6, batch_n)
-        stride_step = max(1, batch_n // n_stride)
-        sample_row_ids = list(range(0, batch_n, stride_step))[:n_stride]
-        stride_vals = sub_acts[sample_row_ids, :]
+        # per-regime exact top-k (magnitudes)
+        K = self.top_k
+        k_new = min(K, N)
+        neg_inf = torch.tensor(float("-inf"), dtype=mags.dtype, device=dev)
+        for r in range(R):
+            masked = torch.where(regime == r, mags, neg_inf)
+            v_new, i_new = torch.topk(masked, k=k_new, dim=0)
+            code_new = codes_rows[i_new]
+            code_new = torch.where(torch.isfinite(v_new), code_new, torch.full_like(code_new, -1))
+            v_cat = torch.cat([self.top_vals[r, :, c0:c1], v_new], dim=0)
+            c_cat = torch.cat([self.top_codes[r, :, c0:c1], code_new], dim=0)
+            v_top, i_top = torch.topk(v_cat, k=K, dim=0)
+            self.top_vals[r, :, c0:c1] = v_top
+            self.top_codes[r, :, c0:c1] = torch.gather(c_cat, 0, i_top)
 
-        pos_vals_cpu = pos_top_vals.T.cpu().tolist()
-        pos_idx_cpu = pos_top_idx.T.cpu().tolist()
-        neg_vals_cpu = neg_top_vals.T.cpu().tolist()
-        neg_idx_cpu = neg_top_idx.T.cpu().tolist()
-        stride_vals_cpu = stride_vals.T.cpu().tolist()
+        # uniform bottom-k reservoir per (pole, octave)
+        C = self.samples_per_octave
+        if C <= 0:
+            return
+        octv = self._octave_index(mags)
+        keys = torch.rand((N, Dc), generator=self._generator).to(dev)
+        bounds_lo = torch.arange(self.n_octaves, device=dev, dtype=torch.float32)
+        bounds_hi = bounds_lo + 1.0
+        for p, pole in enumerate((PoleType.POSITIVE, PoleType.NEGATIVE)):
+            pole_codes = self._regime_codes_for_pole(pole)
+            pole_mask = torch.zeros_like(valid)
+            for rc in pole_codes:
+                pole_mask |= regime == rc
+            if not bool(pole_mask.any()):
+                continue
+            composite = torch.where(pole_mask, octv.to(torch.float32) + keys, torch.full_like(keys, float("inf")))
+            sorted_c, perm = torch.sort(composite, dim=0)
+            sc_t = sorted_c.T.contiguous()                       # [Dc, N]
+            perm_t = perm.T.contiguous()
+            lo = torch.searchsorted(sc_t, bounds_lo.unsqueeze(0).expand(Dc, -1).contiguous())  # [Dc, n_oct]
+            hi = torch.searchsorted(sc_t, bounds_hi.unsqueeze(0).expand(Dc, -1).contiguous())
+            cand_keys = torch.full((Dc, self.n_octaves, C), float("inf"), dtype=torch.float32, device=dev)
+            cand_vals = torch.zeros((Dc, self.n_octaves, C), dtype=torch.float32, device=dev)
+            cand_codes = torch.full((Dc, self.n_octaves, C), -1, dtype=torch.long, device=dev)
+            cand_reg = torch.full((Dc, self.n_octaves, C), -1, dtype=torch.int8, device=dev)
+            mags_t = mags.T
+            reg_t = regime.T
+            for j in range(C):
+                pos_j = lo + j
+                ok = pos_j < hi
+                pos_c = torch.clamp(pos_j, max=N - 1)
+                rows = torch.gather(perm_t, 1, pos_c)                        # [Dc, n_oct]
+                kv = torch.gather(sc_t, 1, pos_c) - bounds_lo.unsqueeze(0)
+                cand_keys[:, :, j] = torch.where(ok, kv, torch.full_like(kv, float("inf")))
+                cand_vals[:, :, j] = torch.gather(mags_t, 1, rows)
+                cand_codes[:, :, j] = torch.where(ok, codes_rows[rows], torch.full_like(rows, -1))
+                cand_reg[:, :, j] = torch.where(ok, torch.gather(reg_t, 1, rows), torch.full_like(rows, -1, dtype=torch.int8))
+            all_keys = torch.cat([self.res_keys[p, c0:c1], cand_keys], dim=-1)
+            all_vals = torch.cat([self.res_vals[p, c0:c1], cand_vals], dim=-1)
+            all_codes = torch.cat([self.res_codes[p, c0:c1], cand_codes], dim=-1)
+            all_reg = torch.cat([self.res_regime[p, c0:c1], cand_reg], dim=-1)
+            kk, ki = torch.topk(all_keys, k=C, dim=-1, largest=False)
+            self.res_keys[p, c0:c1] = kk
+            self.res_vals[p, c0:c1] = torch.gather(all_vals, -1, ki)
+            self.res_codes[p, c0:c1] = torch.gather(all_codes, -1, ki)
+            self.res_regime[p, c0:c1] = torch.gather(all_reg, -1, ki)
 
-        if sub_dbl_neg is not None:
-            pos_dbl_cpu = torch.gather(sub_dbl_neg, 0, pos_top_idx).T.cpu().tolist()
-            stride_dbl_cpu = sub_dbl_neg[sample_row_ids, :].T.cpu().tolist()
-        else:
-            pos_dbl_cpu = None
-            stride_dbl_cpu = None
+    def _referenced_internal_indices(self) -> torch.Tensor:
+        codes = torch.cat([self.top_codes.reshape(-1), self.res_codes.reshape(-1)])
+        codes = codes[codes >= 0]
+        return torch.unique(codes // POS_BASE)
 
-        for local_i, neuron_idx in enumerate(target_indices):
-            pos_heap = self.pos_heaps[neuron_idx]
-            neg_heap = self.neg_heaps[neuron_idx]
-            dbl_heap = self.double_neg_heaps[neuron_idx]
-            pos_res = self.pos_band_reservoirs[neuron_idx]
-            neg_res = self.neg_band_reservoirs[neuron_idx]
-            pos_mag_res = self.pos_mag_reservoirs[neuron_idx]
-            neg_mag_res = self.neg_mag_reservoirs[neuron_idx]
+    def _maybe_compact_registry(self) -> None:
+        # Memory management only: drop samples no stored example points to any more.
+        if len(self.registry) <= 4 * max(self.top_k, 1) * max(len(self.regimes), 1) + 1024:
+            return
+        ref = set(int(i) for i in self._referenced_internal_indices().tolist())
+        if len(self.registry) > 2 * len(ref):
+            self.registry = {k: v for k, v in self.registry.items() if k in ref}
 
-            running_pos_max = max(float(curr_max_cpu[local_i]), 1e-9)
-            running_neg_max = max(abs(min(float(curr_min_cpu[local_i]), 0.0)), 1e-9)
-
-            p_vals = pos_vals_cpu[local_i]
-            p_idxs = pos_idx_cpu[local_i]
-            p_dbls = pos_dbl_cpu[local_i] if pos_dbl_cpu is not None else None
-            p_min_heap = pos_heap[0][0] if len(pos_heap) >= self.top_k else float("-inf")
-
-            for j in range(k):
-                val = float(p_vals[j])
-                if val <= 0.0:
-                    break
-                r_idx = p_idxs[j]
-                is_dbl = bool(p_dbls[j]) if p_dbls is not None else False
-                need_top = (not is_dbl or val >= 0.80 * running_pos_max) and (
-                    len(pos_heap) < self.top_k or val > p_min_heap
-                )
-                need_dbl = is_dbl and (len(dbl_heap) < self.top_k or val > dbl_heap[0][0])
-                need_res = len(pos_res) < self._reservoir_cap
-                if not (need_top or need_dbl or need_res):
-                    continue
-                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
-                sample = self._build_sample(
-                    val,
-                    f_idx,
-                    seq_len,
-                    sample_ids,
-                    tokens_per_sample,
-                    contexts_per_sample,
-                    spatial_hw=spatial_hw,
-                    is_double_negative_route=is_dbl,
-                )
-                if need_top:
-                    self._push_heap(pos_heap, val, sample, self.top_k)
-                    p_min_heap = pos_heap[0][0] if len(pos_heap) >= self.top_k else float("-inf")
-                if need_dbl:
-                    self._push_heap(dbl_heap, val, sample, self.top_k)
-                if need_res:
-                    self._push_stratified_reservoir(pos_res, val, sample, running_pos_max)
-
-            n_vals = neg_vals_cpu[local_i]
-            n_idxs = neg_idx_cpu[local_i]
-            n_min_heap = neg_heap[0][0] if len(neg_heap) >= self.top_k else float("-inf")
-
-            for j in range(k):
-                val = float(n_vals[j])
-                if val >= 0.0:
-                    break
-                mag = -val
-                r_idx = n_idxs[j]
-                need_top = len(neg_heap) < self.top_k or mag > n_min_heap
-                need_res = len(neg_res) < self._reservoir_cap
-                if not (need_top or need_res):
-                    continue
-                f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
-                sample = self._build_sample(
-                    val,
-                    f_idx,
-                    seq_len,
-                    sample_ids,
-                    tokens_per_sample,
-                    contexts_per_sample,
-                    spatial_hw=spatial_hw,
-                    is_double_negative_route=False,
-                )
-                if need_top:
-                    self._push_heap(neg_heap, mag, sample, self.top_k)
-                    n_min_heap = neg_heap[0][0] if len(neg_heap) >= self.top_k else float("-inf")
-                if need_res:
-                    self._push_stratified_reservoir(neg_res, mag, sample, running_neg_max)
-
-            # Update unbiased magnitude reservoirs & intermediate bands from strided batch rows
-            s_vals = stride_vals_cpu[local_i]
-            s_dbls = stride_dbl_cpu[local_i] if stride_dbl_cpu is not None else None
-            for s_pos, r_idx in enumerate(sample_row_ids):
-                val = float(s_vals[s_pos])
-                if val > 0.0:
-                    self._record_unbiased_magnitude(
-                        val, pos_mag_res, self._pos_mag_seen, neuron_idx
-                    )
-                    if 0.15 * running_pos_max <= val < 0.80 * running_pos_max and (
-                        len(pos_res) < self._reservoir_cap or s_pos == 0
-                    ):
-                        f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
-                        is_dbl = bool(s_dbls[s_pos]) if s_dbls is not None else False
-                        sample = self._build_sample(
-                            val,
-                            f_idx,
-                            seq_len,
-                            sample_ids,
-                            tokens_per_sample,
-                            contexts_per_sample,
-                            spatial_hw=spatial_hw,
-                            is_double_negative_route=is_dbl,
-                        )
-                        self._push_stratified_reservoir(pos_res, val, sample, running_pos_max)
-                elif val < 0.0:
-                    mag = -val
-                    self._record_unbiased_magnitude(
-                        mag, neg_mag_res, self._neg_mag_seen, neuron_idx
-                    )
-                    if 0.15 * running_neg_max <= mag < 0.80 * running_neg_max and (
-                        len(neg_res) < self._reservoir_cap or s_pos == 0
-                    ):
-                        f_idx = valid_idx_cpu[r_idx] if valid_idx_cpu is not None else r_idx
-                        sample = self._build_sample(
-                            val,
-                            f_idx,
-                            seq_len,
-                            sample_ids,
-                            tokens_per_sample,
-                            contexts_per_sample,
-                            spatial_hw=spatial_hw,
-                            is_double_negative_route=False,
-                        )
-                        self._push_stratified_reservoir(neg_res, mag, sample, running_neg_max)
-
-    @staticmethod
-    def _build_sample(
-        val: float,
-        flat_idx: int,
-        seq_len: int,
-        sample_ids: Optional[List[int]],
-        tokens_per_sample: Optional[List[List[str]]],
-        contexts_per_sample: Optional[List[str]],
-        spatial_hw: Optional[Tuple[int, int]] = None,
-        is_double_negative_route: bool = False,
-    ) -> ActivationSample:
-        b_idx = flat_idx // seq_len
-        pos_idx = flat_idx % seq_len
-        s_id = sample_ids[b_idx] if sample_ids and b_idx < len(sample_ids) else b_idx
-        tok_str = None
-        next_tok_str = None
-        window_str = None
-
-        if tokens_per_sample and b_idx < len(tokens_per_sample):
-            tok_list = tokens_per_sample[b_idx]
-            if pos_idx < len(tok_list):
-                tok_str = tok_list[pos_idx]
-                next_tok_str = tok_list[pos_idx + 1] if (pos_idx + 1) < len(tok_list) else "<eos>"
-                start_w = max(0, pos_idx - 2)
-                end_w = min(len(tok_list), pos_idx + 3)
-                prefix = " ".join(tok_list[start_w:pos_idx])
-                suffix = " ".join(tok_list[pos_idx + 1: end_w])
-                focal = f"[{tok_str}] -> {next_tok_str}"
-                parts = [p for p in (prefix, focal, suffix) if p]
-                window_str = " ".join(parts)
-        elif spatial_hw is not None:
-            # Automatic Vision / Conv2d patch coordinate label when no text tokens are supplied
-            h_dim, w_dim = spatial_hw
-            row, col = pos_idx // w_dim, pos_idx % w_dim
-            tok_str = f"patch_({row},{col})"
-            window_str = tok_str
-
-        ctx_str = (
-            contexts_per_sample[b_idx]
-            if contexts_per_sample and b_idx < len(contexts_per_sample)
-            else (f"image_sample_{s_id}" if spatial_hw is not None else None)
-        )
+    # ------------------------------------------------------------------
+    # Sample decoding
+    # ------------------------------------------------------------------
+    def _decode_sample(self, code: int, value: float, regime_code: int, pole_extreme: float) -> ActivationSample:
+        internal, pos = divmod(int(code), POS_BASE)
+        sid, toks, ctx, spatial = self.registry.get(internal, (internal, None, None, None))
+        token = nxt = window = None
+        if toks is not None and pos < len(toks):
+            token = toks[pos]
+            nxt = toks[pos + 1] if pos + 1 < len(toks) else None
+            pre = "".join(toks[max(0, pos - self.window_tokens_before): pos])
+            post = "".join(toks[pos + 1: pos + 1 + self.window_tokens_after])
+            window = f"{pre}[[{token}]]{post}"
+        elif spatial is not None:
+            h, w = spatial
+            token = f"patch_({pos // w},{pos % w})"
+            window = token
+        regime = self.regimes[regime_code].value if 0 <= regime_code < len(self.regimes) else None
+        frac = abs(value) / abs(pole_extreme) if pole_extreme not in (0.0, float("inf"), float("-inf")) else None
         return ActivationSample(
-            activation_value=float(val),
-            sample_id=s_id,
-            position_idx=pos_idx,
-            token_str=tok_str,
-            context_str=ctx_str,
-            next_token_str=next_tok_str,
-            window_str=window_str,
-            is_double_negative_route=is_double_negative_route,
+            activation_value=float(value),
+            sample_id=sid,
+            position_idx=pos,
+            token_str=token,
+            context_str=ctx,
+            next_token_str=nxt,
+            window_str=window,
+            sign_regime=regime,
+            fraction_of_pole_extreme=round(frac, 6) if frac is not None else None,
         )
 
-    def _push_heap(
+    # ------------------------------------------------------------------
+    # Thresholds
+    # ------------------------------------------------------------------
+    def pole_histogram(self, neuron_idx: int, pole: PoleType) -> torch.Tensor:
+        codes = self._regime_codes_for_pole(pole)
+        return self.hist[codes, neuron_idx, :].to(torch.long).sum(dim=0)
+
+    def pole_extreme_magnitude(self, neuron_idx: int, pole: PoleType) -> float:
+        if pole == PoleType.POSITIVE:
+            v = float(self.max_val[neuron_idx].item())
+            return v if v > 0 else 0.0
+        v = float(self.min_val[neuron_idx].item())
+        return -v if v < 0 else 0.0
+
+    def percentile_within_pole(self, neuron_idx: int, pole: PoleType, percentile: float) -> float:
+        """
+        Magnitude below which `percentile`% of this pole's activations fall, read from the exact
+        log-magnitude histogram with log-linear interpolation inside the bin (relative resolution
+        2^(1/bins_per_octave)).
+        """
+        if not 0.0 < percentile < 100.0:
+            raise ValueError("percentile must be in (0, 100)")
+        h = self.pole_histogram(neuron_idx, pole)
+        total = int(h.sum().item())
+        if total == 0:
+            return 0.0
+        target = percentile / 100.0 * total
+        cum = torch.cumsum(h, dim=0)
+        b = int(torch.searchsorted(cum, torch.tensor(target, dtype=cum.dtype)).item())
+        b = min(b, self.n_bins - 1)
+        prev = int(cum[b - 1].item()) if b > 0 else 0
+        in_bin = int(h[b].item())
+        frac = (target - prev) / in_bin if in_bin > 0 else 0.0
+        extreme = self.pole_extreme_magnitude(neuron_idx, pole)
+        if b == 0:
+            return frac * min(2.0 ** self.min_exponent, extreme)
+        if b == self.n_bins - 1:
+            lo = self._bin_lower_value(b)
+            return lo + frac * max(extreme - lo, 0.0)
+        lo_exp = self.min_exponent + (b - 1) / self.bins_per_octave
+        return min(2.0 ** (lo_exp + frac / self.bins_per_octave), extreme)
+
+    def compute_thresholds(
         self,
-        heap: List[Tuple[float, int, ActivationSample]],
-        priority: float,
-        sample: ActivationSample,
-        max_len: int,
-    ) -> None:
-        self._tie_breaker += 1
-        item = (priority, self._tie_breaker, sample)
-        if len(heap) < max_len:
-            heapq.heappush(heap, item)
-        elif priority > heap[0][0]:
-            heapq.heapreplace(heap, item)
-
-    def _push_stratified_reservoir(
-        self,
-        reservoir: List[Tuple[float, int, ActivationSample]],
-        magnitude: float,
-        sample: ActivationSample,
-        running_pole_max: float,
-    ) -> None:
-        """
-        Maintains a stratified pool of active samples across all quantile bands
-        (`peak_trunk` >= 0.80, `secondary_branch` [0.40..0.80), `tertiary_offshoot` [0.15..0.40)).
-        Unlike naive nearest-neighbor replacement, each band has a protected quota of
-        `self._reservoir_cap // 3` slots, preventing new peak activations from collapsing
-        onto a single slot or starving intermediate bands.
-        """
-        self._tie_breaker += 1
-        item = (magnitude, self._tie_breaker, sample)
-        if len(reservoir) < self._reservoir_cap:
-            reservoir.append(item)
-            return
-
-        pole_max = max(running_pole_max, magnitude, max((x[0] for x in reservoir), default=1e-9))
-
-        def _band_of(mag_val: float) -> int:
-            r = mag_val / pole_max
-            if r >= 0.80:
-                return 0  # peak_trunk
-            elif r >= 0.40:
-                return 1  # secondary_branch
-            elif r >= 0.15:
-                return 2  # tertiary_offshoot
-            return 3      # sub-tertiary (< 15% of max)
-
-        target_band = _band_of(magnitude)
-        if target_band == 3:
-            return
-
-        band_indices: Dict[int, List[int]] = {0: [], 1: [], 2: [], 3: []}
-        for idx, (m_val, _, _) in enumerate(reservoir):
-            band_indices[_band_of(m_val)].append(idx)
-
-        # 1. Always evict sub-tertiary (< 15% of current max) entries first
-        if band_indices[3]:
-            evict_idx = band_indices[3][0]
-            reservoir[evict_idx] = item
-            return
-
-        # 2. If another band is over-represented (> cap // 3), evict from the largest band
-        quota = max(1, self._reservoir_cap // 3)
-        if len(band_indices[target_band]) < quota:
-            overfull_band = max((0, 1, 2), key=lambda b: len(band_indices[b]))
-            candidates = band_indices[overfull_band]
-        else:
-            candidates = band_indices[target_band]
-
-        if candidates:
-            evict_idx = self._rng.choice(candidates)
-            reservoir[evict_idx] = item
-
-    def _build_quantile_buckets(
-        self,
-        neuron_idx: int,
-        is_positive: bool,
-        pole_max_abs: float,
-    ) -> Tuple[Dict[str, List[ActivationSample]], Dict[str, float]]:
-        """
-        Partitions collected samples for a pole into Cammarata's Stratified Quantile Bands:
-          - `peak_trunk`:        [0.80 * max_abs, 1.00 * max_abs]
-          - `secondary_branch`:  [0.40 * max_abs, 0.80 * max_abs)
-          - `tertiary_offshoot`: [0.15 * max_abs, 0.40 * max_abs)
-        Also computes per-band SwiGLU double-negative rates (`double_negative_band_rates`)
-        before filtering double-negative (`gate < 0, up < 0`) samples out of true positive
-        quantile buckets (unless no true positive `gate > 0, up > 0` samples exist in a band).
-        """
-        buckets: Dict[str, List[ActivationSample]] = {
-            name: [] for name, _, _ in self.QUANTILE_BAND_SPECS
-        }
-        band_dbl_rates: Dict[str, float] = {
-            name: 0.0 for name, _, _ in self.QUANTILE_BAND_SPECS
-        }
-        if pole_max_abs <= 1e-9:
-            return buckets, band_dbl_rates
-
-        heap_items = (
-            self.pos_heaps.get(neuron_idx, []) + self.double_neg_heaps.get(neuron_idx, [])
-            if is_positive
-            else self.neg_heaps.get(neuron_idx, [])
-        )
-        res_items = (
-            self.pos_band_reservoirs.get(neuron_idx, [])
-            if is_positive
-            else self.neg_band_reservoirs.get(neuron_idx, [])
-        )
-
-        # Deduplicate all candidate samples by (sample_id, position_idx, round(activation_value, 6))
-        seen = set()
-        all_candidates: List[ActivationSample] = []
-        for mag, _, s in sorted(heap_items + res_items, key=lambda x: x[0], reverse=True):
-            key = (s.sample_id, s.position_idx, round(s.activation_value, 6))
-            if key not in seen and mag > 0:
-                seen.add(key)
-                all_candidates.append(s)
-
-        has_true_positive = any(not s.is_double_negative_route for s in all_candidates)
-        band_totals: Dict[str, int] = {name: 0 for name, _, _ in self.QUANTILE_BAND_SPECS}
-        band_dbls: Dict[str, int] = {name: 0 for name, _, _ in self.QUANTILE_BAND_SPECS}
-
-        for s in all_candidates:
-            ratio = abs(s.activation_value) / pole_max_abs
-            for band_name, low_r, high_r in self.QUANTILE_BAND_SPECS:
-                if low_r <= ratio <= high_r:
-                    band_totals[band_name] += 1
-                    if s.is_double_negative_route:
-                        band_dbls[band_name] += 1
-                    if is_positive and s.is_double_negative_route and has_true_positive:
-                        break
-                    tagged = ActivationSample(
-                        activation_value=s.activation_value,
-                        sample_id=s.sample_id,
-                        position_idx=s.position_idx,
-                        token_str=s.token_str,
-                        context_str=s.context_str,
-                        quantile_band=band_name,
-                        next_token_str=s.next_token_str,
-                        window_str=s.window_str,
-                        is_double_negative_route=s.is_double_negative_route,
-                    )
-                    if len(buckets[band_name]) < self.top_k:
-                        buckets[band_name].append(tagged)
-                    break
-
-        for band_name, _, _ in self.QUANTILE_BAND_SPECS:
-            tot = band_totals[band_name]
-            band_dbl_rates[band_name] = round(band_dbls[band_name] / tot, 4) if tot > 0 else 0.0
-
-        return buckets, band_dbl_rates
-
-    @staticmethod
-    def _classify_pole_prior(
-        pole_selectivity: float,
-        pole_firing_rate: float,
-        pole_std: float,
-        other_pole_rate: float = 0.0,
-        outgoing_weight_norm: float = 1.0,
-    ) -> SparsityTailPrior:
-        """Assigns the statistical SparsityTailPrior for a single pole."""
-        if pole_std < 1e-6 or outgoing_weight_norm < 1e-5 or pole_firing_rate < 1e-4:
-            return SparsityTailPrior.DEAD_OR_FLAT
-        if pole_firing_rate <= 0.20 and pole_selectivity >= 1.85:
-            return SparsityTailPrior.SPARSE_DETECTOR
-        if pole_firing_rate >= 0.05 and other_pole_rate >= 0.05 and pole_selectivity >= 1.35:
-            return SparsityTailPrior.BIPOLAR_ROUTER_CANDIDATE
-        if pole_selectivity >= 1.25:
-            return SparsityTailPrior.GRADED_DIAL
-        return SparsityTailPrior.DENSE_UNSELECTIVE
-
-    @staticmethod
-    def _classify_pole_taxonomy(
-        pole_selectivity: float,
-        pole_firing_rate: float,
-        pole_std: float,
-        outgoing_weight_norm: float = 1.0,
-    ) -> NeuronTaxonomy:
-        """Classifies an individual neuron pole (Positive or Negative) independently."""
-        if pole_std < 1e-6 or outgoing_weight_norm < 1e-5 or pole_firing_rate < 1e-4:
-            return NeuronTaxonomy.DEAD_OR_NOISY
-        elif pole_selectivity >= 2.05:
-            return NeuronTaxonomy.CLEAN_MONOSEMANTIC
-        elif pole_selectivity >= 1.48:
-            return NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE
-        else:
-            return NeuronTaxonomy.TRUE_POLYSEMANTIC
-
-    def _compute_pole_selectivities_and_stds(
-        self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Computes conditional standard deviations and null-calibrated tail-selectivity scores
-        for both the Positive Pole and Negative Pole across all neurons in the layer.
-
-        Statistical Calibration against the Gaussian / SwiGLU Null:
-          - For two independent standard normal projections G, U ~ N(0, 1), the SwiGLU
-            bilinear product `a = SiLU(G) * U` fires positively ~50% of the time (`p_pole ~ 0.50`)
-            with theoretical conditional positive kurtosis `kappa_+ ~ 9.0` (`9.0^0.25 = 1.732`).
-          - Uncalibrated `(kurt^0.25) * (1 / p_pole)^0.25` gave `1.732 * 1.189 = 2.06 >= 1.95`
-            on 100% random white-noise SwiGLU neurons!
-          - Here:
-            1. Sparsity boost is referenced to a genuine sparse firing rate `p_ref = 0.20`:
-               `sparsity_factor = (0.20 / max(p_pole, 1e-4))^0.25`, which boosts sparse
-               detectors (`p_pole < 0.20`) and penalizes dense coin-flip firing (`p_pole ~ 0.50`).
-            2. For dense poles (`p_pole > 0.25`), the SwiGLU/Gaussian baseline kurtosis (`13.5`)
-               is subtracted (`eff_kurt = clamp(kurt - 13.5, min=1.0)`), ensuring random-init
-               SwiGLU layers score near `0.8 - 1.2` instead of masquerading as clean detectors.
-        """
-        n_total = float(max(self.count, 1))
-
-        overall_std = torch.sqrt(torch.clamp(self.m2 / n_total, min=1e-12))
-
-        pos_n = torch.clamp(self.pos_count.to(torch.float64), min=1.0)
-        pos_rate = pos_n / n_total
-        pos_var = self.pos_m2 / pos_n
-        pos_std = torch.sqrt(torch.clamp(pos_var, min=1e-12))
-        pos_kurt = (self.pos_m4 / pos_n) / (pos_var.pow(2) + 1e-12)
-        pos_null_kurt = torch.where(pos_rate > 0.25, 22.0, 12.5)
-        pos_eff_kurt = torch.clamp(pos_kurt - pos_null_kurt, min=1.0)
-        pos_snr = torch.where(
-            self.pos_count == 1,
-            torch.full_like(self.pos_mean, 6.0),
-            self.pos_mean.abs() / torch.clamp(pos_std, min=1e-6),
-        )
-        pos_focal_kurt = torch.where(
-            (pos_rate <= 0.15) & (self.pos_mean.abs() >= overall_std),
-            torch.clamp((pos_snr - 2.0) * 6.0, min=1.0, max=64.0),
-            torch.ones_like(pos_snr),
-        )
-        pos_eff_kurt = torch.maximum(pos_eff_kurt, pos_focal_kurt)
-        pos_raw_sparsity = (0.20 / torch.clamp(pos_rate, min=1e-4)).pow(0.25)
-        pos_sparsity_factor = torch.where(
-            pos_eff_kurt > 1.05,
-            pos_raw_sparsity,
-            torch.clamp(pos_raw_sparsity, max=1.0),
-        )
-        pos_sel = torch.where(
-            self.pos_count > 0,
-            torch.clamp(pos_eff_kurt.pow(0.25) * pos_sparsity_factor, min=0.0, max=100.0),
-            torch.zeros_like(pos_var),
-        )
-
-        # When SwiGLU 4-quadrant sign regimes are tracked, also evaluate the uncontaminated
-        # True Positive (+ x +, gate > 0 and up > 0) moments so double-negative (- x -) echoes
-        # do not dilute positive pole kurtosis or falsely inflate firing rate into the dense regime.
-        if (self.true_pos_count > 0).any():
-            tp_n = torch.clamp(self.true_pos_count.to(torch.float64), min=1.0)
-            tp_rate = tp_n / n_total
-            tp_var = self.true_pos_m2 / tp_n
-            tp_std = torch.sqrt(torch.clamp(tp_var, min=1e-12))
-            tp_kurt = (self.true_pos_m4 / tp_n) / (tp_var.pow(2) + 1e-12)
-            # Under random-init SwiGLU (G, U ~ N(0,1)), P(G>0, U>0) = 0.25
-            tp_null_kurt = torch.where(tp_rate > 0.18, 22.0, 12.5)
-            tp_eff_kurt = torch.clamp(tp_kurt - tp_null_kurt, min=1.0)
-            tp_snr = torch.where(
-                self.true_pos_count == 1,
-                torch.full_like(self.true_pos_mean, 6.0),
-                self.true_pos_mean.abs() / torch.clamp(tp_std, min=1e-6),
-            )
-            tp_focal_kurt = torch.where(
-                (tp_rate <= 0.12) & (self.true_pos_mean.abs() >= overall_std),
-                torch.clamp((tp_snr - 2.0) * 6.0, min=1.0, max=64.0),
-                torch.ones_like(tp_snr),
-            )
-            tp_eff_kurt = torch.maximum(tp_eff_kurt, tp_focal_kurt)
-            tp_raw_sparsity = (0.18 / torch.clamp(tp_rate, min=1e-4)).pow(0.25)
-            tp_sparsity_factor = torch.where(
-                tp_eff_kurt > 1.05,
-                tp_raw_sparsity,
-                torch.clamp(tp_raw_sparsity, max=1.0),
-            )
-            tp_sel = torch.where(
-                self.true_pos_count > 0,
-                torch.clamp(tp_eff_kurt.pow(0.25) * tp_sparsity_factor, min=0.0, max=100.0),
-                torch.zeros_like(tp_var),
-            )
-            pos_sel = torch.maximum(pos_sel, tp_sel)
-            pos_std = torch.where(self.true_pos_count > 0, torch.maximum(pos_std, tp_std), pos_std)
-
-        neg_n = torch.clamp(self.neg_count.to(torch.float64), min=1.0)
-        neg_rate = neg_n / n_total
-        neg_var = self.neg_m2 / neg_n
-        neg_std = torch.sqrt(torch.clamp(neg_var, min=1e-12))
-        neg_kurt = (self.neg_m4 / neg_n) / (neg_var.pow(2) + 1e-12)
-        neg_null_kurt = torch.where(neg_rate > 0.25, 22.0, 12.5)
-        neg_eff_kurt = torch.clamp(neg_kurt - neg_null_kurt, min=1.0)
-        neg_snr = torch.where(
-            self.neg_count == 1,
-            torch.full_like(self.neg_mean, 6.0),
-            self.neg_mean.abs() / torch.clamp(neg_std, min=1e-6),
-        )
-        neg_focal_kurt = torch.where(
-            (neg_rate <= 0.15) & (self.neg_mean.abs() >= overall_std),
-            torch.clamp((neg_snr - 2.0) * 6.0, min=1.0, max=64.0),
-            torch.ones_like(neg_snr),
-        )
-        neg_eff_kurt = torch.maximum(neg_eff_kurt, neg_focal_kurt)
-        neg_raw_sparsity = (0.20 / torch.clamp(neg_rate, min=1e-4)).pow(0.25)
-        neg_sparsity_factor = torch.where(
-            neg_eff_kurt > 1.05,
-            neg_raw_sparsity,
-            torch.clamp(neg_raw_sparsity, max=1.0),
-        )
-        neg_sel = torch.where(
-            self.neg_count > 0,
-            torch.clamp(neg_eff_kurt.pow(0.25) * neg_sparsity_factor, min=0.0, max=100.0),
-            torch.zeros_like(neg_var),
-        )
-
-        return pos_std, pos_sel, neg_std, neg_sel
-
-    def _compute_token_selectivity_and_motifs(
-        self, neuron_idx: int, pos_rate: float, neg_rate: float, pos_std: float, neg_std: float
-    ) -> Tuple[float, float, float, float, str]:
-        """
-        Computes token-conditional lexical consistency and firing motif diagnostics
-        (Cammarata: 'What Do Neurons Actually Compute?') from collected samples:
-          - `lexical_selectivity_r2`: token-group ANOVA variance ratio R^2 = SS_between / SS_total
-            (or top-token concentration when sample count is small)
-          - `current_token_concentration`: share of active samples on the top-2 focal tokens
-          - `next_token_concentration`: share of active samples on the top-2 next tokens
-          - `punctuation_firing_rate`: share of active samples firing on punctuation / clause boundaries
-          - `inferred_firing_motif`: 'current_token_detector' | 'next_token_preparer' |
-            'punctuation_consolidation' | 'bipolar_router' | 'distributed_contextual'
-        """
-        seen = set()
-        samples: List[ActivationSample] = []
-        for _, _, s in (
-            self.pos_heaps.get(neuron_idx, [])
-            + self.neg_heaps.get(neuron_idx, [])
-            + self.pos_band_reservoirs.get(neuron_idx, [])
-            + self.neg_band_reservoirs.get(neuron_idx, [])
-        ):
-            key = (s.sample_id, s.position_idx, round(s.activation_value, 6))
-            if key not in seen:
-                seen.add(key)
-                samples.append(s)
-
-        tok_samples = [s for s in samples if s.token_str is not None]
-        if not tok_samples:
-            motif = (
-                "bipolar_router"
-                if (pos_rate >= 0.05 and neg_rate >= 0.05 and pos_std > 0.1 and neg_std > 0.1)
-                else "distributed_contextual"
-            )
-            return 0.0, 0.0, 0.0, 0.0, motif
-
-        def _norm_tok(t: Optional[str]) -> str:
-            if not t:
-                return ""
-            stripped = t.lstrip("Ġ▁ ").strip()
-            return stripped if stripped else t
-
-        n_tok = len(tok_samples)
-        tok_counts = Counter(_norm_tok(s.token_str) for s in tok_samples if s.token_str)
-        top2_curr = sum(c for _, c in tok_counts.most_common(2))
-        curr_conc = float(top2_curr / max(n_tok, 1))
-
-        next_valid = [
-            _norm_tok(s.next_token_str)
-            for s in tok_samples
-            if s.next_token_str is not None and s.next_token_str != "<eos>"
-        ]
-        if next_valid:
-            next_counts = Counter(next_valid)
-            top2_next = sum(c for _, c in next_counts.most_common(2))
-            next_conc = float(top2_next / len(next_valid))
-        else:
-            next_conc = 0.0
-
-        # Also evaluate top-heap concentrations per pole independently so opposite poles and
-        # low-amplitude tertiary reservoirs do not dilute peak current/next-token detectors.
-        for pole_heap in (self.pos_heaps.get(neuron_idx, []), self.neg_heaps.get(neuron_idx, [])):
-            p_toks = [_norm_tok(s.token_str) for _, _, s in pole_heap if s.token_str]
-            if len(p_toks) >= 3:
-                p_curr = sum(c for _, c in Counter(p_toks).most_common(2)) / float(len(p_toks))
-                curr_conc = max(curr_conc, p_curr)
-            p_next = [
-                _norm_tok(s.next_token_str)
-                for _, _, s in pole_heap
-                if s.next_token_str is not None and s.next_token_str != "<eos>"
-            ]
-            if len(p_next) >= 3:
-                p_nx = sum(c for _, c in Counter(p_next).most_common(2)) / float(len(p_next))
-                next_conc = max(next_conc, p_nx)
-
-        punct_hits = sum(
-            1
-            for s in tok_samples
-            if s.token_str
-            and (
-                all(ch in self._PUNCTUATION_CHARS for ch in _norm_tok(s.token_str))
-                or _norm_tok(s.token_str) in {".", ",", ";", ":", "!", "?", "(", ")", "-", "/"}
-            )
-        )
-        punct_rate = float(punct_hits / max(n_tok, 1))
-
-        # Between-token vs total activation variance ratio R^2 = SS_between / SS_total
-        # restricted to repeated tokens (len(g) >= 2) to prevent singleton degrees-of-freedom inflation
-        vals = [float(s.activation_value) for s in tok_samples]
-        grand_mean = sum(vals) / n_tok
-        ss_total = sum((v - grand_mean) ** 2 for v in vals)
-        r2 = 0.0
-        if ss_total > 1e-9 and len(tok_counts) < n_tok:
-            by_tok: Dict[str, List[float]] = defaultdict(list)
-            for s in tok_samples:
-                if s.token_str is not None:
-                    by_tok[_norm_tok(s.token_str)].append(float(s.activation_value))
-            repeated_groups = [g for g in by_tok.values() if len(g) >= 2]
-            if repeated_groups:
-                ss_between = sum(
-                    len(g) * ((sum(g) / len(g)) - grand_mean) ** 2 for g in repeated_groups
-                )
-                raw_r2 = float(min(max(ss_between / ss_total, 0.0), 1.0))
-                k_rep = len(repeated_groups)
-                if n_tok > k_rep + 2:
-                    adj_r2 = 1.0 - (1.0 - raw_r2) * (n_tok - 1.0) / float(n_tok - k_rep - 1)
-                    r2 = float(min(max(adj_r2, 0.0), 1.0))
-                else:
-                    r2 = raw_r2 * float(sum(len(g) for g in repeated_groups) / max(n_tok, 1))
-
-        # Between-context (sample_id) ANOVA R^2 for contextual/clause routers on multi-sentence corpora
-        if ss_total > 1e-9 and self.count >= 256:
-            by_ctx: Dict[int, List[float]] = defaultdict(list)
-            for s in tok_samples:
-                if s.sample_id is not None:
-                    by_ctx[int(s.sample_id)].append(float(s.activation_value))
-            ctx_groups = [g for g in by_ctx.values() if len(g) >= 3]
-            if len(ctx_groups) >= 4 and n_tok > len(ctx_groups) + 4:
-                ss_ctx = sum(
-                    len(g) * ((sum(g) / len(g)) - grand_mean) ** 2 for g in ctx_groups
-                )
-                raw_ctx_r2 = float(min(max(ss_ctx / ss_total, 0.0), 1.0))
-                k_ctx = len(ctx_groups)
-                adj_ctx_r2 = 1.0 - (1.0 - raw_ctx_r2) * (n_tok - 1.0) / float(n_tok - k_ctx - 1)
-                r2 = max(r2, float(min(max(adj_ctx_r2 * 0.85, 0.0), 1.0)))
-
-        if punct_rate >= 0.40:
-            motif = "punctuation_consolidation"
-        elif next_conc > curr_conc + 0.15 and next_conc >= 0.35:
-            motif = "next_token_preparer"
-        elif pos_rate >= 0.05 and neg_rate >= 0.05 and pos_std > 0.1 and neg_std > 0.1 and r2 >= 0.25:
-            motif = "bipolar_router"
-        elif curr_conc >= 0.25:
-            motif = "current_token_detector"
-        else:
-            motif = "distributed_contextual"
-
-        return (
-            round(r2, 4),
-            round(curr_conc, 4),
-            round(next_conc, 4),
-            round(punct_rate, 4),
-            motif,
-        )
-
-    def compute_adaptive_thresholds(
-        self,
-        neuron_indices: List[int],
-        std_multiplier: Optional[float] = None,
+        neuron_indices: Sequence[int],
+        pole: PoleType,
+        fraction_of_extreme: Optional[float] = None,
         percentile: Optional[float] = None,
-        pole: PoleType = PoleType.BOTH,
+        std_multiplier: Optional[float] = None,
     ) -> List[float]:
         """
-        Computes per-neuron native activation thresholds from audited statistics
-        (Cammarata: 'Finding Clean Circuits' — Respecting Native Activation Ranges & Percentiles).
-          - If `percentile` (in (0, 100)) is provided, computes the empirical quantile over
-            each neuron's unbiased Algorithm R active-magnitude reservoir (`pos_mag_reservoirs`,
-            `neg_mag_reservoirs`, or both depending on `pole`), avoiding top-k outlier bias.
-          - Otherwise uses `|mean_i| + k * std_i` where `k = std_multiplier or 1.0`.
+        Per-neuron magnitude thresholds for one pole, from exactly one rule:
+          * `fraction_of_extreme`: f * |corpus extreme of the pole| (the paper's preferred view:
+            the neuron's own raw shape, 'fraction of its max'),
+          * `percentile`: within-pole percentile of |a|,
+          * `std_multiplier`: k * std of the pole's magnitudes above zero.
         """
-        n = max(self.count, 1)
-        var_vec = self.m2 / n
-        std_vec = torch.sqrt(torch.clamp(var_vec, min=1e-12))
-        thresholds: List[float] = []
-
+        rules = [x is not None for x in (fraction_of_extreme, percentile, std_multiplier)]
+        if sum(rules) != 1:
+            raise ValueError("Specify exactly one of fraction_of_extreme, percentile, std_multiplier.")
+        if pole == PoleType.BOTH:
+            raise ValueError("Thresholds are per pole; call once for POSITIVE and once for NEGATIVE.")
+        p = 0 if pole == PoleType.POSITIVE else 1
+        out: List[float] = []
         for idx in neuron_indices:
-            if percentile is not None:
-                q = min(max(float(percentile) / 100.0, 0.01), 0.99)
-                if pole == PoleType.POSITIVE:
-                    mags = list(self.pos_mag_reservoirs.get(idx, []))
-                elif pole == PoleType.NEGATIVE:
-                    mags = list(self.neg_mag_reservoirs.get(idx, []))
-                else:
-                    mags = list(self.pos_mag_reservoirs.get(idx, [])) + list(
-                        self.neg_mag_reservoirs.get(idx, [])
-                    )
-                if len(mags) >= 4:
-                    mags_sorted = sorted(mags)
-                    pos_f = q * (len(mags_sorted) - 1)
-                    lo = int(math.floor(pos_f))
-                    hi = int(math.ceil(pos_f))
-                    frac = pos_f - lo
-                    interp = mags_sorted[lo] * (1.0 - frac) + mags_sorted[hi] * frac
-                    thresholds.append(float(interp))
-                else:
-                    # Fallback to Gaussian quantile on neuron's native std
-                    z_approx = math.sqrt(2.0) * torch.erfinv(torch.tensor(2.0 * q - 1.0)).item()
-                    base_std = float(std_vec[idx].item())
-                    thresholds.append(
-                        max(abs(float(self.mean[idx].item())) + max(z_approx, 0.1) * base_std, 1e-6)
-                    )
+            if fraction_of_extreme is not None:
+                out.append(float(fraction_of_extreme) * self.pole_extreme_magnitude(idx, pole))
+            elif percentile is not None:
+                out.append(self.percentile_within_pole(idx, pole, float(percentile)))
             else:
-                k = float(std_multiplier if std_multiplier is not None else 1.0)
-                base_mean = abs(float(self.mean[idx].item()))
-                base_std = float(std_vec[idx].item())
-                thresholds.append(base_mean + k * base_std)
+                n = max(int(self.pole_count[p, idx].item()), 1)
+                std = math.sqrt(max(float(self.pole_m2[p, idx].item()) / n, 0.0))
+                out.append(float(std_multiplier) * std)
+        return out
 
-        return thresholds
+    # ------------------------------------------------------------------
+    # Profiles
+    # ------------------------------------------------------------------
+    def _moments(self, count: torch.Tensor, mean: torch.Tensor, m2: torch.Tensor, m3: torch.Tensor, m4: torch.Tensor, idx: int, extreme: float) -> DistributionMoments:
+        n = int(count[idx].item())
+        if n == 0:
+            return DistributionMoments(count=0, rate=0.0, extreme=extreme)
+        nf = torch.tensor([float(n)], dtype=torch.float64)
+        m2i = m2[idx:idx + 1].cpu()
+        return DistributionMoments(
+            count=n,
+            rate=n / max(self.count, 1),
+            mean=float(mean[idx].item()),
+            std=math.sqrt(max(float(m2[idx].item()) / n, 0.0)),
+            skewness=float(_skewness(nf, m2i, m3[idx:idx + 1].cpu())[0].item()),
+            excess_kurtosis=float(_excess_kurtosis(nf, m2i, m4[idx:idx + 1].cpu())[0].item()),
+            extreme=extreme,
+        )
 
-    def export_profile(self, neuron_idx: int) -> NeuronPoleProfile:
-        """Compiles the final NeuronPoleProfile for a given neuron index."""
+    def _regime_top_samples(self, neuron_idx: int, r: int, pole_extreme: float) -> List[ActivationSample]:
+        sign = 1.0 if self.regimes[r].pole == PoleType.POSITIVE else -1.0
+        vals = self.top_vals[r, :, neuron_idx].cpu().tolist()
+        codes = self.top_codes[r, :, neuron_idx].cpu().tolist()
+        return [
+            self._decode_sample(c, sign * v, r, pole_extreme)
+            for v, c in zip(vals, codes)
+            if c >= 0 and math.isfinite(v)
+        ]
+
+    def activation_bands(
+        self,
+        neuron_idx: int,
+        pole: PoleType,
+        band_edges: Sequence[float] = DEFAULT_BAND_EDGES,
+        samples_per_band: int = 4,
+    ) -> List[ActivationBand]:
+        """
+        Rings of one pole as fractions of its corpus extreme. `band_edges` must be descending from
+        1.0 to 0.0. Counts are exact over the snapped edges; samples are drawn uniformly from inside
+        each band (octave reservoirs reweighted by octave counts).
+        """
+        edges = list(band_edges)
+        if edges[0] != 1.0 or edges[-1] != 0.0 or any(a <= b for a, b in zip(edges, edges[1:])):
+            raise ValueError("band_edges must descend strictly from 1.0 to 0.0")
+        extreme = self.pole_extreme_magnitude(neuron_idx, pole)
+        if extreme <= 0.0:
+            return []
+        p = 0 if pole == PoleType.POSITIVE else 1
+        sign = 1.0 if pole == PoleType.POSITIVE else -1.0
+        reg_codes = self._regime_codes_for_pole(pole)
+        hist_r = {rc: self.hist[rc, neuron_idx, :].to(torch.long) for rc in reg_codes}
+        pole_hist = sum(hist_r.values())
+
+        keys = self.res_keys[p, neuron_idx].reshape(-1)
+        vals = self.res_vals[p, neuron_idx].reshape(-1)
+        codes = self.res_codes[p, neuron_idx].reshape(-1)
+        regs = self.res_regime[p, neuron_idx].reshape(-1)
+        finite = torch.isfinite(keys) & (codes >= 0)
+        vals, codes, regs = vals[finite], codes[finite], regs[finite]
+        octs = self._octave_index(vals)
+        # octave population (exact) and candidates per octave -> inverse-inclusion weights
+        oct_pop = torch.zeros(self.n_octaves, dtype=torch.float64)
+        for b in range(self.n_bins):
+            c = int(pole_hist[b].item())
+            if c:
+                lo_v = self._bin_lower_value(b) if b > 0 else 0.0
+                o = int(self._octave_index(torch.tensor([max(lo_v, 1e-38)]))[0].item()) if b > 0 else 0
+                oct_pop[o] += c
+        cand_per_oct = torch.bincount(octs, minlength=self.n_octaves).to(torch.float64)
+
+        gen = torch.Generator().manual_seed(self.seed * 1_000_003 + neuron_idx * 2 + p)
+        bands: List[ActivationBand] = []
+        for hi_f, lo_f in zip(edges, edges[1:]):
+            e_hi = self.n_bins if hi_f == 1.0 else self._value_to_edge(hi_f * extreme)
+            e_lo = 0 if lo_f == 0.0 else self._value_to_edge(lo_f * extreme)
+            v_hi = extreme if hi_f == 1.0 else self._bin_lower_value(e_hi)
+            v_lo = 0.0 if lo_f == 0.0 else self._bin_lower_value(e_lo)
+            reg_counts = {self.regimes[rc].value: int(hist_r[rc][e_lo:e_hi].sum().item()) for rc in reg_codes}
+            count = sum(reg_counts.values())
+            in_band = (vals >= v_lo) & ((vals < v_hi) if hi_f != 1.0 else torch.ones_like(vals, dtype=torch.bool))
+            idxs = torch.nonzero(in_band, as_tuple=False).reshape(-1)
+            samples: List[ActivationSample] = []
+            if idxs.numel() > 0 and samples_per_band > 0:
+                w = oct_pop[octs[idxs]] / torch.clamp(cand_per_oct[octs[idxs]], min=1.0)
+                w = torch.where(w > 0, w, torch.ones_like(w))
+                take = min(samples_per_band, idxs.numel())
+                pick = torch.multinomial(w, take, replacement=False, generator=gen)
+                chosen = idxs[pick]
+                chosen = chosen[torch.argsort(vals[chosen], descending=True)]
+                for ci in chosen.tolist():
+                    samples.append(
+                        self._decode_sample(int(codes[ci]), sign * float(vals[ci]), int(regs[ci]), sign * extreme)
+                    )
+            bands.append(
+                ActivationBand(
+                    pole=pole,
+                    lower_fraction=round(v_lo / extreme, 6),
+                    upper_fraction=round(min(v_hi / extreme, 1.0), 6),
+                    lower_value=sign * v_lo,
+                    upper_value=sign * v_hi,
+                    count=count,
+                    regime_counts=reg_counts,
+                    samples=samples,
+                )
+            )
+        return bands
+
+    def export_profile(
+        self,
+        neuron_idx: int,
+        band_edges: Sequence[float] = DEFAULT_BAND_EDGES,
+        samples_per_band: int = 4,
+    ) -> NeuronPoleProfile:
         n = max(self.count, 1)
-        mean_val = float(self.mean[neuron_idx].item())
-        var_val = float((self.m2[neuron_idx] / n).item())
-        std_val = max(var_val ** 0.5, 1e-9)
-
-        pos_rate = float(self.pos_count[neuron_idx].item() / n)
-        neg_rate = float(self.neg_count[neuron_idx].item() / n)
-        tot_rate = pos_rate + neg_rate
-
-        raw_kurtosis = float((self.m4[neuron_idx] / n).item()) / ((var_val ** 2) + 1e-12)
-        if pos_rate > 0.25 and neg_rate > 0.25:
-            eff_kurtosis = max(raw_kurtosis - 20.0, 1.0)
-        else:
-            active_kurt = raw_kurtosis * max(tot_rate, 1e-4)
-            eff_kurtosis = max(active_kurt - 12.5, 1.0)
-        raw_sparsity = (0.20 / max(tot_rate, 1e-4)) ** 0.25 if tot_rate > 0 else 0.0
-        sparsity_factor = raw_sparsity if eff_kurtosis > 1.05 else min(raw_sparsity, 1.0)
-        selectivity = float(min(max((eff_kurtosis ** 0.25) * sparsity_factor, 0.0), 100.0))
-
-        pos_std_vec, pos_sel_vec, neg_std_vec, neg_sel_vec = (
-            self._compute_pole_selectivities_and_stds()
-        )
-        pos_sel = float(pos_sel_vec[neuron_idx].item())
-        neg_sel = float(neg_sel_vec[neuron_idx].item())
-        pos_std = float(pos_std_vec[neuron_idx].item())
-        neg_std = float(neg_std_vec[neuron_idx].item())
-
-        all_stds = torch.sqrt(torch.clamp(self.m2 / n, min=1e-12))
-        active_stds = all_stds[all_stds > 1e-6]
-        median_std = float(torch.median(active_stds).item()) if active_stds.numel() >= 4 else std_val
-        scale_salience = std_val / max(median_std, 1e-6) if self.num_neurons >= 8 else 1.0
-
-        r2, curr_conc, next_conc, punct_rate, motif = self._compute_token_selectivity_and_motifs(
-            neuron_idx, pos_rate, neg_rate, pos_std, neg_std
-        )
-        salient_for_lex = (
-            scale_salience >= 4.0
-            if self.num_neurons >= 8
-            else max(selectivity, pos_sel, neg_sel) >= 1.50
-        )
-        if r2 >= 0.35 and salient_for_lex:
-            scale_boost = (
-                min(max(0.45 * math.log1p(max(scale_salience - 3.5, 0.0)), 0.0), 2.5)
-                if scale_salience >= 4.0
-                else 0.0
-            )
-            lex_bonus = 0.85 * r2 + scale_boost
-            selectivity = round(selectivity + lex_bonus, 3)
-            if pos_rate > 0:
-                pos_sel = round(pos_sel + lex_bonus, 3)
-            if neg_rate > 0:
-                neg_sel = round(neg_sel + lex_bonus, 3)
-        elif (
-            self.count >= 256
-            and scale_salience >= 0.75
-            and max(selectivity, pos_sel, neg_sel) >= 1.15
-        ):
-            motif_signal = max(
-                r2 if r2 >= 0.38 else 0.0,
-                next_conc if next_conc >= 0.40 else 0.0,
-                curr_conc if curr_conc >= 0.45 else 0.0,
-                punct_rate * 0.85 if punct_rate >= 0.45 else 0.0,
-            )
-            if motif_signal >= 0.38:
-                lex_bonus = 0.55 * motif_signal
-                selectivity = round(selectivity + lex_bonus, 3)
-                if pos_rate > 0:
-                    pos_sel = round(pos_sel + lex_bonus, 3)
-                if neg_rate > 0:
-                    neg_sel = round(neg_sel + lex_bonus, 3)
-
-        pos_cnt = int(self.pos_count[neuron_idx].item())
-        dbl_neg_cnt = int(self.double_neg_count[neuron_idx].item())
-        dbl_neg_rate = float(dbl_neg_cnt / max(pos_cnt, 1)) if pos_cnt > 0 else 0.0
-
-        # 4-quadrant SwiGLU sign regime rates
-        q_pp = int(self.q_pp_count[neuron_idx].item())
-        q_nn = int(self.q_nn_count[neuron_idx].item())
-        q_pn = int(self.q_pn_count[neuron_idx].item())
-        q_np = int(self.q_np_count[neuron_idx].item())
-        q_tot = q_pp + q_nn + q_pn + q_np
-        if q_tot > 0:
-            swiglu_regimes = {
-                "pos_gate_pos_up": round(q_pp / q_tot, 4),
-                "neg_gate_neg_up": round(q_nn / q_tot, 4),
-                "pos_gate_neg_up": round(q_pn / q_tot, 4),
-                "neg_gate_pos_up": round(q_np / q_tot, 4),
-            }
-        else:
-            swiglu_regimes = {}
-
-        pos_tax = self._classify_pole_taxonomy(pos_sel, pos_rate, pos_std)
-        neg_tax = self._classify_pole_taxonomy(neg_sel, neg_rate, neg_std)
-        pos_prior = self._classify_pole_prior(pos_sel, pos_rate, pos_std, other_pole_rate=neg_rate)
-        neg_prior = self._classify_pole_prior(neg_sel, neg_rate, neg_std, other_pole_rate=pos_rate)
-
-        effective_pos_heap = (
-            self.pos_heaps.get(neuron_idx, [])
-            or self.double_neg_heaps.get(neuron_idx, [])
-        )
-        pos_samples = [
-            item[2]
-            for item in sorted(effective_pos_heap, key=lambda x: x[0], reverse=True)
-        ]
-        neg_samples = [
-            item[2]
-            for item in sorted(self.neg_heaps.get(neuron_idx, []), key=lambda x: x[0], reverse=True)
-        ]
-        dbl_neg_samples = [
-            item[2]
-            for item in sorted(
-                self.double_neg_heaps.get(neuron_idx, []), key=lambda x: x[0], reverse=True
-            )
-        ]
-
         max_v = float(self.max_val[neuron_idx].item())
         min_v = float(self.min_val[neuron_idx].item())
-        clean_max_v = max_v if max_v != float("-inf") else 0.0
-        clean_min_v = min_v if min_v != float("inf") else 0.0
+        max_v = max_v if math.isfinite(max_v) else 0.0
+        min_v = min_v if math.isfinite(min_v) else 0.0
+        pos_ext = max_v if max_v > 0 else 0.0
+        neg_ext = min_v if min_v < 0 else 0.0
 
-        pos_buckets, dbl_band_rates = self._build_quantile_buckets(
-            neuron_idx, is_positive=True, pole_max_abs=max(clean_max_v, 0.0)
-        )
-        neg_buckets, _ = self._build_quantile_buckets(
-            neuron_idx, is_positive=False, pole_max_abs=abs(min(clean_min_v, 0.0))
-        )
+        pos_m = self._moments(self.pole_count[0], self.pole_mean[0], self.pole_m2[0], self.pole_m3[0], self.pole_m4[0], neuron_idx, pos_ext)
+        neg_m = self._moments(self.pole_count[1], self.pole_mean[1], self.pole_m2[1], self.pole_m3[1], self.pole_m4[1], neuron_idx, neg_ext)
+        regime_m: Dict[str, DistributionMoments] = {}
+        regime_top: Dict[str, List[ActivationSample]] = {}
+        for r, reg in enumerate(self.regimes):
+            ext = pos_ext if reg.pole == PoleType.POSITIVE else neg_ext
+            regime_m[reg.value] = self._moments(self.reg_count[r], self.reg_mean[r], self.reg_m2[r], self.reg_m3[r], self.reg_m4[r], neuron_idx, ext)
+            regime_top[reg.value] = self._regime_top_samples(neuron_idx, r, ext)
+
+        def _merge(pole: PoleType) -> List[ActivationSample]:
+            merged: List[ActivationSample] = []
+            for r, reg in enumerate(self.regimes):
+                if reg.pole == pole:
+                    merged.extend(regime_top[reg.value])
+            merged.sort(key=lambda s: abs(s.activation_value), reverse=True)
+            return merged[: self.top_k]
+
+        pos_count = int(self.pole_count[0, neuron_idx].item())
+        nn_rate = 0.0
+        if self.gated and pos_count > 0:
+            nn_rate = int(self.reg_count[1, neuron_idx].item()) / pos_count
 
         return NeuronPoleProfile(
             layer_name=self.layer_name,
             neuron_idx=neuron_idx,
-            mean=mean_val,
-            std=std_val,
-            max_val=clean_max_v,
-            min_val=clean_min_v,
-            positive_firing_rate=pos_rate,
-            negative_firing_rate=neg_rate,
-            pole_selectivity_score=selectivity,
-            top_positive_samples=pos_samples,
-            top_negative_samples=neg_samples,
-            pos_pole_mean=float(self.pos_mean[neuron_idx].item()),
-            pos_pole_std=pos_std,
-            pos_pole_selectivity_score=round(pos_sel, 3),
-            pos_taxonomy_class=pos_tax,
-            pos_sparsity_prior=pos_prior,
-            neg_pole_mean=-float(self.neg_mean[neuron_idx].item()),
-            neg_pole_std=neg_std,
-            neg_pole_selectivity_score=round(neg_sel, 3),
-            neg_taxonomy_class=neg_tax,
-            neg_sparsity_prior=neg_prior,
-            positive_quantile_buckets=pos_buckets,
-            negative_quantile_buckets=neg_buckets,
-            double_negative_positive_rate=round(dbl_neg_rate, 4),
-            double_negative_samples=dbl_neg_samples,
-            swiglu_sign_regime_rates=swiglu_regimes,
-            double_negative_band_rates=dbl_band_rates,
-            lexical_selectivity_r2=r2,
-            current_token_concentration=curr_conc,
-            next_token_concentration=next_conc,
-            punctuation_firing_rate=punct_rate,
-            inferred_firing_motif=motif,
+            tokens_observed=self.count,
+            mean=float(self.mean[neuron_idx].item()),
+            std=math.sqrt(max(float(self.m2[neuron_idx].item()) / n, 0.0)),
+            max_val=max_v,
+            min_val=min_v,
+            positive_firing_rate=pos_m.rate,
+            negative_firing_rate=neg_m.rate,
+            gated=self.gated,
+            positive_pole=pos_m,
+            negative_pole=neg_m,
+            regime_moments=regime_m,
+            swiglu_sign_regime_rates={k: v.rate for k, v in regime_m.items()} if self.gated else {},
+            double_negative_positive_rate=nn_rate,
+            top_positive_samples=_merge(PoleType.POSITIVE),
+            top_negative_samples=_merge(PoleType.NEGATIVE),
+            regime_top_samples=regime_top,
+            positive_bands=self.activation_bands(neuron_idx, PoleType.POSITIVE, band_edges, samples_per_band),
+            negative_bands=self.activation_bands(neuron_idx, PoleType.NEGATIVE, band_edges, samples_per_band),
         )
 
     @torch.no_grad()
-    def scan_layer_cleanliness(
-        self,
-        down_proj_module: Optional[nn.Module] = None,
-        verified_hypotheses: Optional[Dict[Tuple[str, int], BipolarVerbHypothesis]] = None,
-    ) -> Tuple[Dict[str, int], Dict[str, float], List[NeuronScanSummary]]:
-        """
-        Vectorized GPU pass over all tracked moments in the layer to classify every neuron
-        AND every individual neuron pole into:
-          1. Statistical `SparsityTailPrior` (null-calibrated excess kurtosis + sparsity prior)
-          2. `NeuronTaxonomy` (promoted when semantically verified in `CircuitEcologyMap` or when
-             excess tail-selectivity clearly exceeds the Gaussian/SwiGLU random-init null).
-        """
+    def scan(self, write_norms: Optional[torch.Tensor] = None) -> List[NeuronScanSummary]:
+        """Vectorised descriptive summary of every neuron (no cleanliness classification)."""
         n = max(self.count, 1)
-        var_vec = self.m2 / n
-        std_vec = torch.sqrt(torch.clamp(var_vec, min=1e-12))
+        std = torch.sqrt(torch.clamp(self.m2 / n, min=0.0))
+        rms = torch.sqrt(torch.clamp(self.m2 / n + self.mean ** 2, min=0.0))
+        pc = self.pole_count.to(torch.float64)
+        pos_k = _excess_kurtosis(pc[0], self.pole_m2[0], self.pole_m4[0])
+        neg_k = _excess_kurtosis(pc[1], self.pole_m2[1], self.pole_m4[1])
+        if self.gated:
+            dbl = self.reg_count[1].to(torch.float64) / torch.clamp(pc[0], min=1.0)
+        else:
+            dbl = torch.zeros_like(std)
+        wn = write_norms.to(torch.float64).cpu() if write_norms is not None else torch.full_like(std.cpu(), float("nan"))
+        rows: List[NeuronScanSummary] = []
+        mean_l = self.mean.cpu().tolist()
+        std_l = std.cpu().tolist()
+        rms_l = rms.cpu().tolist()
+        max_l = self.max_val.cpu().tolist()
+        min_l = self.min_val.cpu().tolist()
+        pr = (pc[0] / n).cpu().tolist()
+        nr = (pc[1] / n).cpu().tolist()
+        pk = pos_k.cpu().tolist()
+        nk = neg_k.cpu().tolist()
+        dl = dbl.cpu().tolist()
+        wl = wn.tolist()
+        pos_codes = self._regime_codes_for_pole(PoleType.POSITIVE)
+        neg_codes = self._regime_codes_for_pole(PoleType.NEGATIVE)
+        top_pos_val, top_pos_reg = self.top_vals[pos_codes, 0, :].max(dim=0)
+        top_neg_val, top_neg_reg = self.top_vals[neg_codes, 0, :].max(dim=0)
+        top_pos_code = self.top_codes[pos_codes, 0, :].gather(0, top_pos_reg.unsqueeze(0))[0]
+        top_neg_code = self.top_codes[neg_codes, 0, :].gather(0, top_neg_reg.unsqueeze(0))[0]
+        tpc = top_pos_code.cpu().tolist()
+        tnc = top_neg_code.cpu().tolist()
 
-        pos_rate_vec = self.pos_count.to(torch.float64) / n
-        neg_rate_vec = self.neg_count.to(torch.float64) / n
-        total_rate_vec = pos_rate_vec + neg_rate_vec
+        def _tok(code: int) -> Optional[str]:
+            if code < 0:
+                return None
+            internal, pos = divmod(code, POS_BASE)
+            entry = self.registry.get(internal)
+            if entry is None or entry[1] is None or pos >= len(entry[1]):
+                return None
+            return entry[1][pos]
 
-        kurt_vec = (self.m4 / n) / (var_vec.pow(2) + 1e-12)
-        active_kurt_vec = kurt_vec * torch.clamp(total_rate_vec, min=1e-4)
-        eff_kurt_vec = torch.where(
-            (pos_rate_vec > 0.25) & (neg_rate_vec > 0.25),
-            torch.clamp(kurt_vec - 20.0, min=1.0),
-            torch.clamp(active_kurt_vec - 12.5, min=1.0),
-        )
-        raw_sparsity_vec = torch.where(
-            total_rate_vec > 0,
-            (0.20 / torch.clamp(total_rate_vec, min=1e-4)).pow(0.25),
-            torch.zeros_like(total_rate_vec),
-        )
-        sparsity_factor_vec = torch.where(
-            eff_kurt_vec > 1.05,
-            raw_sparsity_vec,
-            torch.clamp(raw_sparsity_vec, max=1.0),
-        )
-        selectivity_vec = torch.clamp(
-            eff_kurt_vec.pow(0.25) * sparsity_factor_vec, min=0.0, max=100.0
-        )
-
-        dbl_neg_rate_vec = self.double_neg_count.to(torch.float64) / torch.clamp(
-            self.pos_count.to(torch.float64), min=1.0
-        )
-
-        bipolar_vec = (4.0 * pos_rate_vec * neg_rate_vec) / (total_rate_vec.pow(2) + 1e-9)
-        pos_std_vec, pos_sel_vec, neg_std_vec, neg_sel_vec = (
-            self._compute_pole_selectivities_and_stds()
-        )
-        selectivity_vec = torch.maximum(selectivity_vec, torch.maximum(pos_sel_vec, neg_sel_vec))
-
-        weight_norms = torch.ones(self.num_neurons, dtype=torch.float64, device=self.device)
-        if down_proj_module is not None and hasattr(down_proj_module, "weight"):
-            w = down_proj_module.weight.detach().to(self.device, dtype=torch.float64)
-            if w.ndim == 3 and w.shape[-1] == self.num_neurons:
-                # 3D MoE down_proj: [num_experts, d_model, d_mlp] -> mean L2 norm across experts
-                weight_norms = torch.norm(w, p=2, dim=1).mean(dim=0)
-            elif down_proj_module.__class__.__name__ == "Conv1D":
-                # [d_mlp, d_model]
-                if w.shape[0] == self.num_neurons:
-                    weight_norms = torch.norm(w, p=2, dim=1)
-            else:
-                # Standard Linear down_proj: [d_model, d_mlp] (or output-hooked [d_mlp, d_in])
-                if w.shape[1] == self.num_neurons:
-                    weight_norms = torch.norm(w, p=2, dim=0)
-                elif w.shape[0] == self.num_neurons:
-                    weight_norms = torch.norm(w, p=2, dim=1)
-        elif (
-            down_proj_module is not None
-            and hasattr(down_proj_module, "down_proj")
-            and isinstance(getattr(down_proj_module, "down_proj"), torch.Tensor)
-        ):
-            w = getattr(down_proj_module, "down_proj").detach().to(self.device, dtype=torch.float64)
-            if w.ndim == 3 and w.shape[-1] == self.num_neurons:
-                weight_norms = torch.norm(w, p=2, dim=1).mean(dim=0)
-
-        impact_vec = std_vec * weight_norms
-        active_stds = std_vec[std_vec > 1e-6]
-        median_std = (
-            float(torch.median(active_stds).item()) if active_stds.numel() >= 4 else 1.0
-        )
-        active_impacts = impact_vec[impact_vec > 1e-6]
-        median_impact = (
-            float(torch.median(active_impacts).item()) if active_impacts.numel() >= 4 else 1.0
-        )
-
-        sel_cpu = selectivity_vec.cpu().tolist()
-        bip_cpu = bipolar_vec.cpu().tolist()
-        pos_cpu = pos_rate_vec.cpu().tolist()
-        neg_cpu = neg_rate_vec.cpu().tolist()
-        dbl_cpu = dbl_neg_rate_vec.cpu().tolist()
-        mean_cpu = self.mean.cpu().tolist()
-        std_cpu = std_vec.cpu().tolist()
-        max_cpu = self.max_val.cpu().tolist()
-        min_cpu = self.min_val.cpu().tolist()
-        wnorm_cpu = weight_norms.cpu().tolist()
-        imp_cpu = impact_vec.cpu().tolist()
-        pos_sel_cpu = pos_sel_vec.cpu().tolist()
-        neg_sel_cpu = neg_sel_vec.cpu().tolist()
-        pos_std_cpu = pos_std_vec.cpu().tolist()
-        neg_std_cpu = neg_std_vec.cpu().tolist()
-
-        counts: Dict[str, int] = {
-            NeuronTaxonomy.CLEAN_MONOSEMANTIC.value: 0,
-            NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE.value: 0,
-            NeuronTaxonomy.TRUE_POLYSEMANTIC.value: 0,
-            NeuronTaxonomy.DEAD_OR_NOISY.value: 0,
-        }
-
-        summaries: List[NeuronScanSummary] = []
-
-        for idx in range(self.num_neurons):
-            sel = float(sel_cpu[idx])
-            bip = float(bip_cpu[idx])
-            std_v = float(std_cpu[idx])
-            wnorm = float(wnorm_cpu[idx])
-            pos_r = float(pos_cpu[idx])
-            neg_r = float(neg_cpu[idx])
-            dbl_r = float(dbl_cpu[idx]) if pos_r > 0 else 0.0
-            tot_rate = pos_r + neg_r
-
-            pos_sel_i = float(pos_sel_cpu[idx])
-            neg_sel_i = float(neg_sel_cpu[idx])
-            pos_std_i = float(pos_std_cpu[idx])
-            neg_std_i = float(neg_std_cpu[idx])
-
-            pos_heap = self.pos_heaps.get(idx, []) or self.double_neg_heaps.get(idx, [])
-            neg_heap = self.neg_heaps.get(idx, [])
-            r2_i = 0.0
-            scale_salience = (
-                max(std_v / max(median_std, 1e-6), float(imp_cpu[idx]) / max(median_impact, 1e-6))
-                if self.num_neurons >= 8
-                else 1.0
-            )
-            if (pos_heap and pos_heap[0][2].token_str is not None) or (
-                neg_heap and neg_heap[0][2].token_str is not None
-            ):
-                r2_i, curr_c_i, next_c_i, punct_r_i, _ = self._compute_token_selectivity_and_motifs(
-                    idx, pos_r, neg_r, pos_std_i, neg_std_i
-                )
-                salient_for_lex = (
-                    scale_salience >= 4.0
-                    if self.num_neurons >= 8
-                    else max(sel, pos_sel_i, neg_sel_i) >= 1.50
-                )
-                if r2_i >= 0.35 and salient_for_lex:
-                    scale_boost = (
-                        min(max(0.45 * math.log1p(max(scale_salience - 3.5, 0.0)), 0.0), 2.5)
-                        if scale_salience >= 4.0
-                        else 0.0
-                    )
-                    lex_bonus = 0.85 * r2_i + scale_boost
-                    sel += lex_bonus
-                    if pos_r > 0:
-                        pos_sel_i += lex_bonus
-                    if neg_r > 0:
-                        neg_sel_i += lex_bonus
-                elif (
-                    self.count >= 256
-                    and scale_salience >= 0.75
-                    and max(sel, pos_sel_i, neg_sel_i) >= 1.15
-                ):
-                    motif_signal = max(
-                        r2_i if r2_i >= 0.38 else 0.0,
-                        next_c_i if next_c_i >= 0.40 else 0.0,
-                        curr_c_i if curr_c_i >= 0.45 else 0.0,
-                        punct_r_i * 0.85 if punct_r_i >= 0.45 else 0.0,
-                    )
-                    if motif_signal >= 0.38:
-                        lex_bonus = 0.55 * motif_signal
-                        sel += lex_bonus
-                        if pos_r > 0:
-                            pos_sel_i += lex_bonus
-                        if neg_r > 0:
-                            neg_sel_i += lex_bonus
-
-            pos_tax = self._classify_pole_taxonomy(pos_sel_i, pos_r, pos_std_i, wnorm)
-            neg_tax = self._classify_pole_taxonomy(neg_sel_i, neg_r, neg_std_i, wnorm)
-            prior = self._classify_pole_prior(
-                max(sel, pos_sel_i, neg_sel_i),
-                min(pos_r if pos_r > 0 else 1.0, neg_r if neg_r > 0 else 1.0),
-                std_v,
-                other_pole_rate=max(pos_r, neg_r),
-                outgoing_weight_norm=wnorm,
-            )
-
-            # Statistical null-calibrated tail-selectivity classification
-            if std_v < 1e-5 or wnorm < 1e-5 or tot_rate < 1e-4:
-                tax = NeuronTaxonomy.DEAD_OR_NOISY
-            elif sel >= 2.05 or max(pos_sel_i, neg_sel_i) >= 2.1:
-                tax = NeuronTaxonomy.CLEAN_MONOSEMANTIC
-            elif sel >= 1.48 or max(pos_sel_i, neg_sel_i) >= 1.52:
-                tax = NeuronTaxonomy.STRUCTURED_RECURSIVE_MIXTURE
-            else:
-                tax = NeuronTaxonomy.TRUE_POLYSEMANTIC
-
-            # Override with semantically verified taxonomy if present in CircuitEcologyMap
-            is_verified = False
-            if verified_hypotheses and (self.layer_name, idx) in verified_hypotheses:
-                v_hyp = verified_hypotheses[(self.layer_name, idx)]
-                if (
-                    v_hyp.verification_report is not None
-                    and v_hyp.verification_report.empirical_verification_score >= 0.6
-                ):
-                    tax = v_hyp.taxonomy_class
-                    is_verified = True
-
-            if tax.value not in counts:
-                counts[tax.value] = 0
-            counts[tax.value] += 1
-
-            top_pos_tok = max(pos_heap, key=lambda x: x[0])[2].token_str if pos_heap else None
-            top_neg_tok = max(neg_heap, key=lambda x: x[0])[2].token_str if neg_heap else None
-
-            summaries.append(
+        for i in range(self.num_neurons):
+            mx = max_l[i] if math.isfinite(max_l[i]) else 0.0
+            mn = min_l[i] if math.isfinite(min_l[i]) else 0.0
+            w = wl[i]
+            rows.append(
                 NeuronScanSummary(
-                    neuron_idx=idx,
-                    taxonomy_class=tax,
-                    pole_selectivity_score=round(sel, 3),
-                    bipolar_balance=round(bip, 3),
-                    positive_firing_rate=round(pos_r, 4),
-                    negative_firing_rate=round(neg_r, 4),
-                    mean=round(float(mean_cpu[idx]), 4),
-                    std=round(std_v, 4),
-                    max_val=round(float(max_cpu[idx]) if max_cpu[idx] != float("-inf") else 0.0, 4),
-                    min_val=round(float(min_cpu[idx]) if min_cpu[idx] != float("inf") else 0.0, 4),
-                    outgoing_weight_norm=round(wnorm, 4),
-                    estimated_causal_impact=round(float(imp_cpu[idx]), 4),
-                    top_pos_token=top_pos_tok,
-                    top_neg_token=top_neg_tok,
-                    pos_pole_selectivity_score=round(pos_sel_i, 3),
-                    neg_pole_selectivity_score=round(neg_sel_i, 3),
-                    pos_taxonomy_class=pos_tax,
-                    neg_taxonomy_class=neg_tax,
-                    double_negative_positive_rate=round(dbl_r, 4),
-                    semantic_verified=is_verified,
-                    sparsity_tail_prior=prior,
-                    lexical_selectivity_r2=round(r2_i, 4),
+                    neuron_idx=i,
+                    mean=mean_l[i],
+                    std=std_l[i],
+                    max_val=mx,
+                    min_val=mn,
+                    positive_firing_rate=pr[i],
+                    negative_firing_rate=nr[i],
+                    positive_excess_kurtosis=pk[i],
+                    negative_excess_kurtosis=nk[i],
+                    double_negative_positive_rate=dl[i],
+                    outgoing_weight_norm=w,
+                    rms_write_norm=rms_l[i] * w if math.isfinite(w) else float("nan"),
+                    top_pos_token=_tok(int(tpc[i])),
+                    top_neg_token=_tok(int(tnc[i])),
                 )
             )
+        return rows
 
-        total_n = max(self.num_neurons, 1)
-        percentages = {k: round((v / total_n) * 100.0, 2) for k, v in counts.items()}
-        return counts, percentages, summaries
+    def layer_regime_band_counts(
+        self,
+        pole: PoleType = PoleType.POSITIVE,
+        fraction_edges: Optional[Sequence[float]] = None,
+        percentile_edges: Optional[Sequence[float]] = None,
+        neuron_indices: Optional[Sequence[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        'The double-negative regime fills the noisy middle': sign-regime counts inside activation bands,
+        summed over neurons, where each neuron's bands are defined on its own scale, either as fractions
+        of its pole extreme (`fraction_edges`, descending 1.0 -> 0.0) or as within-pole percentiles
+        (`percentile_edges`, ascending 0 -> 100). Bins are assigned to a band by the value (fraction mode)
+        or cumulative share (percentile mode) at the bin's centre, so counts are exact up to one bin.
+        """
+        if (fraction_edges is None) == (percentile_edges is None):
+            raise ValueError("Give exactly one of fraction_edges or percentile_edges.")
+        idxs = list(range(self.num_neurons)) if neuron_indices is None else list(neuron_indices)
+        codes = self._regime_codes_for_pole(pole)
+        if fraction_edges is not None:
+            edges = list(fraction_edges)
+            labels = [(lo, hi) for hi, lo in zip(edges, edges[1:])]
+        else:
+            edges = list(percentile_edges)
+            labels = [(lo, hi) for lo, hi in zip(edges, edges[1:])]
+        totals = [{self.regimes[c].value: 0 for c in codes} for _ in labels]
+        centres = torch.tensor([0.0] + [2.0 ** (self.min_exponent + (b - 0.5) / self.bins_per_octave) for b in range(1, self.n_bins)],
+                               dtype=torch.float64)
+        for i in idxs:
+            h = self.hist[codes, i, :].to(torch.float64)  # [R_pole, n_bins]
+            ph = h.sum(0)
+            tot = float(ph.sum())
+            if tot == 0:
+                continue
+            if fraction_edges is not None:
+                ext = self.pole_extreme_magnitude(i, pole)
+                key = centres / ext
+                key[-1] = min(float(key[-1]), 1.0)
+                for k, (lo, hi) in enumerate(labels):
+                    sel = (key >= lo) & ((key < hi) if hi < 1.0 else torch.ones_like(key, dtype=torch.bool))
+                    for r, c in enumerate(codes):
+                        totals[k][self.regimes[c].value] += int(h[r][sel].sum())
+            else:
+                cum = torch.cumsum(ph, 0)
+                mid = (cum - ph / 2.0) / tot * 100.0
+                for k, (lo, hi) in enumerate(labels):
+                    sel = (mid >= lo) & ((mid < hi) if hi < 100.0 else torch.ones_like(mid, dtype=torch.bool))
+                    for r, c in enumerate(codes):
+                        totals[k][self.regimes[c].value] += int(h[r][sel].sum())
+        out = []
+        for (lo, hi), cnt in zip(labels, totals):
+            s = sum(cnt.values())
+            out.append({"band": [lo, hi], "counts": cnt, "shares": {k: (v / s if s else 0.0) for k, v in cnt.items()}})
+        return out
+
+    def layer_double_negative_positive_rate(self) -> float:
+        if not self.gated:
+            return 0.0
+        pos_total = int(self.pole_count[0].sum().item())
+        return int(self.reg_count[1].sum().item()) / pos_total if pos_total else 0.0
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    _TENSOR_FIELDS = (
+        "mean", "m2", "m3", "m4", "max_val", "min_val",
+        "pole_count", "pole_mean", "pole_m2", "pole_m3", "pole_m4",
+        "reg_count", "reg_mean", "reg_m2", "reg_m3", "reg_m4",
+        "top_vals", "top_codes", "hist",
+        "res_keys", "res_vals", "res_codes", "res_regime",
+    )
 
     def save_state(self, path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
-        """
-        Serializes all streaming moment tensors, heaps, and reservoirs into a portable
-        state dictionary (optionally saved via `torch.save` to `path`) so multi-hour
-        corpus audits can be checkpointed and resumed across sessions.
-        """
+        """Serialises the complete tracker (moments, top lists, histograms, reservoirs, registry)."""
+        ref = set(int(i) for i in self._referenced_internal_indices().tolist())
         state: Dict[str, Any] = {
-            "layer_name": self.layer_name,
-            "num_neurons": self.num_neurons,
-            "top_k": self.top_k,
+            "config": {
+                "layer_name": self.layer_name,
+                "num_neurons": self.num_neurons,
+                "gated": self.gated,
+                "top_k": self.top_k,
+                "bins_per_octave": self.bins_per_octave,
+                "min_exponent": self.min_exponent,
+                "max_exponent": self.max_exponent,
+                "samples_per_octave": self.samples_per_octave,
+                "seed": self.seed,
+                "window_tokens_before": self.window_tokens_before,
+                "window_tokens_after": self.window_tokens_after,
+            },
             "count": self.count,
-            "mean": self.mean.cpu(),
-            "m2": self.m2.cpu(),
-            "m3": self.m3.cpu(),
-            "m4": self.m4.cpu(),
-            "max_val": self.max_val.cpu(),
-            "min_val": self.min_val.cpu(),
-            "pos_count": self.pos_count.cpu(),
-            "pos_mean": self.pos_mean.cpu(),
-            "pos_m2": self.pos_m2.cpu(),
-            "pos_m3": self.pos_m3.cpu(),
-            "pos_m4": self.pos_m4.cpu(),
-            "neg_count": self.neg_count.cpu(),
-            "neg_mean": self.neg_mean.cpu(),
-            "neg_m2": self.neg_m2.cpu(),
-            "neg_m3": self.neg_m3.cpu(),
-            "neg_m4": self.neg_m4.cpu(),
-            "double_neg_count": self.double_neg_count.cpu(),
-            "q_pp_count": self.q_pp_count.cpu(),
-            "q_nn_count": self.q_nn_count.cpu(),
-            "q_pn_count": self.q_pn_count.cpu(),
-            "q_np_count": self.q_np_count.cpu(),
-            "true_pos_count": self.true_pos_count.cpu(),
-            "true_pos_mean": self.true_pos_mean.cpu(),
-            "true_pos_m2": self.true_pos_m2.cpu(),
-            "true_pos_m3": self.true_pos_m3.cpu(),
-            "true_pos_m4": self.true_pos_m4.cpu(),
-            "pos_mag_reservoirs": dict(self.pos_mag_reservoirs),
-            "neg_mag_reservoirs": dict(self.neg_mag_reservoirs),
-            "pos_mag_seen": dict(self._pos_mag_seen),
-            "neg_mag_seen": dict(self._neg_mag_seen),
+            "next_internal": self._next_internal,
+            "generator_state": self._generator.get_state(),
+            "registry": {k: v for k, v in self.registry.items() if k in ref},
         }
+        for f in self._TENSOR_FIELDS:
+            state[f] = getattr(self, f).cpu()
         if path is not None:
             torch.save(state, str(path))
         return state
 
     @classmethod
-    def load_state(
-        cls,
-        state_or_path: Union[Dict[str, Any], str, Path],
-        device: str = "cpu",
-    ) -> StreamingLayerStats:
-        """Restores a `StreamingLayerStats` instance from `save_state()` output or file path."""
+    def load_state(cls, state_or_path: Union[Dict[str, Any], str, Path], device: str = "cpu") -> "StreamingLayerStats":
         state = (
             torch.load(str(state_or_path), map_location="cpu", weights_only=False)
             if isinstance(state_or_path, (str, Path))
             else state_or_path
         )
-        inst = cls(
-            layer_name=state["layer_name"],
-            num_neurons=int(state["num_neurons"]),
-            top_k=int(state.get("top_k", 10)),
-            device=device,
-        )
+        inst = cls(device=device, **state["config"])
         inst.count = int(state["count"])
-        for attr in (
-            "mean",
-            "m2",
-            "m3",
-            "m4",
-            "max_val",
-            "min_val",
-            "pos_count",
-            "pos_mean",
-            "pos_m2",
-            "pos_m3",
-            "pos_m4",
-            "neg_count",
-            "neg_mean",
-            "neg_m2",
-            "neg_m3",
-            "neg_m4",
-            "double_neg_count",
-            "q_pp_count",
-            "q_nn_count",
-            "q_pn_count",
-            "q_np_count",
-            "true_pos_count",
-            "true_pos_mean",
-            "true_pos_m2",
-            "true_pos_m3",
-            "true_pos_m4",
-        ):
-            if attr in state:
-                getattr(inst, attr).copy_(state[attr].to(device=device))
-        for k, v in state.get("pos_mag_reservoirs", {}).items():
-            inst.pos_mag_reservoirs[int(k)] = list(v)
-        for k, v in state.get("neg_mag_reservoirs", {}).items():
-            inst.neg_mag_reservoirs[int(k)] = list(v)
-        for k, v in state.get("pos_mag_seen", {}).items():
-            inst._pos_mag_seen[int(k)] = int(v)
-        for k, v in state.get("neg_mag_seen", {}).items():
-            inst._neg_mag_seen[int(k)] = int(v)
+        inst._next_internal = int(state["next_internal"])
+        inst._generator.set_state(state["generator_state"])
+        inst.registry = dict(state["registry"])
+        for f in cls._TENSOR_FIELDS:
+            setattr(inst, f, state[f].to(device=inst.device))
         return inst
 
 
 class LogitLensAttributor:
     """
-    Computes Direct Weight-to-Vocabulary Attribution for any MLP neuron.
-    By multiplying a neuron's outgoing column vector in `down_proj` with the model's
-    unembedding matrix `lm_head`, we see which tokens the Positive and Negative poles
-    directly push into the output distribution.
+    Direct logit attribution of a neuron's write vector: logits contribution of a unit activation,
+    W_U (gamma ⊙ W_down[:, i]), where gamma is the final norm's scale. This is the direct path only
+    (it ignores everything downstream and the norm's data-dependent denominator).
     """
 
     @staticmethod
     @torch.no_grad()
-    def attribute_neuron_to_vocab(
-        down_proj_module: nn.Module,
+    def attribute_write_vector(
+        write_vec: torch.Tensor,
         unembed_weight: torch.Tensor,
-        neuron_idx: int,
         idx_to_token: Optional[Dict[int, str]] = None,
-        top_k: int = 8,
+        top_k: int = 10,
         final_norm_module: Optional[nn.Module] = None,
     ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]]]:
-        """
-        Returns (top_promoted_tokens, top_suppressed_tokens) for `neuron_idx`.
-        - `down_proj_module`: nn.Linear (shape [d_model, d_mlp]), GPT2 Conv1D (shape [d_mlp, d_model]),
-          or 3D MoE expert module (shape [num_experts, d_model, d_mlp]).
-        - `unembed_weight`: shape [vocab_size, d_model]
-        - `final_norm_module`: optional pre-unembedding LayerNorm / RMSNorm module
-          (automatically handles Gemma's `1 + weight` RMSNorm parameterization).
-        """
-        if hasattr(down_proj_module, "weight") and isinstance(down_proj_module.weight, torch.Tensor):
-            weight = down_proj_module.weight.detach()
-        elif hasattr(down_proj_module, "down_proj") and isinstance(getattr(down_proj_module, "down_proj"), torch.Tensor):
-            weight = getattr(down_proj_module, "down_proj").detach()
-        else:
-            return [], []
-        if weight.ndim == 3:
-            # 3D MoE down_proj: [num_experts, d_model, d_mlp] -> average write direction across experts
-            neuron_out_vec = weight[:, :, neuron_idx].mean(dim=0).to(dtype=torch.float32)
-        elif down_proj_module.__class__.__name__ == "Conv1D":
-            # [d_mlp, d_model]
-            neuron_out_vec = weight[neuron_idx, :].to(dtype=torch.float32)
-        else:
-            # Standard nn.Linear: [d_model, d_mlp]
-            if neuron_idx < weight.shape[1]:
-                neuron_out_vec = weight[:, neuron_idx].to(dtype=torch.float32)
-            else:
-                neuron_out_vec = weight[neuron_idx, :].to(dtype=torch.float32)
-
-        # Apply final RMSNorm / LayerNorm scaling vector gamma before unembedding
-        # (including Gemma's 1.0 + weight offset via LayerDiscovery.extract_norm_scale)
+        vec = write_vec.detach().to(torch.float32)
         if final_norm_module is not None:
-            norm_scale = LayerDiscovery.extract_norm_scale(
-                final_norm_module,
-                d_model=neuron_out_vec.shape[0],
-                device=neuron_out_vec.device,
-                dtype=torch.float32,
-            )
-            if norm_scale is not None and norm_scale.shape == neuron_out_vec.shape:
-                neuron_out_vec = neuron_out_vec * norm_scale
-
-        # Project onto vocabulary space: [vocab_size]
-        unembed = unembed_weight.detach().to(neuron_out_vec.device, dtype=torch.float32)
-        if unembed.shape[1] != neuron_out_vec.shape[0] and unembed.shape[0] == neuron_out_vec.shape[0]:
-            unembed = unembed.T
-
-        if unembed.shape[1] != neuron_out_vec.shape[0]:
-            return [], []
-
-        logit_contributions = torch.mv(unembed, neuron_out_vec)
-        k = min(top_k, logit_contributions.numel())
-
-        top_pos_vals, top_pos_ids = torch.topk(logit_contributions, k=k, largest=True)
-        top_neg_vals, top_neg_ids = torch.topk(logit_contributions, k=k, largest=False)
+            scale = LayerDiscovery.extract_norm_scale(final_norm_module, d_model=vec.shape[0], device=vec.device)
+            if scale is not None:
+                vec = vec * scale
+        unembed = unembed_weight.detach().to(vec.device, dtype=torch.float32)
+        if unembed.shape[1] != vec.shape[0]:
+            if unembed.shape[0] == vec.shape[0]:
+                unembed = unembed.T
+            else:
+                return [], []
+        logits = torch.mv(unembed, vec)
+        k = min(top_k, logits.numel())
+        pv, pi = torch.topk(logits, k=k, largest=True)
+        nv, ni = torch.topk(logits, k=k, largest=False)
 
         def _fmt(ids: torch.Tensor, vals: torch.Tensor) -> List[Tuple[str, float]]:
-            results = []
-            for tok_id, score in zip(ids.tolist(), vals.tolist()):
-                label = (
-                    idx_to_token.get(tok_id, f"token_{tok_id}")
-                    if idx_to_token
-                    else f"class_{tok_id}"
-                )
-                results.append((label, round(float(score), 4)))
-            return results
+            out = []
+            for t, s in zip(ids.tolist(), vals.tolist()):
+                label = idx_to_token.get(t, f"token_{t}") if idx_to_token else f"token_{t}"
+                out.append((label, float(s)))
+            return out
 
-        return _fmt(top_pos_ids, top_pos_vals), _fmt(top_neg_ids, top_neg_vals)
+        return _fmt(pi, pv), _fmt(ni, nv)
+
+
+# =============================================================================
+# Contrastive discovery with prompts as the independent units
+# =============================================================================
+def _betacf(a: float, b: float, x: float, max_iter: int = 300, eps: float = 3e-16) -> float:
+    """Continued fraction for the regularised incomplete beta function (modified Lentz)."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c if abs(c) > tiny else 1.0 + aa / tiny
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = 1.0 / (d if abs(d) > tiny else tiny)
+        c = 1.0 + aa / c if abs(c) > tiny else 1.0 + aa / tiny
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    ln_bt = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1.0 - x)
+    bt = math.exp(ln_bt)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def student_t_two_sided_p(t: float, df: float) -> float:
+    if not math.isfinite(t):
+        return 0.0
+    if df <= 0:
+        return 1.0
+    return regularized_incomplete_beta(df / 2.0, 0.5, df / (df + t * t))
 
 
 class ContrastivePoleFinder:
     """
-    Contrastive Pole Discovery Engine (Cammarata: 'Thinking in Neurons' & 'Finding Clean Circuits'):
-    Ranks all native-basis neurons across one or more layers by regularized Welch's
-    Bipolar Separation t-statistic between two contrastive input sets (D+ and D-):
-        t_i = (mu+(a_i) - mu-(a_i)) / (sqrt(var+(a_i)/N+ + var-(a_i)/N-) + s_0)
-    Directly surfaces native 'verb' neurons that route between positive and negative
-    behaviors without requiring an external Sparse Autoencoder (SAE).
+    Ranks neurons by Welch's t between per-prompt mean activations on a positive prompt set and a
+    negative prompt set. Tokens inside one prompt are not independent, so each prompt contributes one
+    observation (its mean over valid tokens). Reports Welch–Satterthwaite degrees of freedom,
+    two-sided p-values and a Bonferroni correction for the number of neurons tested.
     """
 
     @staticmethod
     @torch.no_grad()
+    def _per_prompt_means(
+        model: nn.Module,
+        batches: List[Any],
+        layer_names: List[str],
+        forward_fn: Callable[[nn.Module, Any], Any],
+        device: torch.device,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        counts = {"tokens": 0}
+        current: Dict[str, Any] = {}
+        rows: Dict[str, List[torch.Tensor]] = {name: [] for name in layer_names}
+
+        def _make_capture(name: str):
+            def _cap(act: torch.Tensor) -> None:
+                a = act.detach().float()
+                mask = current.get("mask")
+                if a.ndim == 2:  # [B, D] (one position per prompt)
+                    rows[name].append(a.to(device))
+                    return
+                if a.ndim == 4:
+                    a = a.flatten(2).transpose(1, 2)  # [B, HW, C]
+                if mask is not None and mask.shape == a.shape[:2]:
+                    m = mask.to(device=a.device, dtype=a.dtype).unsqueeze(-1)
+                    per = (a * m).sum(dim=1) / torch.clamp(m.sum(dim=1), min=1.0)
+                else:
+                    per = a.mean(dim=1)
+                rows[name].append(per.to(device))
+            return _cap
+
+        from .hooks import HookSet
+
+        hs = HookSet(model)
+        for name in layer_names:
+            cap = _make_capture(name)
+
+            def _c(act, _g, _r, c=cap, site=hs.site(name)):
+                if site.target == "moe_expert":
+                    grid = current.get("grid")
+                    if grid is None:
+                        raise ValueError("MoE expert layers need 2D input_ids batches.")
+                    act = act.reshape(grid[0], grid[1], -1)  # unrouted tokens are 0: the neuron does not fire
+                c(act)
+
+            hs.add_capture(name, _c)
+        hs.attach()
+        try:
+            for b in batches:
+                current["mask"] = b.get("attention_mask") if isinstance(b, dict) else None
+                ids = b.get("input_ids") if isinstance(b, dict) else b
+                current["grid"] = tuple(ids.shape) if isinstance(ids, torch.Tensor) and ids.ndim == 2 else None
+                if current["mask"] is not None:
+                    counts["tokens"] += int(current["mask"].sum().item())
+                forward_fn(model, b)
+        finally:
+            hs.detach()
+        out: Dict[str, torch.Tensor] = {}
+        n_prompts = 0
+        for name in layer_names:
+            if rows[name]:
+                out[name] = torch.cat(rows[name], dim=0)
+                n_prompts = out[name].shape[0]
+        return out, counts["tokens"] if counts["tokens"] else n_prompts
+
+    @classmethod
     def discover(
+        cls,
         model: nn.Module,
         pos_inputs: Union[torch.Tensor, Iterable[Any]],
         neg_inputs: Union[torch.Tensor, Iterable[Any]],
@@ -1889,144 +1112,91 @@ class ContrastivePoleFinder:
         device: str = "cpu",
     ) -> ContrastiveDiscoveryReport:
         run_fwd = forward_fn or (lambda m, inp: m(inp))
-
-        def _normalize_batches(data: Union[torch.Tensor, Iterable[Any]]) -> List[Any]:
-            if isinstance(data, torch.Tensor):
-                return [data]
-            return list(data)
-
-        pos_batches = _normalize_batches(pos_inputs)
-        neg_batches = _normalize_batches(neg_inputs)
-
-        def _collect_stats(batches: List[Any]) -> Dict[str, StreamingLayerStats]:
-            trackers: Dict[str, StreamingLayerStats] = {}
-            handles: List[RemovableHandle] = []
-            current_mask: Dict[str, Optional[torch.Tensor]] = {"mask": None}
-
-            for target_layer in layer_names:
-                mod, hook_target, num_n = LayerDiscovery.resolve_module(model, target_layer)
-                st = StreamingLayerStats(target_layer, num_n, top_k=1, device=device)
-                trackers[target_layer] = st
-                if hook_target == "input":
-                    handles.append(
-                        mod.register_forward_pre_hook(
-                            lambda _m, inp, s=st: (
-                                s.update(
-                                    inp[0].detach(),
-                                    tracked_neurons=[],
-                                    attention_mask=current_mask["mask"],
-                                )
-                                if inp and isinstance(inp[0], torch.Tensor)
-                                else None
-                            )
-                        )
-                    )
-                else:
-                    handles.append(
-                        mod.register_forward_hook(
-                            lambda _m, _inp, out, s=st: s.update(
-                                (out[0] if isinstance(out, tuple) else out).detach(),
-                                tracked_neurons=[],
-                                attention_mask=current_mask["mask"],
-                            )
-                        )
-                    )
-            try:
-                for b in batches:
-                    current_mask["mask"] = (
-                        b.get("attention_mask") if isinstance(b, dict) else None
-                    )
-                    run_fwd(model, b)
-            finally:
-                for handle in handles:
-                    handle.remove()
-            return trackers
-
+        pos_batches = [pos_inputs] if isinstance(pos_inputs, torch.Tensor) else list(pos_inputs)
+        neg_batches = [neg_inputs] if isinstance(neg_inputs, torch.Tensor) else list(neg_inputs)
+        dev = torch.device(device)
         was_training = model.training
         model.eval()
         try:
-            pos_stats = _collect_stats(pos_batches)
-            neg_stats = _collect_stats(neg_batches)
+            pos_means, pos_tok = cls._per_prompt_means(model, pos_batches, layer_names, run_fwd, dev)
+            neg_means, neg_tok = cls._per_prompt_means(model, neg_batches, layer_names, run_fwd, dev)
         finally:
             if was_training:
                 model.train()
 
+        candidates: List[Tuple[float, str, int, Dict[str, float]]] = []
+        tests = 0
+        n_pos_prompts = n_neg_prompts = 0
+        for name in layer_names:
+            P = pos_means.get(name)
+            Q = neg_means.get(name)
+            if P is None or Q is None:
+                continue
+            n1, n2 = P.shape[0], Q.shape[0]
+            n_pos_prompts, n_neg_prompts = n1, n2
+            if n1 < 2 or n2 < 2:
+                raise ValueError("Each prompt set needs at least two prompts for a Welch t-test.")
+            m1, m2 = P.mean(0), Q.mean(0)
+            v1, v2 = P.var(0, unbiased=True), Q.var(0, unbiased=True)
+            se2 = v1 / n1 + v2 / n2
+            t = (m1 - m2) / torch.sqrt(se2)
+            t = torch.where(se2 > 0, t, torch.zeros_like(t))
+            df = se2 ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
+            df = torch.where(torch.isfinite(df), df, torch.full_like(df, float(n1 + n2 - 2)))
+            pooled = torch.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2))
+            d = torch.where(pooled > 0, (m1 - m2) / pooled, torch.zeros_like(pooled))
+            tests += t.numel()
+            k = min(top_k, t.numel())
+            _, idx = torch.topk(t.abs(), k=k)
+            for i in idx.tolist():
+                candidates.append((
+                    abs(float(t[i])), name, i,
+                    {
+                        "t": float(t[i]), "df": float(df[i]), "m1": float(m1[i]), "m2": float(m2[i]),
+                        "s1": math.sqrt(max(float(v1[i]), 0.0)), "s2": math.sqrt(max(float(v2[i]), 0.0)),
+                        "d": float(d[i]),
+                    },
+                ))
+        candidates.sort(key=lambda x: x[0], reverse=True)
         matches: List[ContrastiveNeuronMatch] = []
-        pos_tokens_count = 0
-        neg_tokens_count = 0
-
-        for layer_name in layer_names:
-            ps = pos_stats[layer_name]
-            ns = neg_stats[layer_name]
-            n_pos = max(ps.count, 1)
-            n_neg = max(ns.count, 1)
-            pos_tokens_count = max(pos_tokens_count, ps.count)
-            neg_tokens_count = max(neg_tokens_count, ns.count)
-
-            var_pos = ps.m2 / n_pos
-            var_neg = ns.m2 / n_neg
-            raw_se_vec = torch.sqrt((var_pos / n_pos) + (var_neg / n_neg) + 1e-9)
-            pooled_std = torch.sqrt(0.5 * (var_pos + var_neg) + 1e-12)
-            # Scale-relative standard-error floor s0 so near-dead background neurons with
-            # tiny variance do not outrank large-effect routers, while preserving sensitivity
-            # across layers of any activation magnitude.
-            scale_floor = max(float(pooled_std.median().item()) * 0.25, 1e-4)
-            s0 = float(raw_se_vec.median().item()) * 0.25 + scale_floor
-            t_vec = (ps.mean - ns.mean) / (raw_se_vec + s0)
-
-            std_pos = torch.sqrt(torch.clamp(var_pos, min=0.0))
-            std_neg = torch.sqrt(torch.clamp(var_neg, min=0.0))
-            sign_floor = scale_floor * 0.05
-
-            t_cpu = t_vec.cpu().tolist()
-            mp_cpu = ps.mean.cpu().tolist()
-            mn_cpu = ns.mean.cpu().tolist()
-            sp_cpu = std_pos.cpu().tolist()
-            sn_cpu = std_neg.cpu().tolist()
-
-            for idx in range(ps.num_neurons):
-                t_val = float(t_cpu[idx])
-                mp = float(mp_cpu[idx])
-                mn = float(mn_cpu[idx])
-                sign_flip = (mp > sign_floor and mn < -sign_floor) or (
-                    mp < -sign_floor and mn > sign_floor
+        for _, name, i, s in candidates[:top_k]:
+            p = student_t_two_sided_p(s["t"], s["df"])
+            matches.append(
+                ContrastiveNeuronMatch(
+                    layer_name=name,
+                    neuron_idx=i,
+                    t_statistic=s["t"],
+                    abs_t_statistic=abs(s["t"]),
+                    degrees_of_freedom=s["df"],
+                    p_value=p,
+                    bonferroni_p_value=min(1.0, p * tests),
+                    pos_mean=s["m1"],
+                    neg_mean=s["m2"],
+                    pos_std=s["s1"],
+                    neg_std=s["s2"],
+                    n_pos_prompts=n_pos_prompts,
+                    n_neg_prompts=n_neg_prompts,
+                    bipolar_sign_flip=(s["m1"] > 0) != (s["m2"] > 0) and s["m1"] != 0 and s["m2"] != 0,
+                    recommended_pole=PoleType.POSITIVE if s["t"] >= 0 else PoleType.NEGATIVE,
+                    cohens_d=s["d"],
                 )
-                rec_pole = PoleType.POSITIVE if t_val >= 0.0 else PoleType.NEGATIVE
-                matches.append(
-                    ContrastiveNeuronMatch(
-                        layer_name=layer_name,
-                        neuron_idx=idx,
-                        t_statistic=round(t_val, 4),
-                        abs_t_statistic=round(abs(t_val), 4),
-                        pos_mean=round(mp, 4),
-                        neg_mean=round(mn, 4),
-                        pos_std=round(float(sp_cpu[idx]), 4),
-                        neg_std=round(float(sn_cpu[idx]), 4),
-                        bipolar_sign_flip=sign_flip,
-                        recommended_pole=rec_pole,
-                    )
-                )
-
-        matches.sort(
-            key=lambda m: m.abs_t_statistic * (1.25 if m.bipolar_sign_flip else 1.0),
-            reverse=True,
-        )
+            )
         return ContrastiveDiscoveryReport(
             layers_scanned=list(layer_names),
-            pos_tokens_count=pos_tokens_count,
-            neg_tokens_count=neg_tokens_count,
-            top_matches=matches[:top_k],
+            pos_prompts_count=n_pos_prompts,
+            neg_prompts_count=n_neg_prompts,
+            pos_tokens_count=pos_tok,
+            neg_tokens_count=neg_tok,
+            tests_performed=tests,
+            top_matches=matches,
         )
 
 
 class CheckpointEvolutionTracker:
     """
-    Cross-Checkpoint 'Recursive Growth' Tracker (Cammarata: 'On Generalization — Recursive Growth'):
-    Inspired by Cammarata's observation of neurons sprouting recursive offshoots across
-    training epochs, `CheckpointEvolutionTracker` audits a specific `(layer_name, neuron_idx)`
-    across a sequence of `(checkpoint_label, model_or_loader_fn)` pairs on a shared evaluation dataset,
-    tracking how pole selectivity, outgoing residual write vectors, SwiGLU double-negative rate,
-    and stratified quantile buckets (`peak_trunk`, `secondary_branch`, `tertiary_offshoot`) evolve.
+    'Watching Neurons Develop': audits one neuron across checkpoints on a shared corpus and reports,
+    per checkpoint, its moments, write-vector drift and which tokens populate each activation band,
+    so the order in which branches appear can be read off.
     """
 
     @staticmethod
@@ -2037,125 +1207,66 @@ class CheckpointEvolutionTracker:
         neuron_idx: int,
         batches: Iterable[Dict[str, Any]],
         forward_fn: Callable[[nn.Module, Dict[str, Any]], Any],
-        top_k: int = 8,
+        top_k: int = 16,
+        band_edges: Sequence[float] = DEFAULT_BAND_EDGES,
     ) -> NeuronEvolutionReport:
         from .injector import NeuralInjector
 
         batch_list = list(batches)
         snapshots: List[NeuronCheckpointSnapshot] = []
-        write_vecs: List[torch.Tensor] = []
-        raw_profiles: List[Tuple[str, NeuronPoleProfile]] = []
+        write_vecs: List[Optional[torch.Tensor]] = []
+        profiles: List[Tuple[str, NeuronPoleProfile]] = []
+        for label, ckpt in checkpoints:
+            model = ckpt() if callable(ckpt) and not isinstance(ckpt, nn.Module) else ckpt
+            try:
+                wv = LayerDiscovery.neuron_write_vectors(model, layer_name)
+                write_vecs.append(wv[neuron_idx].float().cpu() if wv is not None else None)
+            except (ValueError, IndexError):
+                write_vecs.append(None)
+            inj = NeuralInjector(model)
+            inj.audit_layers([layer_name], batch_list, forward_fn=forward_fn, top_k=top_k)
+            profiles.append((label, inj.get_neuron_profile(layer_name, neuron_idx, band_edges=band_edges)))
+            del inj
 
-        # Stream one checkpoint at a time so lazy callables `(label, lambda: load_ckpt(...))`
-        # never require holding multiple multi-GB models in memory simultaneously.
-        for label, ckpt_or_fn in checkpoints:
-            ckpt_model = ckpt_or_fn() if callable(ckpt_or_fn) and not isinstance(ckpt_or_fn, nn.Module) else ckpt_or_fn
-            mod, _, _ = LayerDiscovery.resolve_module(ckpt_model, layer_name)
-            if hasattr(mod, "weight") and isinstance(mod.weight, torch.Tensor):
-                w = mod.weight.detach().float()
-                if w.ndim == 3:
-                    v = w[:, :, neuron_idx].mean(dim=0)
-                elif mod.__class__.__name__ == "Conv1D":
-                    v = w[neuron_idx, :]
-                else:
-                    v = w[:, neuron_idx] if neuron_idx < w.shape[1] else w[neuron_idx, :]
-                write_vecs.append(v.cpu())
+        final = write_vecs[-1] if write_vecs else None
+        for (label, prof), wv in zip(profiles, write_vecs):
+            if wv is not None and final is not None and wv.shape == final.shape and wv.norm() > 0 and final.norm() > 0:
+                cos = float(F.cosine_similarity(wv.unsqueeze(0), final.unsqueeze(0)).item())
+                wnorm = float(wv.norm().item())
             else:
-                write_vecs.append(torch.ones(1))
-
-            inj = NeuralInjector(ckpt_model)
-            inj.audit_layers(
-                layer_names=[layer_name],
-                dataloader_or_batches=batch_list,
-                forward_fn=forward_fn,
-                top_k=top_k,
-                tracked_neurons=[neuron_idx],
-            )
-            prof = inj.get_neuron_profile(layer_name, neuron_idx)
-            raw_profiles.append((label, prof))
-
-        final_vec = (
-            F.normalize(write_vecs[-1].unsqueeze(0), dim=-1).squeeze(0)
-            if write_vecs
-            else torch.ones(1)
-        )
-
-        for (label, prof), v_curr in zip(raw_profiles, write_vecs):
-            wnorm = float(torch.norm(v_curr, p=2).item())
-            if v_curr.shape == final_vec.shape and wnorm > 1e-9:
-                cos_final = float(
-                    torch.dot(
-                        F.normalize(v_curr.unsqueeze(0), dim=-1).squeeze(0), final_vec
-                    ).item()
-                )
-            else:
-                cos_final = 1.0
-
-            pos_b = prof.positive_quantile_buckets
-            peak_toks = list(
-                dict.fromkeys(
-                    s.token_str for s in pos_b.get("peak_trunk", []) if s.token_str is not None
-                )
-            )
-            sec_toks = list(
-                dict.fromkeys(
-                    s.token_str
-                    for s in pos_b.get("secondary_branch", [])
-                    if s.token_str is not None
-                )
-            )
-            tert_toks = list(
-                dict.fromkeys(
-                    s.token_str
-                    for s in pos_b.get("tertiary_offshoot", [])
-                    if s.token_str is not None
-                )
-            )
-
+                cos, wnorm = float("nan"), float("nan")
+            band_tokens: Dict[str, List[str]] = {}
+            for pole_name, bands in (("positive", prof.positive_bands), ("negative", prof.negative_bands)):
+                for b in bands:
+                    key = f"{pole_name}:{b.lower_fraction:.4f}-{b.upper_fraction:.4f}"
+                    band_tokens[key] = list(dict.fromkeys(s.token_str for s in b.samples if s.token_str))
             snapshots.append(
                 NeuronCheckpointSnapshot(
                     checkpoint_label=label,
-                    mean=round(prof.mean, 4),
-                    std=round(prof.std, 4),
-                    pos_pole_selectivity=round(prof.pos_pole_selectivity_score, 4),
-                    neg_pole_selectivity=round(prof.neg_pole_selectivity_score, 4),
-                    pos_taxonomy=prof.pos_taxonomy_class,
-                    neg_taxonomy=prof.neg_taxonomy_class,
-                    outgoing_weight_norm=round(wnorm, 4),
-                    weight_cosine_to_final=round(cos_final, 4),
-                    peak_trunk_tokens=peak_toks,
-                    secondary_branch_tokens=sec_toks,
-                    tertiary_offshoot_tokens=tert_toks,
-                    double_negative_positive_rate=round(prof.double_negative_positive_rate, 4),
+                    mean=prof.mean,
+                    std=prof.std,
+                    max_val=prof.max_val,
+                    min_val=prof.min_val,
+                    positive_firing_rate=prof.positive_firing_rate,
+                    negative_firing_rate=prof.negative_firing_rate,
+                    outgoing_weight_norm=wnorm,
+                    weight_cosine_to_final=cos,
+                    band_tokens=band_tokens,
+                    double_negative_positive_rate=prof.double_negative_positive_rate,
                 )
             )
 
-        if snapshots:
-            initial_tokens = set(
-                snapshots[0].peak_trunk_tokens
-                + snapshots[0].secondary_branch_tokens
-                + snapshots[0].tertiary_offshoot_tokens
-            )
-            final_offshoots = (
-                snapshots[-1].secondary_branch_tokens + snapshots[-1].tertiary_offshoot_tokens
-            )
-            emerged = list(dict.fromkeys(t for t in final_offshoots if t not in initial_tokens))
-            sel_delta_pos = round(
-                snapshots[-1].pos_pole_selectivity - snapshots[0].pos_pole_selectivity, 4
-            )
-            sel_delta_neg = round(
-                snapshots[-1].neg_pole_selectivity - snapshots[0].neg_pole_selectivity, 4
-            )
-        else:
-            emerged = []
-            sel_delta_pos = 0.0
-            sel_delta_neg = 0.0
-
+        emerged: Dict[str, List[str]] = {}
+        if len(snapshots) >= 2:
+            first, last = snapshots[0].band_tokens, snapshots[-1].band_tokens
+            seen_first = {t for toks in first.values() for t in toks}
+            for key, toks in last.items():
+                new = [t for t in toks if t not in seen_first]
+                if new:
+                    emerged[key] = new
         return NeuronEvolutionReport(
             layer_name=layer_name,
             neuron_idx=neuron_idx,
             snapshots=snapshots,
-            emerged_offshoot_tokens=emerged,
-            selectivity_delta_pos=sel_delta_pos,
-            selectivity_delta_neg=sel_delta_neg,
+            emerged_tokens_by_band=emerged,
         )

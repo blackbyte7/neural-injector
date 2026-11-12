@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .discovery import LayerDiscovery
+from .hooks import HookSet, default_forward, extract_logits, flat_neuron_view, valid_position_mask
 from .types import (
     GateConditionSpec,
     InterventionMode,
@@ -21,12 +21,10 @@ if TYPE_CHECKING:
 
 class InterventionKernel:
     """
-    High-efficiency vectorized tensor operations that manipulate neuron values
-    during forward passes with minimal memory or latency overhead.
-    Supports scalar values, native per-neuron adaptive thresholds/values, and
-    closed-loop dynamic concept gating (`InterventionMode.CONDITIONAL_GATE`),
-    including stateful KV-cache latching (`sticky_on_decode`) across single-token
-    autoregressive generation steps.
+    Vectorised neuron manipulations applied inside forward hooks.
+    Supported activation shapes: [B, S, D], [B, D] (also routed MoE rows), [B, C, H, W] (conv).
+    Gate-conditioned modes (DOUBLE_NEGATIVE_ABLATE, EXTREME_CULL with condition_signal="gate")
+    receive the gate pre-activation tensor of the same shape.
     """
 
     @staticmethod
@@ -37,52 +35,30 @@ class InterventionKernel:
         latched_masks: Optional[Dict[int, torch.Tensor]] = None,
         spec_id: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        Evaluates whether `condition.detector_neuron` in `detector_acts` satisfies
-        the pole and threshold trigger criteria.
-        Returns a boolean mask of shape `[B, S, 1]` (3D), `[B, 1]` (2D), or `[B, 1, H, W]` (4D).
-
-        When `condition.sequence_scope == "any_token"` and `condition.sticky_on_decode == True`:
-          - On a multi-token prompt prefill (`S > 1`), stores the sequence-level trigger
-            `[B, 1, 1]` into `latched_masks[spec_id]`.
-          - On subsequent single-token KV-cached decoding steps (`S == 1`), OR-combines
-            the current step's trigger with `latched_masks[spec_id]`, keeping the gate
-            latched open for the remainder of the generated response.
-        """
         n_idx = condition.detector_neuron
         if is_conv2d and detector_acts.ndim == 4:
-            det_slice = detector_acts[:, n_idx: n_idx + 1, :, :]
+            det = detector_acts[:, n_idx: n_idx + 1, :, :]
         else:
-            det_slice = detector_acts[..., n_idx: n_idx + 1]
-
+            det = detector_acts[..., n_idx: n_idx + 1]
         thresh = abs(float(condition.threshold))
         if condition.detector_pole == PoleType.POSITIVE:
-            mask = det_slice > thresh
+            mask = det > thresh
         elif condition.detector_pole == PoleType.NEGATIVE:
-            mask = det_slice < -thresh
+            mask = det < -thresh
         else:
-            mask = det_slice.abs() > thresh
+            mask = det.abs() > thresh
 
         if condition.sequence_scope == "any_token" and mask.ndim == 3:
-            step_trigger = mask.any(dim=1, keepdim=True)  # [B, 1, 1]
-            if (
-                condition.sticky_on_decode
-                and latched_masks is not None
-                and spec_id is not None
-            ):
-                seq_len = mask.shape[1]
-                if seq_len > 1:
-                    latched_masks[spec_id] = step_trigger.detach().clone()
+            step = mask.any(dim=1, keepdim=True)
+            if condition.sticky_on_decode and latched_masks is not None and spec_id is not None:
+                if mask.shape[1] > 1:
+                    latched_masks[spec_id] = step.detach().clone()
                 else:
-                    prev_latch = latched_masks.get(spec_id)
-                    if prev_latch is not None and prev_latch.shape[0] == step_trigger.shape[0]:
-                        step_trigger = step_trigger | prev_latch.to(
-                            device=step_trigger.device, dtype=torch.bool
-                        )
-                    latched_masks[spec_id] = step_trigger.detach().clone()
-
-            mask = step_trigger.expand_as(mask)
-
+                    prev = latched_masks.get(spec_id)
+                    if prev is not None and prev.shape[0] == step.shape[0]:
+                        step = step | prev.to(device=step.device, dtype=torch.bool)
+                    latched_masks[spec_id] = step.detach().clone()
+            mask = step.expand_as(mask)
         return mask
 
     @staticmethod
@@ -92,207 +68,182 @@ class InterventionKernel:
         is_conv2d: bool = False,
         conditional_masks: Optional[Dict[int, torch.Tensor]] = None,
         latched_masks: Optional[Dict[int, torch.Tensor]] = None,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Applies a list of InterventionSpecs to an activation tensor.
-        Supports shapes:
-          - [batch, seq_len, hidden_dim] (Transformers / Sequence models)
-          - [batch, hidden_dim]          (Standard MLPs / Routed MoE)
-          - [batch, channels, H, W]      (CNNs when is_conv2d=True)
-        """
         if not specs:
             return tensor
-
-        # Clone once to avoid corrupting autograd graphs or shared views when modifying in-place
         out = tensor.clone()
-        device = out.device
-        dtype = out.dtype
+        device, dtype = out.device, out.dtype
 
         for spec in specs:
             if not spec.enabled or not spec.neuron_indices:
                 continue
+            if spec.needs_gate_signal and gate is None:
+                raise RuntimeError(f"{spec.mode.value} on '{spec.layer_name}' requires the gate pre-activation.")
 
-            # Resolve optional closed-loop conditional trigger mask
             cond_mask: Optional[torch.Tensor] = None
-            if spec.gate_condition is not None or spec.mode == InterventionMode.CONDITIONAL_GATE:
+            if spec.mode == InterventionMode.CONDITIONAL_GATE or spec.gate_condition is not None:
                 if conditional_masks is not None and id(spec) in conditional_masks:
                     cond_mask = conditional_masks[id(spec)]
-                elif (
-                    spec.gate_condition is not None
-                    and spec.gate_condition.detector_layer == spec.layer_name
-                ):
-                    # Same-layer detector: evaluate directly on the incoming activation tensor
+                elif spec.gate_condition is not None and spec.gate_condition.detector_layer == spec.layer_name:
                     cond_mask = InterventionKernel.compute_detector_mask(
-                        tensor,
-                        spec.gate_condition,
-                        is_conv2d=is_conv2d,
-                        latched_masks=latched_masks,
-                        spec_id=id(spec),
+                        tensor, spec.gate_condition, is_conv2d=is_conv2d,
+                        latched_masks=latched_masks, spec_id=id(spec),
                     )
-                if cond_mask is None or not cond_mask.any():
+                if cond_mask is None or not bool(cond_mask.any()):
                     continue
 
             idx = torch.as_tensor(spec.neuron_indices, dtype=torch.long, device=device)
-
-            # Extract the slice corresponding to target neurons
             if is_conv2d and out.ndim == 4:
-                # Shape: [B, C, H, W] -> index along channel dimension (dim=1)
                 sub = out[:, idx, :, :]
-                modified = InterventionKernel._transform_slice(
-                    sub, spec, dtype, is_conv2d=True, cond_mask=cond_mask
-                )
-                out[:, idx, :, :] = modified
-
-            elif out.ndim == 3:
-                # Shape: [B, S, D] -> Transformer sequence activation
-                if spec.token_positions is not None:
-                    seq_len = out.shape[1]
-                    # Normalize negative indices (e.g. -1 -> seq_len - 1) and filter out-of-bounds
-                    # positions so single-token KV-cached decode steps (seq_len == 1) never crash.
-                    valid_positions = [
-                        (seq_len + p if p < 0 else p)
-                        for p in spec.token_positions
-                        if 0 <= (seq_len + p if p < 0 else p) < seq_len
-                    ]
-                    if not valid_positions:
-                        continue
-                    pos_idx = torch.as_tensor(valid_positions, dtype=torch.long, device=device)
-                    sub = out[:, pos_idx[:, None], idx]
-                    pos_cond = (
-                        cond_mask[:, pos_idx, :]
-                        if (cond_mask is not None and cond_mask.ndim == 3)
-                        else cond_mask
-                    )
-                    modified = InterventionKernel._transform_slice(
-                        sub, spec, dtype, cond_mask=pos_cond
-                    )
-                    out[:, pos_idx[:, None], idx] = modified
-                else:
-                    sub = out[:, :, idx]
-                    modified = InterventionKernel._transform_slice(
-                        sub, spec, dtype, cond_mask=cond_mask
-                    )
-                    out[:, :, idx] = modified
-
-            elif out.ndim == 2:
-                # Shape: [B, D] -> Standard 2D batch activation
-                sub = out[:, idx]
-                modified = InterventionKernel._transform_slice(
-                    sub, spec, dtype, cond_mask=cond_mask
-                )
-                out[:, idx] = modified
-
+                g_sub = gate[:, idx, :, :] if gate is not None else None
+                out[:, idx, :, :] = InterventionKernel._transform(sub, spec, dtype, True, cond_mask, g_sub)
+            elif out.ndim == 3 and spec.token_positions is not None:
+                seq_len = out.shape[1]
+                valid = [(seq_len + p if p < 0 else p) for p in spec.token_positions]
+                valid = [p for p in valid if 0 <= p < seq_len]
+                if not valid:
+                    continue
+                pos = torch.as_tensor(valid, dtype=torch.long, device=device)
+                sub = out[:, pos[:, None], idx]
+                g_sub = gate[:, pos[:, None], idx] if gate is not None else None
+                c_sub = cond_mask[:, pos, :] if (cond_mask is not None and cond_mask.ndim == 3) else cond_mask
+                out[:, pos[:, None], idx] = InterventionKernel._transform(sub, spec, dtype, False, c_sub, g_sub)
             else:
-                # Generic fallback: assume last dimension is the neuron basis
+                if spec.token_positions is not None and out.ndim != 3:
+                    raise ValueError("token_positions requires [B, S, D] activations.")
                 sub = out[..., idx]
-                modified = InterventionKernel._transform_slice(
-                    sub, spec, dtype, cond_mask=cond_mask
-                )
-                out[..., idx] = modified
-
+                g_sub = gate[..., idx] if gate is not None else None
+                out[..., idx] = InterventionKernel._transform(sub, spec, dtype, False, cond_mask, g_sub)
         return out
 
     @staticmethod
-    def _resolve_value_tensor(
-        sub: torch.Tensor,
-        spec: InterventionSpec,
-        dtype: torch.dtype,
-        is_conv2d: bool = False,
-    ) -> torch.Tensor:
-        """
-        Resolves either a broadcastable per-neuron value tensor (from `spec.per_neuron_values`)
-        or a uniform scalar tensor (from `spec.value`) matching `sub`.
-        """
-        if spec.per_neuron_values is not None and len(spec.per_neuron_values) == len(spec.neuron_indices):
-            val_1d = torch.as_tensor(spec.per_neuron_values, dtype=dtype, device=sub.device)
-            if is_conv2d and sub.ndim == 4:
-                return val_1d.view(1, -1, 1, 1).expand_as(sub)
-            else:
-                view_shape = [1] * (sub.ndim - 1) + [-1]
-                return val_1d.view(*view_shape).expand_as(sub)
+    def _values(sub: torch.Tensor, spec: InterventionSpec, dtype: torch.dtype, is_conv2d: bool) -> torch.Tensor:
+        if spec.per_neuron_values is not None:
+            if len(spec.per_neuron_values) != len(spec.neuron_indices):
+                raise ValueError("per_neuron_values must align with neuron_indices")
+            v = torch.as_tensor(spec.per_neuron_values, dtype=dtype, device=sub.device)
+            shape = [1, -1, 1, 1] if (is_conv2d and sub.ndim == 4) else [1] * (sub.ndim - 1) + [-1]
+            return v.view(*shape).expand_as(sub)
         return torch.full_like(sub, float(spec.value))
 
     @staticmethod
-    def _transform_slice(
+    def _transform(
         sub: torch.Tensor,
         spec: InterventionSpec,
         dtype: torch.dtype,
-        is_conv2d: bool = False,
-        cond_mask: Optional[torch.Tensor] = None,
+        is_conv2d: bool,
+        cond_mask: Optional[torch.Tensor],
+        gate_sub: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Executes the specific pole-aware mathematical operation on the selected neuron slice."""
         if spec.custom_fn is not None:
-            transformed = spec.custom_fn(sub).to(dtype)
-            if cond_mask is not None:
-                return torch.where(cond_mask.to(device=sub.device), transformed, sub)
-            return transformed
+            new = spec.custom_fn(sub).to(dtype)
+            return torch.where(cond_mask.to(sub.device), new, sub) if cond_mask is not None else new
 
-        # Build pole mask if targeting only POSITIVE (> 0) or NEGATIVE (< 0) neuron pole
         if spec.pole == PoleType.POSITIVE:
-            pole_mask = sub > 0
+            mask = sub > 0
         elif spec.pole == PoleType.NEGATIVE:
-            pole_mask = sub < 0
+            mask = sub < 0
         else:
-            pole_mask = torch.ones_like(sub, dtype=torch.bool)
-
+            mask = torch.ones_like(sub, dtype=torch.bool)
         if cond_mask is not None:
-            aligned_cond = cond_mask.to(device=sub.device, dtype=torch.bool)
-            if aligned_cond.shape == pole_mask.shape or aligned_cond.ndim == pole_mask.ndim:
-                pole_mask = pole_mask & aligned_cond.expand_as(pole_mask)
+            mask = mask & cond_mask.to(device=sub.device, dtype=torch.bool).expand_as(mask)
+
+        mode = spec.mode
+        if mode == InterventionMode.CONDITIONAL_GATE:
+            if spec.gate_condition is None:
+                raise ValueError("CONDITIONAL_GATE requires gate_condition")
+            mode = spec.gate_condition.action_mode
+
+        zeros = torch.zeros_like(sub)
+        if mode == InterventionMode.ZERO_ABLATE:
+            return torch.where(mask, zeros, sub)
+        if mode == InterventionMode.POLE_RECTIFY:
+            return torch.where(mask, sub, zeros)
+        if mode == InterventionMode.DOUBLE_NEGATIVE_ABLATE:
+            # a > 0 with g < 0 implies u < 0 because act(g) < 0 for g < 0
+            return torch.where(mask & (sub > 0) & (gate_sub.to(sub.device) < 0), zeros, sub)
+
+        val = InterventionKernel._values(sub, spec, dtype, is_conv2d)
+        if mode == InterventionMode.HARD_CLAMP:
+            return torch.where(mask, val, sub)
+        if mode == InterventionMode.SCALE:
+            return torch.where(mask, sub * val, sub)
+        if mode == InterventionMode.ADDITIVE_STEER:
+            return torch.where(mask, sub + val, sub)
+        if mode == InterventionMode.WEAK_PRUNE:
+            return torch.where(mask & (sub.abs() < val.abs()), zeros, sub)
+        if mode == InterventionMode.EXTREME_CULL:
+            if spec.condition_signal == "gate":
+                hit = gate_sub.to(device=sub.device, dtype=val.dtype) > val
+            elif spec.pole == PoleType.NEGATIVE:
+                hit = sub < -val.abs()
+            elif spec.pole == PoleType.POSITIVE:
+                hit = sub > val.abs()
             else:
-                pole_mask = pole_mask & aligned_cond.any()
+                hit = sub.abs() > val.abs()
+            return torch.where(mask & hit, zeros, sub)
+        raise ValueError(f"Unsupported intervention mode {mode}")
 
-        effective_mode = (
-            spec.gate_condition.action_mode
-            if (spec.mode == InterventionMode.CONDITIONAL_GATE and spec.gate_condition is not None)
-            else (
-                InterventionMode.ADDITIVE_STEER
-                if spec.mode == InterventionMode.CONDITIONAL_GATE
-                else spec.mode
-            )
-        )
 
-        if effective_mode == InterventionMode.ZERO_ABLATE:
-            return torch.where(pole_mask, torch.zeros_like(sub), sub)
+def build_intervention_hookset(
+    model: nn.Module,
+    interventions: Dict[str, List[InterventionSpec]],
+    latched_masks: Dict[int, torch.Tensor],
+    counter: Optional[Dict[str, int]] = None,
+):
+    """
+    HookSet applying `interventions` (with cross-layer conditional-gate detectors and gate signals)
+    plus the dict of per-forward detector masks, which the caller must clear at the start of every
+    forward pass of the root model.
+    """
+    hs = HookSet(model)
+    cond_masks: Dict[int, torch.Tensor] = {}
+    for layer_name, specs in interventions.items():
+        for spec in specs:
+            if not spec.enabled or spec.gate_condition is None:
+                continue
+            det = spec.gate_condition.detector_layer
+            if det == layer_name:
+                continue
+            det_site = hs.site(det)
 
-        elif effective_mode == InterventionMode.POLE_RECTIFY:
-            return torch.where(pole_mask, sub, torch.zeros_like(sub))
+            def _det(act, _g, _r, s=spec, conv=det_site.is_conv2d) -> None:
+                cond_masks[id(s)] = InterventionKernel.compute_detector_mask(
+                    act.detach(), s.gate_condition, is_conv2d=conv, latched_masks=latched_masks, spec_id=id(s))
 
-        val_tensor = InterventionKernel._resolve_value_tensor(
-            sub, spec, dtype, is_conv2d=is_conv2d
-        )
+            hs.add_capture(det, _det)
+    for layer_name, specs in interventions.items():
+        active = [s for s in specs if s.enabled]
+        if not active:
+            continue
+        site = hs.site(layer_name)
 
-        if effective_mode == InterventionMode.HARD_CLAMP:
-            return torch.where(pole_mask, val_tensor, sub)
+        def _mod(act, gate, ls=active, conv=site.is_conv2d, nm=layer_name):
+            new = InterventionKernel.apply(act, ls, is_conv2d=conv, conditional_masks=cond_masks,
+                                           latched_masks=latched_masks, gate=gate)
+            if counter is not None:
+                counter[nm] = counter.get(nm, 0) + int((new != act).sum().item())
+            return new
 
-        elif effective_mode == InterventionMode.SCALE:
-            return torch.where(pole_mask, sub * val_tensor, sub)
-
-        elif effective_mode == InterventionMode.ADDITIVE_STEER:
-            return torch.where(pole_mask, sub + val_tensor, sub)
-
-        elif effective_mode == InterventionMode.WEAK_PRUNE:
-            weak_mask = pole_mask & (sub.abs() < val_tensor.abs())
-            return torch.where(weak_mask, torch.zeros_like(sub), sub)
-
-        return sub
+        hs.add_modifier(layer_name, _mod, need_gate=any(s.needs_gate_signal for s in active))
+    return hs, cond_masks
 
 
 class AblationMaskOptimizer:
     """
-    Subspace / Multi-Neuron Synergistic Ablation Optimizer (Cammarata: 'Understanding Compounds').
-    Because backup circuits ('circuit ecology') often compensate when a single neuron is ablated,
-    `AblationMaskOptimizer` finds the minimal coalition of `k` neurons in `layer_name` whose
-    joint ablation maximizes causal divergence or flips a target token behavior.
+    Finds a small coalition of neurons in one layer whose joint ablation has the largest effect,
+    which single-neuron ablation misses when backup circuits compensate.
 
-    Supports two search strategies:
-      1. `method="greedy"`: Fast candidate pre-filtering (by activation magnitude * weight norm)
-         followed by exact forward-pass greedy subset selection.
-      2. `method="l1_optim"`: Differentiable continuous gate mask `m in [0, 1]^D` optimized via
-         Adam with an L1 sparsity penalty, discretized to the top `max_subset_size` neurons.
+    Objective: mean KL(P_clean || P_ablated) over valid positions, or, when `target_token_ids` are
+    given, the drop in log-probability mass of those tokens (one quantity, never a sum of both).
+      * method="greedy": exact forward-pass greedy selection over a candidate pool.
+      * method="l1_optim": continuous mask m = sigmoid(alpha) on the pool, alpha initialised at 0
+        (m = 0.5, the neutral midpoint, so the objective has gradient from the first step),
+        maximising objective - l1_penalty * sum(1 - m); the top `max_subset_size` are then evaluated exactly.
     """
 
-    def __init__(self, injector: NeuralInjector):
+    def __init__(self, injector: "NeuralInjector"):
         self.injector = injector
         self.model = injector.model
 
@@ -305,268 +256,125 @@ class AblationMaskOptimizer:
         method: str = "greedy",
         target_token_ids: Optional[List[int]] = None,
         pole: PoleType = PoleType.BOTH,
-        l1_steps: int = 15,
-        l1_lr: float = 0.25,
-        l1_penalty: float = 0.01,
+        l1_steps: int = 30,
+        l1_lr: float = 0.1,
+        l1_penalty: float = 0.0,
         forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         candidate_neurons: Optional[List[int]] = None,
     ) -> SynergisticAblationResult:
-        def _default_fwd(m: nn.Module, inp: Any) -> Any:
-            if isinstance(inp, dict):
-                return m(inp["input_ids"]) if "input_ids" in inp else m(**inp)
-            return m(inp)
-
-        run_fwd = forward_fn or _default_fwd
+        run_fwd = forward_fn or default_forward
         if attention_mask is None and isinstance(inputs, dict):
             attention_mask = inputs.get("attention_mask")
-
-        mod, hook_target, num_neurons = LayerDiscovery.resolve_module(self.model, layer_name)
-        k_max = min(max_subset_size, num_neurons)
-        pool_k = min(max(candidate_pool_size, k_max * 2), num_neurons)
+        inj = self.injector
+        site = HookSet(self.model).site(layer_name)
+        n_neurons = site.num_neurons
+        k_max = min(max_subset_size, n_neurons)
 
         was_training = self.model.training
         self.model.eval()
         try:
-            # Step 1: Clean baseline forward pass to capture clean logits & active neuron magnitudes
-            captured_acts: List[torch.Tensor] = []
-            h_cap = (
-                mod.register_forward_pre_hook(
-                    lambda _m, inp: (
-                        captured_acts.append(inp[0].detach())
-                        if inp and isinstance(inp[0], torch.Tensor)
-                        else None
-                    )
-                )
-                if hook_target == "input"
-                else mod.register_forward_hook(
-                    lambda _m, _inp, out: captured_acts.append(
-                        (out[0] if isinstance(out, tuple) else out).detach()
-                    )
-                )
-            )
+            captured: List[torch.Tensor] = []
+            hs = HookSet(self.model)
+            hs.add_capture(layer_name, lambda a, g, r: captured.append(a.detach()))
+            with torch.no_grad(), inj.clean_forward(), hs.active():
+                clean_logits = extract_logits(run_fwd(self.model, inputs)).float()
+            clean_lp = F.log_softmax(clean_logits, dim=-1)
+            clean_p = clean_lp.exp()
+            n_pos = clean_logits.shape[:-1].numel()
+            valid = valid_position_mask(attention_mask, n_pos, clean_logits.device)
 
-            try:
-                with torch.no_grad(), self.injector.without_interventions():
-                    clean_out = run_fwd(self.model, inputs)
-                    clean_logits = (
-                        clean_out.logits if hasattr(clean_out, "logits") else clean_out
-                    ).detach().float()
-                    clean_log_probs = F.log_softmax(clean_logits, dim=-1)
-                    clean_probs = clean_log_probs.exp()
-            finally:
-                h_cap.remove()
-
-            act_flat = captured_acts[-1].reshape(-1, num_neurons).float()
-            if attention_mask is not None:
-                mask_flat = attention_mask.reshape(-1).to(
-                    device=act_flat.device, dtype=torch.bool
-                )
-                if mask_flat.numel() == act_flat.shape[0] and mask_flat.any():
-                    act_flat = act_flat[mask_flat]
-            mean_abs_act = act_flat.abs().mean(dim=0)
-
-            # Weight by outgoing L2 norm if available
-            if hasattr(mod, "weight") and isinstance(mod.weight, torch.Tensor):
-                w = mod.weight.detach().float()
-                if w.ndim == 3 and w.shape[-1] == num_neurons:
-                    wnorm = torch.norm(w, p=2, dim=1).mean(dim=0)
-                elif mod.__class__.__name__ == "Conv1D" and w.shape[0] == num_neurons:
-                    wnorm = torch.norm(w, p=2, dim=1)
-                elif w.ndim == 2 and w.shape[1] == num_neurons:
-                    wnorm = torch.norm(w, p=2, dim=0)
-                elif w.ndim == 2 and w.shape[0] == num_neurons:
-                    wnorm = torch.norm(w, p=2, dim=1)
-                else:
-                    wnorm = torch.ones_like(mean_abs_act)
-            else:
-                wnorm = torch.ones_like(mean_abs_act)
-
-            importance = mean_abs_act * wnorm.to(mean_abs_act.device)
-            if candidate_neurons is not None:
-                candidate_indices = [
-                    int(i) for i in candidate_neurons if 0 <= int(i) < num_neurons
-                ]
-            else:
-                _, top_cand_tensor = torch.topk(importance, k=pool_k)
-                candidate_indices = [int(i) for i in top_cand_tensor.tolist()]
-
-            def _masked_kl(mod_log_probs: torch.Tensor) -> torch.Tensor:
-                token_kl = (clean_probs * (clean_log_probs - mod_log_probs)).sum(dim=-1)
-                if attention_mask is not None and token_kl.shape == attention_mask.shape:
-                    m_bool = attention_mask.to(device=token_kl.device, dtype=torch.bool)
-                    if m_bool.any():
-                        return token_kl[m_bool].mean()
-                return token_kl.mean()
-
-            def _score_logits(mod_logits: torch.Tensor) -> float:
-                mod_log_probs = F.log_softmax(mod_logits.float(), dim=-1)
-                kl = float(_masked_kl(mod_log_probs).item())
+            def _objective(logits: torch.Tensor) -> torch.Tensor:
+                lp = F.log_softmax(logits.float(), dim=-1)
                 if target_token_ids:
-                    drop = float(
-                        (
-                            clean_logits[..., target_token_ids].mean()
-                            - mod_logits.float()[..., target_token_ids].mean()
-                        ).item()
-                    )
-                    return kl + max(drop, 0.0)
-                return kl
+                    t_idx = torch.as_tensor(target_token_ids, device=lp.device)
+                    clean_mass = torch.logsumexp(clean_lp[..., t_idx], dim=-1).reshape(-1)
+                    new_mass = torch.logsumexp(lp[..., t_idx], dim=-1).reshape(-1)
+                    return (clean_mass - new_mass)[valid].mean()
+                kl = (clean_p * (clean_lp - lp)).sum(dim=-1).reshape(-1)
+                return kl[valid].mean()
+
+            if candidate_neurons is not None:
+                cand = [int(i) for i in candidate_neurons if 0 <= int(i) < n_neurons]
+            else:
+                acts = flat_neuron_view(captured[-1].float(), site.is_conv2d)
+                act_valid = valid_position_mask(attention_mask, acts.shape[0], acts.device)
+                mean_abs = acts[act_valid].abs().mean(dim=0)
+                wv = inj.neuron_write_vectors(layer_name)
+                wn = wv.float().norm(dim=1).to(mean_abs.device) if wv is not None else torch.ones_like(mean_abs)
+                pool = min(max(candidate_pool_size, k_max), n_neurons)
+                cand = torch.topk(mean_abs * wn, k=pool).indices.tolist()
+
+            def _score_set(neurons: List[int]) -> float:
+                spec = InterventionSpec(layer_name=layer_name, neuron_indices=list(neurons), mode=InterventionMode.ZERO_ABLATE, pole=pole)
+                with torch.no_grad(), inj.temporary_interventions([spec]):
+                    return float(_objective(extract_logits(run_fwd(self.model, inputs))).item())
 
             selected: List[int] = []
-            stepwise_scores: List[float] = []
-
+            stepwise: List[float] = []
             if method == "l1_optim":
-                # Differentiable continuous mask optimization over `candidate_indices`
                 device = clean_logits.device
-                logits_alpha = nn.Parameter(
-                    torch.full((len(candidate_indices),), 2.0, device=device)
-                )
-                optimizer = torch.optim.Adam([logits_alpha], lr=l1_lr)
-                cand_idx_t = torch.as_tensor(candidate_indices, dtype=torch.long, device=device)
+                alpha = nn.Parameter(torch.zeros(len(cand), device=device))
+                opt = torch.optim.Adam([alpha], lr=l1_lr)
+                cand_t = torch.as_tensor(cand, dtype=torch.long)
 
-                def _apply_soft_gate(x_in: torch.Tensor) -> torch.Tensor:
-                    x = x_in.clone()
-                    sub = x[..., cand_idx_t]
-                    gate_vals = torch.sigmoid(logits_alpha).to(dtype=x.dtype, device=x.device)
-                    view_shape = [1] * (sub.ndim - 1) + [-1]
-                    g_broad = gate_vals.view(*view_shape).expand_as(sub)
+                def _soft(act: torch.Tensor, _g: Optional[torch.Tensor]) -> torch.Tensor:
+                    x = act.clone()
+                    ci = cand_t.to(x.device)
+                    sub = x[..., ci]
+                    m = torch.sigmoid(alpha).to(dtype=x.dtype, device=x.device)
+                    shape = [1] * (sub.ndim - 1) + [-1]
+                    m = m.view(*shape)
                     if pole == PoleType.POSITIVE:
-                        gated = torch.where(sub > 0, sub * g_broad, sub)
+                        sub = torch.where(sub > 0, sub * m, sub)
                     elif pole == PoleType.NEGATIVE:
-                        gated = torch.where(sub < 0, sub * g_broad, sub)
+                        sub = torch.where(sub < 0, sub * m, sub)
                     else:
-                        gated = sub * g_broad
-                    x[..., cand_idx_t] = gated
+                        sub = sub * m
+                    x[..., ci] = sub
                     return x
 
-                def _mask_pre(_m: nn.Module, inp: Any):
-                    if not inp or not isinstance(inp[0], torch.Tensor):
-                        return inp
-                    return (_apply_soft_gate(inp[0]),) + inp[1:]
-
-                def _mask_fwd(_m: nn.Module, _inp: Any, out: Any):
-                    t0 = out[0] if isinstance(out, tuple) else out
-                    if not isinstance(t0, torch.Tensor):
-                        return out
-                    x = _apply_soft_gate(t0)
-                    return (x,) + out[1:] if isinstance(out, tuple) else x
-
-                h_opt = (
-                    mod.register_forward_pre_hook(_mask_pre)
-                    if hook_target == "input"
-                    else mod.register_forward_hook(_mask_fwd)
-                )
-                try:
-                    with self.injector.without_interventions(), torch.enable_grad():
-                        for _ in range(l1_steps):
-                            optimizer.zero_grad()
-                            out_step = run_fwd(self.model, inputs)
-                            step_logits = (
-                                out_step.logits if hasattr(out_step, "logits") else out_step
-                            ).float()
-                            step_log_probs = F.log_softmax(step_logits, dim=-1)
-                            kl_term = _masked_kl(step_log_probs)
-                            if target_token_ids:
-                                t_drop = (
-                                    clean_logits[..., target_token_ids].mean()
-                                    - step_logits[..., target_token_ids].mean()
-                                )
-                                objective = kl_term + t_drop
-                            else:
-                                objective = kl_term
-                            # Maximize objective while minimizing number of ablated neurons (1 - gate)
-                            gates = torch.sigmoid(logits_alpha)
-                            ablation_mass = (1.0 - gates).sum()
-                            loss = -objective + l1_penalty * ablation_mass
-                            loss.backward()
-                            optimizer.step()
-                finally:
-                    h_opt.remove()
-
-                with torch.no_grad():
-                    ablation_strength = (1.0 - torch.sigmoid(logits_alpha)).detach()
-                    _, best_local = torch.topk(
-                        ablation_strength, k=min(k_max, len(candidate_indices))
-                    )
-                    selected = [candidate_indices[int(i)] for i in best_local.tolist()]
-                    for step_i in range(1, len(selected) + 1):
-                        spec = InterventionSpec(
-                            layer_name=layer_name,
-                            neuron_indices=selected[:step_i],
-                            mode=InterventionMode.ZERO_ABLATE,
-                            pole=pole,
-                        )
-                        with self.injector.temporary_interventions([spec]):
-                            m_out = run_fwd(self.model, inputs)
-                            m_logits = m_out.logits if hasattr(m_out, "logits") else m_out
-                            stepwise_scores.append(round(_score_logits(m_logits), 5))
+                hs_opt = HookSet(self.model)
+                hs_opt.add_modifier(layer_name, _soft)
+                with inj.clean_forward(), hs_opt.active(), torch.enable_grad():
+                    for _ in range(l1_steps):
+                        opt.zero_grad()
+                        obj = _objective(extract_logits(run_fwd(self.model, inputs)))
+                        loss = -obj + l1_penalty * (1.0 - torch.sigmoid(alpha)).sum()
+                        loss.backward()
+                        opt.step()
+                strength = (1.0 - torch.sigmoid(alpha)).detach()
+                order = torch.argsort(strength, descending=True)[:k_max].tolist()
+                selected = [cand[i] for i in order]
+                for s in range(1, len(selected) + 1):
+                    stepwise.append(_score_set(selected[:s]))
+            elif method == "greedy":
+                remaining = list(cand)
+                for _ in range(k_max):
+                    best_n, best_s = None, float("-inf")
+                    for c in remaining:
+                        sc = _score_set(selected + [c])
+                        if sc > best_s:
+                            best_n, best_s = c, sc
+                    if best_n is None:
+                        break
+                    selected.append(best_n)
+                    remaining.remove(best_n)
+                    stepwise.append(best_s)
             else:
-                # Greedy forward subset selection
-                remaining = list(candidate_indices)
-                with torch.no_grad():
-                    for _ in range(k_max):
-                        best_n: Optional[int] = None
-                        best_score = -1.0
-                        for cand in remaining:
-                            trial_set = selected + [cand]
-                            spec = InterventionSpec(
-                                layer_name=layer_name,
-                                neuron_indices=trial_set,
-                                mode=InterventionMode.ZERO_ABLATE,
-                                pole=pole,
-                            )
-                            with self.injector.temporary_interventions([spec]):
-                                m_out = run_fwd(self.model, inputs)
-                                m_logits = m_out.logits if hasattr(m_out, "logits") else m_out
-                                sc = _score_logits(m_logits)
-                            if sc > best_score:
-                                best_score = sc
-                                best_n = cand
-                        if best_n is not None:
-                            selected.append(best_n)
-                            remaining.remove(best_n)
-                            stepwise_scores.append(round(best_score, 5))
+                raise ValueError("method must be 'greedy' or 'l1_optim'")
 
-            # Measure joint KL vs sum of individual KLs to quantify backup-circuit synergy
-            with torch.no_grad():
-                joint_spec = InterventionSpec(
-                    layer_name=layer_name,
-                    neuron_indices=selected,
-                    mode=InterventionMode.ZERO_ABLATE,
-                    pole=pole,
-                )
-                with self.injector.temporary_interventions([joint_spec]):
-                    j_out = run_fwd(self.model, inputs)
-                    j_logits = (j_out.logits if hasattr(j_out, "logits") else j_out).float()
-                    j_log_probs = F.log_softmax(j_logits, dim=-1)
-                    joint_kl = float(_masked_kl(j_log_probs).item())
-                    target_shift = (
-                        float(
-                            (
-                                clean_logits[..., target_token_ids].mean()
-                                - j_logits[..., target_token_ids].mean()
-                            ).item()
-                        )
-                        if target_token_ids
-                        else 0.0
-                    )
-
-                indiv_kl_sum = 0.0
-                for n_idx in selected:
-                    indiv_kl_sum += self.injector.measure_ablation_kl_divergence(
-                        layer_name, n_idx, inputs=inputs, pole=pole, forward_fn=run_fwd
-                    )
-
-            synergy_ratio = joint_kl / max(indiv_kl_sum, 1e-9) if selected else 1.0
+            joint = _score_set(selected) if selected else 0.0
+            indiv = sum(_score_set([n]) for n in selected)
             return SynergisticAblationResult(
                 layer_name=layer_name,
                 method=method,
+                objective="target_logprob_mass_drop" if target_token_ids else "mean_kl",
                 selected_neurons=selected,
-                stepwise_scores=stepwise_scores,
-                joint_ablation_kl=round(joint_kl, 5),
-                sum_of_individual_kls=round(indiv_kl_sum, 5),
-                synergy_ratio=round(synergy_ratio, 4),
-                target_logit_shift=round(target_shift, 5),
+                stepwise_scores=stepwise,
+                joint_score=joint,
+                sum_of_individual_scores=indiv,
+                synergy_ratio=joint / indiv if indiv > 0 else float("nan"),
             )
         finally:
             if was_training:
