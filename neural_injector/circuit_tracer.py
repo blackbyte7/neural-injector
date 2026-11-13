@@ -547,6 +547,8 @@ class CircuitTracer:
         (e.g. a decoder block, or the final norm), compares each coordinate's share of activation mass
         E[x_d^2] with its share of what downstream readers read, sum over readers of ||W[:, d] * gamma_d||^2
         (attention q/k/v and MLP gate/up of later blocks, and the unembedding, each with its own norm scale).
+        A coordinate is a candidate when it holds more than the uniform share 1/d_model of the mass and a
+        larger share of the mass than of the reading; candidates are listed by mass share.
         """
         mod = self.model.get_submodule(residual_site)
         sq: Dict[str, Any] = {"sum": None, "n": 0}
@@ -624,11 +626,12 @@ class CircuitTracer:
         entries = []
         sinks = []
         for d in torch.argsort(mass_share, descending=True).tolist():
-            cand = float(mass_share[d]) > uniform and float(read_share[d]) < uniform
+            # more than its uniform share of the mass, and more of the mass than of what readers read
+            cand = float(mass_share[d]) > uniform and float(mass_share[d]) > float(read_share[d])
             if cand:
                 sinks.append(d)
             entries.append(ResidualCoordinateEntry(d, float(mass_share[d]), float(read_share[d]), cand))
-        write_share: Dict[int, float] = {}
+        write_share: Dict[str, float] = {}
         if neuron_layers and sinks:
             for nl in neuron_layers:
                 W = LayerDiscovery.neuron_write_vectors(self.model, nl)
@@ -637,7 +640,7 @@ class CircuitTracer:
                 Wf = W.float().cpu()
                 share = (Wf[:, sinks] ** 2).sum(1) / torch.clamp((Wf ** 2).sum(1), min=1e-30)
                 for i, v in enumerate(share.tolist()):
-                    write_share[i] = max(write_share.get(i, 0.0), v)
+                    write_share[f"{nl}#{i}"] = v
         return ResidualSinkReport(residual_site, d_model, int(sq["n"]), entries, sinks, write_share)
 
     # ------------------------------------------------------------------

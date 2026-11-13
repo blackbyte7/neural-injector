@@ -415,15 +415,15 @@ class ResidualSinkReport:
     """
     'Looking at the Residual Stream': a coordinate that carries a large share of the activation
     mass while downstream readers barely read it acts as a saliency knob through LayerNorm/RMSNorm.
-    A coordinate is a candidate when its mass share exceeds the uniform share 1/d_model while its
-    read share is below 1/d_model (both measured, nothing tuned).
+    A coordinate is a candidate when its mass share exceeds the uniform share 1/d_model and exceeds its
+    read share (both measured, nothing tuned); candidates are ordered by mass share.
     """
     residual_site: str
     d_model: int
     tokens_observed: int
     coordinates: List[ResidualCoordinateEntry] = field(default_factory=list)
     sink_candidate_coordinates: List[int] = field(default_factory=list)
-    neuron_write_share_on_sinks: Dict[int, float] = field(default_factory=dict)
+    neuron_write_share_on_sinks: Dict[str, float] = field(default_factory=dict)  # 'layer#neuron' -> share of ||w||^2 on sink coordinates
 
 
 @dataclass
