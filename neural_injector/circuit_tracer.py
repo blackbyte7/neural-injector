@@ -9,7 +9,6 @@ import torch
 import torch.autograd.forward_ad as fwAD
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.hooks import RemovableHandle
 
 from .discovery import LayerDiscovery
 from .hooks import HookSet, default_forward, extract_logits, flat_neuron_view, valid_position_mask

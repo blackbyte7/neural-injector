@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 import weakref
 
 import torch

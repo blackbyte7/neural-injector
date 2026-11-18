@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from . import __version__
 from .session import WorkbenchSession
 from .types import InterventionMode, InterventionSpec, PoleType
 
@@ -59,7 +60,7 @@ class EvaluateRequest(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    prompt: str = Field(..., description="Prompt for side-by-side multi-token CoT generation")
+    prompt: str = Field(..., description="Prompt for side-by-side clean vs intervened generation")
     max_new_tokens: int = Field(default=8, ge=1, le=256)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     use_kv_cache: bool = Field(default=True)
@@ -103,7 +104,7 @@ def create_workbench_app(
     app = FastAPI(
         title="Neural Injector Workbench API",
         description="Bipolar Neuron Auditor, Surgical Activation Injector, Circuit Tracer & Agentic Explainer",
-        version="0.7.0",
+        version=__version__,
     )
     session_lock = asyncio.Lock()
     app_state = getattr(app, "state", None)
@@ -350,7 +351,7 @@ def create_workbench_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def workbench_ui() -> HTMLResponse:
-        return HTMLResponse(content=WORKBENCH_HTML)
+        return HTMLResponse(content=WORKBENCH_HTML.replace("{{VERSION}}", __version__))
 
     return app
 
@@ -369,7 +370,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   <div class="max-w-7xl mx-auto space-y-6">
     <header class="flex items-center justify-between border-b border-slate-800 pb-4">
       <div>
-        <h1 class="text-2xl font-bold text-emerald-400">Neural Injector Workbench v0.6</h1>
+        <h1 class="text-2xl font-bold text-emerald-400">Neural Injector Workbench v{{VERSION}}</h1>
         <p class="text-sm text-slate-400">Bipolar Auditor • Layer Scan • Surgical Injector • Circuit Tracer • Production Steering Exporter</p>
       </div>
       <span id="model-badge" class="px-3 py-1 rounded bg-slate-800 text-xs font-mono text-emerald-300">Loading...</span>
@@ -456,7 +457,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
         </div>
         <div class="flex gap-2">
           <button onclick="evaluatePrompt()" class="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium py-2 rounded">Compare Next Token</button>
-          <button onclick="generatePrompt()" class="flex-1 bg-teal-600 hover:bg-teal-500 text-white text-xs font-medium py-2 rounded">Generate CoT (Multi-Token)</button>
+          <button onclick="generatePrompt()" class="flex-1 bg-teal-600 hover:bg-teal-500 text-white text-xs font-medium py-2 rounded">Generate (clean vs intervened)</button>
         </div>
         <pre id="eval-output" class="bg-slate-950 p-3 rounded text-xs font-mono overflow-auto max-h-64 text-slate-300"></pre>
       </div>

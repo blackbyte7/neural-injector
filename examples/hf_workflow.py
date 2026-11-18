@@ -1,7 +1,7 @@
 """
 End-to-end workflow on any HuggingFace causal LM.
 
-Everything reported is measured; nothing is classified from activation statistics.
+Every number reported is a measurement; neurons are described only through explanations that were tested.
 
   python examples/hf_workflow.py --model HuggingFaceTB/SmolLM2-135M --layers 1,7,14,21,28 \
       --hf-dataset Salesforce/wikitext --hf-config wikitext-103-raw-v1 --hf-split validation --n-texts 1000 \

@@ -25,3 +25,6 @@ venv/
 *.pth
 *.safetensors
 *_preset.json
+# Output of examples/hf_workflow.py and saved steering presets
+results/
+presets/

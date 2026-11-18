@@ -8,7 +8,6 @@ import unicodedata
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.hooks import RemovableHandle
 
 from .discovery import LayerDiscovery
 from .types import (

@@ -44,7 +44,7 @@ class WorkbenchSession:
     Stateful manager holding the active model, tokenizer mappings, NeuralInjector instance,
     cached evaluation prompts, and helper methods for JSON-serializable inspection,
     intervention, circuit tracing, side-by-side next-token logit comparison, and
-    multi-token Chain-of-Thought autoregressive generation (`generate_comparison`).
+    side-by-side clean vs intervened continuations (`generate_comparison`).
     """
 
     def __init__(
@@ -67,7 +67,14 @@ class WorkbenchSession:
 
     @classmethod
     def create_demo_session(cls) -> WorkbenchSession:
-        """Creates a pre-calibrated 2-layer SwiGLU session with pre-audited bipolar circuits."""
+        """
+        Small hand-built 2-layer SwiGLU model on an 18-token vocabulary, used by the CLI and the
+        web workbench when no HuggingFace model is given, and by the tests. Its weights are set by
+        hand so that it contains a known circuit: L0 N7 fires positive on cryptography tokens and
+        negative on SQL tokens, L1 N12 reads its positive pole and L1 N19 its negative pole.
+        Its layers are audited on five short prompts so that profiles exist straight away.
+        It is a fixture with known ground truth, not a model to draw conclusions from.
+        """
         torch.manual_seed(7)
         vocab = [
             "<pad>", "the", "system", "negotiated", "executed",
@@ -84,11 +91,9 @@ class WorkbenchSession:
             sql_vec = F.normalize(torch.randn(64), dim=0)
             bridge_vec = F.normalize(torch.randn(64), dim=0)
 
-            # Calibrate neutral background tokens so that after norm_0 they have zero
-            # sql_vec/bridge_vec leakage and a weak positive projection (+0.34) along crypto_vec.
-            # This produces a_7 ≈ +0.68 on neutral tokens: active (> 1e-5) in the unsaturated
-            # regime of norm_1 for Forward-AD Jacobian tracing, yet strictly below the
-            # conditional gate threshold (1.0) on SQL prompts.
+            # Neutral tokens: embeddings orthogonal to the three circuit directions, plus a small
+            # component along crypto_vec. L0 N7 is then weakly active (a_7 ≈ +0.68) on neutral
+            # text, so derivative-based tracing has a non-zero signal to follow there.
             ones_vec = torch.ones(64)
             basis = torch.stack([crypto_vec, sql_vec, bridge_vec, ones_vec], dim=1)
             q_basis, _ = torch.linalg.qr(basis)
@@ -111,17 +116,17 @@ class WorkbenchSession:
                 model.embed.weight[tid] = sql_vec * 3.0
                 model.lm_head.weight[tid] = (sql_vec - bridge_vec) * 3.5
 
-            # Layer 0, Neuron #7: Bipolar Verb Router (Crypto -> +Pole, SQL -> -Pole)
+            # L0 N7: positive pole on cryptography tokens, negative pole on SQL tokens; writes bridge_vec
             model.mlp_block_0.gate_proj.weight[7] = (crypto_vec + sql_vec) * 2.5
             model.mlp_block_0.up_proj.weight[7] = (crypto_vec - sql_vec) * 3.2
             model.mlp_block_0.down_proj.weight[:, 7] = bridge_vec * 3.5
 
-            # Layer 1, Neuron #12: Excited by L0 N7 (+Pole)
+            # L1 N12: reads bridge_vec, so it is excited by L0 N7's positive pole
             model.mlp_block_1.gate_proj.weight[12] = bridge_vec * 2.5
             model.mlp_block_1.up_proj.weight[12] = bridge_vec * 3.0
             model.mlp_block_1.down_proj.weight[:, 12] = crypto_vec * 4.0
 
-            # Layer 1, Neuron #19: Inhibited by L0 N7 (+Pole), Excited by (-Pole)
+            # L1 N19: reads -bridge_vec, so it is inhibited by L0 N7's positive pole and excited by its negative pole
             model.mlp_block_1.gate_proj.weight[19] = (sql_vec - bridge_vec) * 2.2
             model.mlp_block_1.up_proj.weight[19] = (-bridge_vec) * 3.8
             model.mlp_block_1.down_proj.weight[:, 19] = sql_vec * 4.0
@@ -133,7 +138,7 @@ class WorkbenchSession:
             unembed_weight=model.lm_head.weight,
             model_name="Demo-2Layer-SwiGLU-64d",
         )
-        # Pre-run default corpus audit so the UI & CLI have immediate profiles ready
+        # Audit both layers on a few prompts so the CLI and the workbench have profiles straight away
         default_prompts = [
             "the system negotiated AES256 TLS cipher",
             "the system executed SELECT WHERE postgres",
@@ -392,10 +397,11 @@ class WorkbenchSession:
         repetition_penalty: float = 1.0,
     ) -> Dict[str, Any]:
         """
-        Runs a side-by-side multi-token autoregressive generation (Chain-of-Thought /
-        continuation comparison) comparing:
-          1. Clean (unmodified) multi-token completion
-          2. Surgically intervened multi-token completion (with active hooks & latched gates)
+        Generates two continuations of the same prompt, token by token:
+          1. the clean model, with every intervention disabled;
+          2. the model with all active interventions (hooks and latched gates) applied.
+        Greedy at temperature 0 (the default), sampled otherwise. Returns both texts and how many
+        generated tokens differ.
         """
         input_ids, prompt_tokens = self.encode_prompt(prompt)
         self.model.eval()

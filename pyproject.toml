@@ -4,11 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neural-injector"
-version = "0.7.0"
+dynamic = ["version"]
 description = "Native-basis neuron auditing, circuit tracing, explanation testing and surgical steering (Neural Networks Are Already Clean)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+authors = [{ name = "Alexander Schneider" }]
+keywords = [
+    "interpretability",
+    "mechanistic-interpretability",
+    "neurons",
+    "circuits",
+    "activation-steering",
+    "transformers",
+    "pytorch",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.1.0",
     "fastapi>=0.115.0",
@@ -16,11 +38,17 @@ dependencies = [
     "pydantic>=2.7.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/blackbyte7/neural-injector"
+Repository = "https://github.com/blackbyte7/neural-injector"
+Issues = "https://github.com/blackbyte7/neural-injector/issues"
+
 [project.optional-dependencies]
 huggingface = [
     "transformers>=4.40.0",
     "accelerate>=0.30.0",
     "safetensors>=0.4.3",
+    "datasets>=2.18.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -29,6 +57,9 @@ dev = [
 
 [project.scripts]
 neural-injector = "neural_injector.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "neural_injector.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

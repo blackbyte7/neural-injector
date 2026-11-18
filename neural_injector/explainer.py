@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import inspect
 import json
-import math
 import os
 import random
 import time
@@ -12,11 +10,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Protocol,
 
 from pydantic import BaseModel, Field, ValidationError
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from .analyzer import is_punctuation_token
-from .hooks import HookSet, default_forward, extract_logits, flat_neuron_view
+from .hooks import HookSet, default_forward, flat_neuron_view
 from .types import (
     ActivationBand,
     ActivationSample,
